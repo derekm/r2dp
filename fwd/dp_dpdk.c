@@ -74,7 +74,8 @@ struct dp_sa {
 };
 
 struct dpdk_priv {
-	int                 port_id;
+	int                 port_id;      /* outer tap (ESP side) */
+	int                 inner_port;   /* inner tap (plaintext side) */
 	struct rte_mempool *pool;
 	struct rte_mempool *sess_mp;   /* crypto session mempool */
 	struct rte_mempool *cop_mp;    /* crypto operation mempool */
@@ -353,11 +354,10 @@ static struct fwd_dp_ops dpdk_ops;
  * interface; ESP is later processed, non-ESP IKE/ARP rides the exception
  * path -- both re-emit on the same port so the kernel sees them). */
 static int
-port_init(struct dpdk_priv *d)
+port_init(struct dpdk_priv *d, uint16_t port)
 {
 	struct rte_eth_conf conf;
 	struct rte_eth_dev_info dev_info;
-	uint16_t port = d->port_id;
 
 	if (port >= RTE_MAX_ETHPORTS)
 		return -1;
@@ -385,15 +385,19 @@ port_init(struct dpdk_priv *d)
 
 /* Inbound ESP: SAD-lookup by (SPI, DIP), run AES-GCM decrypt through the
  * OpenSSL cryptodev, then finalize with rte_ipsec_pkt_process.  One
- * enqueue/dequeue round per matched packet on the same lcore. */
+ * enqueue/dequeue round per matched packet on the same lcore.  Decrypted
+ * inner packets are written into `out` (up to *nout); unmatched/undecryptable
+ * packets are freed.  Returns the number of mbufs consumed from `in`. */
 static uint16_t
-esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr)
+esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
+    struct rte_mbuf *out[], uint16_t *nout)
 {
 	union rte_ipsec_sad_key kkey[BURST_SZ];
 	const union rte_ipsec_sad_key *keys[BURST_SZ];
 	struct rte_mbuf *pm[BURST_SZ];
 	void *sas[BURST_SZ];
 	uint32_t nk = 0;
+	uint16_t no = 0;
 
 	if (nr > BURST_SZ) nr = BURST_SZ;
 
@@ -423,8 +427,10 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr)
 		pm[nk] = bufs[i];
 		nk++;
 	}
-	if (nk == 0)
+	if (nk == 0) {
+		if (nout) *nout = 0;
 		return 0;
+	}
 
 	uint32_t nlook = rte_ipsec_sad_lookup(d->sad, keys, sas, nk);
 
@@ -432,6 +438,7 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr)
 		/* no SA matched -- drop the whole burst */
 		for (uint32_t i = 0; i < nk; i++)
 			rte_pktmbuf_free(pm[i]);
+		if (nout) *nout = 0;
 		return nk;
 	}
 
@@ -450,20 +457,31 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr)
 		uint16_t np = rte_ipsec_pkt_crypto_prepare(ss, &pm[i], cop, 1);
 		if (np == 0) {
 			rte_crypto_op_free(cop[0]);
+			rte_pktmbuf_free(pm[i]);
 			continue;
 		}
 		uint16_t enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, np);
 		uint16_t dq = enq ?
 		    rte_cryptodev_dequeue_burst(d->cdev_id, 0, cop, enq) : 0;
-		uint16_t proc = dq ?
-		    rte_ipsec_pkt_process(ss, &pm[i], dq) : 0;
-		for (uint16_t k = proc; k < dq; k++)
+		/* Packet i is the one due back from crypto.  rte_ipsec_pkt_process
+		 * on dq (==1 here) leaves the DECRYPTED inner packet in pm[i];
+		 * forward it.  On any failure drop it. */
+		if (dq == 1) {
+			uint16_t proc = rte_ipsec_pkt_process(ss, &pm[i], dq);
+			/* processed packets have the inner (cleartext) frame */
+			if (proc == 1 && out && no < BURST_SZ)
+				out[no++] = pm[i];
+			else
+				rte_pktmbuf_free(pm[i]);
+		} else {
 			rte_pktmbuf_free(pm[i]);
+		}
 		/* completed ops are safe to return/refund after process */
 		for (uint16_t k = 0; k < dq; k++)
 			rte_crypto_op_free(cop[k]);
 	}
 	(void)nlook;
+	if (nout) *nout = no;
 	return nk;
 }
 
@@ -489,6 +507,95 @@ is_udp(struct rte_mbuf *mb)
 	return (ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_UDP;
 }
 
+/* Process a burst received on the OUTER tap (ESP side): ESP -> decrypt ->
+ * forward the inner (cleartext) packet out the inner tap; non-ESP (IKE, ARP)
+ * is the exception path and crosses to the inner (kernel) side. */
+static void
+worker_outer(struct dpdk_priv *d, int port)
+{
+	struct rte_mbuf *bufs[BURST_SZ];
+	uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
+
+	if (nr == 0)
+		return;
+	d->n_rx += nr;
+	uint16_t np = 0;
+	uint16_t nesp = 0;
+	for (uint16_t i = 0; i < nr; i++) {
+		if (is_esp(bufs[i])) {
+			d->n_esp++;
+			bufs[nesp] = bufs[i];
+			nesp++;
+		} else {
+			np++;
+		}
+	}
+
+	if (nesp) {
+		struct rte_mbuf *dec[BURST_SZ];
+		uint16_t ndec = 0;
+		esp_inbound(d, bufs, nesp, dec, &ndec);
+		if (ndec) {
+			uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
+			uint16_t sent = rte_eth_tx_burst(to, 0, dec, ndec);
+			d->n_tx += sent;
+			for (uint16_t i = sent; i < ndec; i++)
+				rte_pktmbuf_free(dec[i]);
+		}
+	}
+	/* non-ESP: exception path -> the kernel side */
+	if (np) {
+		struct rte_mbuf *plain[BURST_SZ];
+		uint16_t nplain = 0;
+		for (uint16_t i = 0; i < nr; i++) {
+			if (!is_esp(bufs[i]))
+				plain[nplain++] = bufs[i];
+		}
+		if (nplain && is_udp(plain[0]))   /* IKE */
+			d->n_ike += nplain;
+		uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
+		uint16_t sent = rte_eth_tx_burst(to, 0, plain, nplain);
+		d->n_tx += sent;
+		d->n_drop += nplain - sent;
+		for (uint16_t i = sent; i < nplain; i++)
+			rte_pktmbuf_free(plain[i]);
+	}
+}
+
+/* Process a burst received on the INNER tap (plaintext/kernel side): ESP is
+ * unusual here, but non-ESP (IKE/ARP from the kernel) is the outbound
+ * exception path and crosses to the outer (peer) tap.  M1 data-plane outbound
+ * (encrypt inner plaintext -> ESP) is the next leg, not yet wired. */
+static void
+worker_inner(struct dpdk_priv *d, int port)
+{
+	struct rte_mbuf *bufs[BURST_SZ];
+	uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
+
+	if (nr == 0)
+		return;
+	d->n_rx += nr;
+	/* non-ESP from the kernel: exception path out to the peer */
+	struct rte_mbuf *plain[BURST_SZ];
+	uint16_t nplain = 0;
+	for (uint16_t i = 0; i < nr; i++) {
+		if (is_esp(bufs[i]))
+			rte_pktmbuf_free(bufs[i]);   /* not handled in M1 outbound */
+		else
+			plain[nplain++] = bufs[i];
+	}
+	if (nplain) {
+		if (is_udp(plain[0]))
+			d->n_ike += nplain;
+		uint16_t to = (d->port_id >= 0) ? d->port_id : port;
+		uint16_t sent = rte_eth_tx_burst(to, 0, plain, nplain);
+		d->n_tx += sent;
+		d->n_drop += nplain - sent;
+		for (uint16_t i = sent; i < nplain; i++)
+			rte_pktmbuf_free(plain[i]);
+	}
+}
+
 static int
 worker_main(void *arg)
 {
@@ -496,58 +603,27 @@ worker_main(void *arg)
 	uint16_t port = d->port_id;
 	uint64_t last_t = 0;
 
-	fprintf(stderr, "r2dp-fwd: worker on lcore %u, port %u\n",
-	    rte_lcore_id(), port);
+	fprintf(stderr, "r2dp-fwd: worker on lcore %u, outer=%u inner=%d\n",
+	    rte_lcore_id(), port, d->inner_port);
 	for (;;) {
-		struct rte_mbuf *bufs[BURST_SZ];
-		uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
 		uint64_t now = rte_rdtsc();
 
-		if (nr == 0) {
-			if (!last_t)
-				last_t = now;
-			else if (now - last_t >= rte_get_timer_hz()) {  /* ~1s */
-				fprintf(stderr,
-				    "r2dp-fwd: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu\n",
-				    (unsigned long long)d->n_rx,
-				    (unsigned long long)d->n_tx,
-				    (unsigned long long)d->n_esp,
-				    (unsigned long long)d->n_ike,
-				    (unsigned long long)d->n_drop);
-				last_t = now;
-			}
-			continue;
+		worker_outer(d, port);
+		if (d->inner_port >= 0)
+			worker_inner(d, d->inner_port);
+
+		if (!last_t)
+			last_t = now;
+		else if (now - last_t >= rte_get_timer_hz()) {  /* ~1s */
+			fprintf(stderr,
+			    "r2dp-fwd: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu\n",
+			    (unsigned long long)d->n_rx,
+			    (unsigned long long)d->n_tx,
+			    (unsigned long long)d->n_esp,
+			    (unsigned long long)d->n_ike,
+			    (unsigned long long)d->n_drop);
+			last_t = now;
 		}
-		d->n_rx += nr;
-
-		/* split: ESP -> crypto path (consumed), non-ESP -> exception
-		 * path (re-emitted on the tap so the kernel sees it) */
-		struct rte_mbuf *plain[BURST_SZ];
-		uint16_t nplain = 0;
-		for (uint16_t i = 0; i < nr; i++) {
-			if (is_esp(bufs[i]))
-				d->n_esp++;
-			else
-				plain[nplain++] = bufs[i];
-		}
-		/* count IKE among the exception path */
-		for (uint16_t i = 0; i < nplain; i++)
-			if (is_udp(bufs[i]))
-				d->n_ike++;
-
-		uint16_t sent = rte_eth_tx_burst(port, 0, plain, nplain);
-		d->n_tx += sent;
-		d->n_drop += nplain - sent;
-		for (uint16_t i = sent; i < nplain; i++)
-			rte_pktmbuf_free(plain[i]);
-
-		/* ESP packets: run the crypto pipeline (SAD lookup + decrypt) */
-		uint16_t espc = 0;
-		for (uint16_t i = 0; i < nr; i++)
-			if (is_esp(bufs[i]))
-				bufs[espc++] = bufs[i];
-		if (espc)
-			esp_inbound(d, bufs, espc);
 	}
 	return 0;
 }
@@ -567,8 +643,13 @@ dpd_start(struct fwd_dp *dp)
 		    "(run with -l 0,<n>, e.g. -l 0-1)\n");
 		return -EAGAIN;
 	}
-	if (port_init(d) < 0)
+	if (port_init(d, d->port_id) < 0)
 		return -rte_errno;
+	/* inner (plaintext) tap is optional: single-tap mode (interop lab,
+	 * control-only) has only the outer port */
+	if (d->inner_port >= 0)
+		if (port_init(d, d->inner_port) < 0)
+			fprintf(stderr, "r2dp-fwd: inner tap init failed\n");
 	d->running = 1;
 	d->worker_lcore = lcore;
 	rte_eal_remote_launch(worker_main, d, lcore);
@@ -685,13 +766,22 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	rte_spinlock_init(&d->lock);
 
 	d->port_id = -1;
+	d->inner_port = -1;
 	RTE_ETH_FOREACH_DEV(port) {
 		struct rte_eth_dev_info di;
 		if (rte_eth_dev_info_get(port, &di) == 0 &&
 		    strstr(di.driver_name, "tap")) {
-			d->port_id = port;
-			break;
+			if (d->port_id < 0) {
+				d->port_id = port;                /* outer = ESP side */
+			} else if (d->inner_port < 0) {
+				d->inner_port = port;             /* inner = plaintext side */
+			}
 		}
+	}
+	if (d->port_id < 0) {
+		fprintf(stderr, "r2dp-fwd: no tap port found "
+		    "(add --vdev=net_tap0,iface=r2dp-tap)\n");
+		return -ENODEV;
 	}
 
 	dp->priv = d;
