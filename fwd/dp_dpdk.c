@@ -443,10 +443,38 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		ihl = (ip->version_ihl & 0x0f) * 4;
 		es = (struct rte_esp_hdr *)((uint8_t *)ip + ihl);
 
-		bufs[i]->l2_len = RTE_ETHER_HDR_LEN;
+		/* librte_ipsec's inbound decrypt expects the bare IP+ESP packet
+		 * (L2 already consumed), not the Ethernet-framed one the tap
+		 * delivers.  Strip the L2 header and set l2_len=0 so the IP sits
+		 * at offset 0; otherwise pofs is computed off-by-14 and the
+		 * ciphertext/AAD/IV are read from the wrong bytes -> AUTH_FAILED
+		 * on every real packet. */
+		(void)rte_pktmbuf_adj(bufs[i], RTE_ETHER_HDR_LEN);
+		ip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
+		ihl = (ip->version_ihl & 0x0f) * 4;
+		es = (struct rte_esp_hdr *)((uint8_t *)ip + ihl);
+
+		bufs[i]->l2_len = 0;
 		bufs[i]->l3_len = ihl;
-		bufs[i]->ol_flags |= RTE_MBUF_F_RX_SEC_OFFLOAD;
+		/* NOTE: do NOT set RTE_MBUF_F_RX_SEC_OFFLOAD here -- that flag
+		 * marks a packet already decrypted by inline hardware and is
+		 * only for hardware inline offload.  On the OpenSSL CPU-crypto
+		 * path (session type NONE) setting it misleads the inbound
+		 * prepare about the packet's crypto state. */
 		bufs[i]->packet_type = RTE_PTYPE_L3_IPV4;
+		if (d->verbose) {
+			fprintf(stderr,
+			    "r2dp-fwd: rx pkt_len=%u data_len=%u l2_len=%u l3_len=%u "
+			    "nextproto=%u dip0=%02x%02x%02x%02x\n",
+			    (unsigned)rte_pktmbuf_pkt_len(bufs[i]),
+			    (unsigned)rte_pktmbuf_data_len(bufs[i]),
+			    (unsigned)bufs[i]->l2_len, (unsigned)bufs[i]->l3_len,
+			    (unsigned)ip->next_proto_id,
+			    ((uint8_t *)&ip->dst_addr)[0],
+			    ((uint8_t *)&ip->dst_addr)[1],
+			    ((uint8_t *)&ip->dst_addr)[2],
+			    ((uint8_t *)&ip->dst_addr)[3]);
+		}
 		kkey[nk].v4.spi = ntohl(es->spi);
 		/* SAD key is keyed on (SPI, DIP) with DIP held in raw wire-order
 		 * bytes -- addr4_to_u32 (SA insert) memcpy's rsa->dst.addr[0..4]
@@ -507,15 +535,13 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 			continue;
 		}
 		if (d->verbose) {
+			uint8_t *b = rte_pktmbuf_mtod(pm[i], uint8_t *);
+			uint32_t pl = rte_pktmbuf_pkt_len(pm[i]);
 			fprintf(stderr,
-			    "r2dp-fwd: esp opsess=%p data.off=%u data.len=%u "
-			    "aad=%p dig=%p msrc=%p\n",
-			    (void *)cop[0]->sym->session,
-			    (unsigned)cop[0]->sym->aead.data.offset,
-			    (unsigned)cop[0]->sym->aead.data.length,
-			    (void *)cop[0]->sym->aead.aad.data,
-			    (void *)cop[0]->sym->aead.digest.data,
-			    (void *)cop[0]->sym->m_src);
+			    "r2dp-fwd: esp pkt=%u b20hex=", pl);
+			for (int z = 0; z < 24 && z < (int)pl; z++)
+				fprintf(stderr, "%02x", b[z]);
+			fprintf(stderr, "\n");
 		}
 		uint16_t enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, np);
 		uint16_t dq = enq ?
