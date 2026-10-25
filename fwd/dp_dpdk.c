@@ -72,6 +72,11 @@ struct dp_sa {
 	                              * and the lookup both use this numeric) */
 	uint32_t           reqid;    /* egress linkage: SP with same reqid uses
 	                              * this SA to encrypt (outbound) */
+	uint32_t           srca, dsta; /* tunnel src/dst endpoints, raw wire bytes
+	                              * (addr4_to_u32 memcpy).  racoon2 sends
+	                              * reqid=0 for every SP/SA, so egress SA
+	                              * selection must fall back to matching the
+	                              * policy's tunnel endpoints (H3). */
 	uint8_t            proto;
 	uint8_t            used;
 	uint8_t            inbound;  /* in the inbound SAD (our GETSPI) */
@@ -200,6 +205,10 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 
 	ds->spi = ntohl(rsa->spi);
 	ds->proto = rsa->proto;
+	/* tunnel endpoints: addr4_to_u32 memcpy's rsa->dst.addr[0..4], raw wire
+	 * order; match that exactly for endpoint selection (H3). */
+	memcpy(&ds->dsta, &rsa->dst.addr[0], 4);
+	memcpy(&ds->srca, &rsa->src.addr[0], 4);
 	ds->used = 1;
 	return 0;
 }
@@ -707,15 +716,34 @@ sel_match(const struct r2dp_addr *sel, uint8_t pref, const uint8_t *ip)
 	return 1;
 }
 
-/* Find the EGRESS SA for `reqid` (outbound SA carrying the matching reqid). */
+/* Find the EGRESS SA for this OUT policy.  racoon2 sends reqid=0 for every
+ * SP and SA, so reqid alone would collapse all tunnels onto the first
+ * outbound SA (H3).  Prefer an exact tunnel-endpoint match (policy tun_src/
+ * tun_dst == SA src/dst); among endpoint matches prefer a real (nonzero)
+ * reqid when the policy carries one, else the last matching slot. */
 static struct dp_sa *
-sa_by_reqid(struct dpdk_priv *d, uint32_t reqid)
+sa_by_policy(struct dpdk_priv *d, const struct r2dp_sp *sp)
 {
-	for (int i = 0; i < MAX_SA; i++)
-		if (d->sa_tab[i].used && !d->sa_tab[i].inbound &&
-		    d->sa_tab[i].reqid == reqid)
-			return &d->sa_tab[i];
-	return NULL;
+	struct dp_sa *endpoint = NULL, *last_match = NULL;
+	uint32_t ts, td;
+	int i;
+
+	memcpy(&ts, &sp->tun_src.addr[0], 4);
+	memcpy(&td, &sp->tun_dst.addr[0], 4);
+	for (i = 0; i < MAX_SA; i++) {
+		struct dp_sa *ds = &d->sa_tab[i];
+		if (!ds->used || ds->inbound)
+			continue;
+		if (ds->srca != ts || ds->dsta != td)
+			continue;
+		/* exact endpoint match */
+		if (sp->reqid && ds->reqid == sp->reqid)
+			return ds;                 /* best: endpoint + real reqid */
+		last_match = ds;
+		if (!ds->reqid)
+			endpoint = ds;             /* fallback: endpoint only */
+	}
+	return endpoint ? endpoint : last_match;
 }
 
 /* Find the OUT policy that (longest-prefix) matches this inner IPv4 packet.
@@ -753,7 +781,7 @@ sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip,
 		}
 	}
 	*sa = (best && best->action == R2DP_ACT_PROTECT) ?
-	    sa_by_reqid(d, best->reqid) : NULL;
+	    sa_by_policy(d, best) : NULL;
 	return best;
 }
 
