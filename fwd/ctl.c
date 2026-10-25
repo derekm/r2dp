@@ -133,9 +133,11 @@ do_hello(int fd, const struct r2dp_msg *m)
 	 * plumbed through the SA; NAT-T, IPv6 and EXPIRE are not yet wired, so
 	 * they must not be advertised or racoon2 would negotiate them and fail. */
 	a.features = R2DP_FEAT_ESN;
-	if (C->dp.ops && C->dp.ops->caps)
-		C->dp.ops->caps(a.enc_caps, a.integ_caps);
-	else {
+	if (C->dp.ops && C->dp.ops->caps) {
+		C->dp.ops->caps(&C->dp);
+		memcpy(a.enc_caps, C->dp.caps_bits_enc, sizeof(a.enc_caps));
+		memcpy(a.integ_caps, C->dp.caps_bits_integ, sizeof(a.integ_caps));
+	} else {
 		/* No dataplane registered: control-only mode.  Advertise NOTHING
 		 * (0xff would falsely claim every algorithm is supported). */
 		memset(a.enc_caps, 0, sizeof(a.enc_caps));
@@ -240,6 +242,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 		/* commit: promotes a larval reservation to a live SA */
 		e->larval = 0;
 		e->sa = *rq;
+		explicit_bzero(blob, sizeof(blob));   /* scrub key material (L5) */
 		reply_sa(fd, m, 0, e);
 		return;
 	case R2DP_SA_UPDATE:
@@ -260,6 +263,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 			}
 		}
 		e->larval = 0; e->sa = *rq;
+		explicit_bzero(blob, sizeof(blob));   /* scrub key material (L5) */
 		reply_sa(fd, m, 0, e);
 		return;
 	case R2DP_SA_DEL:

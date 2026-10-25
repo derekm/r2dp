@@ -67,8 +67,10 @@ struct dp_sa {
 	struct rte_ipsec_sa *sa;      /* opaque, allocated from the ipsec lib */
 	struct rte_ipsec_session sess;/* ipsec session bound to the crypto dev */
 	struct rte_cryptodev_sym_session *cses;   /* crypto sym session */
-	uint32_t           spi;      /* host order */
-	uint32_t           dip;      /* host order */
+	uint32_t           spi;      /* host order (ntohl of the wire SPI) */
+	uint32_t           dip;      /* RAW wire-order addr bytes (addr4_to_u32
+	                              * memcpy, NOT byteswapped -- the SAD key
+	                              * and the lookup both use this numeric) */
 	uint8_t            proto;
 	uint8_t            used;
 };
@@ -95,8 +97,11 @@ struct dpdk_priv {
 
 /* ------------------------------------------------------------------ */
 static void
-dpdk_caps(uint32_t enc_caps[R2DP_CAP_WORDS], uint32_t integ_caps[R2DP_CAP_WORDS])
+dpdk_caps(struct fwd_dp *dp)
 {
+	uint32_t *enc_caps = dp->caps_bits_enc;
+	uint32_t *integ_caps = dp->caps_bits_integ;
+
 	memset(enc_caps, 0, sizeof(enc_caps[0]) * R2DP_CAP_WORDS);
 	memset(integ_caps, 0, sizeof(integ_caps[0]) * R2DP_CAP_WORDS);
 	/* Advertise only the AES-GCM-16 tunnel transform dp_sa_init actually
@@ -144,6 +149,9 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	memset(&prm, 0, sizeof(prm));
 	memset(&aead, 0, sizeof(aead));
 
+	/* salt is the last 4 bytes of the AEAD blob (cipher key || salt).
+	 * memcpy'd into a host-order uint32_t but used as raw bytes: librte_ipsec
+	 * treats ipsec_xform.salt as byte-copy, so this is correct for RFC 4106. */
 	memcpy(&salt, (const uint8_t *)key + 16, 4);
 
 	aead.type = RTE_CRYPTO_SYM_XFORM_AEAD;
@@ -299,22 +307,33 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 
 	/* Upsert (SA_ADD on a larval, or SA_UPDATE on a live SA): the SAD key is
 	 * (SPI, DIP), so installing a new session for the same SPI requires a
-	 * del-then-add.  Find the slot holding that SPI's current session, tear it
-	 * down, and reuse it -- otherwise rte_ipsec_sad_add fails (duplicate key)
-	 * and the error is swallowed, leaving ctl's table on the new SA while the
-	 * SAD keeps the old (review finding). */
+	 * del-then-add.  Find the slot holding that SPI+DIP's current session,
+	 * tear it down, and reuse it -- otherwise rte_ipsec_sad_add fails
+	 * (duplicate key) and the error is swallowed, leaving ctl's table on the
+	 * new SA while the SAD keeps the old (deep-review P2/D6).  The match and
+	 * the del must use the SAME (SPI, DIP) key; SPIs are only unique per
+	 * destination, so matching on SPI+proto alone could tear down another
+	 * peer's SA. */
 	idx = -1;
 	for (int i = 0; i < MAX_SA; i++) {
 		if (d->sa_tab[i].used && d->sa_tab[i].proto == rsa->proto &&
-		    d->sa_tab[i].spi == ntohl(rsa->spi)) {
+		    d->sa_tab[i].spi == ntohl(rsa->spi) &&
+		    d->sa_tab[i].dip == dip) {
 			idx = i;
 			break;
 		}
 	}
 	if (idx >= 0) {
+		/* del using the OLD slot's stored DIP, which is the key it was
+		 * published under.  NOTE (deep-review D6): this del-then-add of a
+		 * live same-SPI SA resets its anti-replay window / ESN high bits,
+		 * so a captured packet could replay after an in-place UPDATE.
+		 * racoon2 rekeys with a fresh SPI (a new slot), so this is the
+		 * atypical path; carrying the replay state across an in-place
+		 * update is deferred to M4 (rte_rcu + replay-carrier). */
 		memset(&keyv, 0, sizeof(keyv));
-		keyv.v4.spi = ntohl(rsa->spi);
-		keyv.v4.dip = dip;
+		keyv.v4.spi = d->sa_tab[idx].spi;
+		keyv.v4.dip = d->sa_tab[idx].dip;
 		rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
 		sa_slot_free(d, &d->sa_tab[idx]);
 	}
@@ -402,7 +421,10 @@ port_init(struct dpdk_priv *d, uint16_t port)
 	if (port >= RTE_MAX_ETHPORTS)
 		return -1;
 	memset(&conf, 0, sizeof(conf));
-	rte_eth_dev_info_get(port, &dev_info);
+	if (rte_eth_dev_info_get(port, &dev_info) < 0) {
+		fprintf(stderr, "r2dp-fwd: dev_info_get(port %u) failed\n", port);
+		return -1;
+	}
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
@@ -444,15 +466,30 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 	for (uint16_t i = 0; i < nr; i++) {
 		struct rte_ether_hdr *eh =
 		    rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
-		struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)
-		    ((uint8_t *)eh + RTE_ETHER_HDR_LEN);
+		struct rte_ipv4_hdr *ip;
 		struct rte_esp_hdr *es;
 		uint8_t ihl;
+		uint16_t ipsize;
 
-		if (rte_pktmbuf_pkt_len(bufs[i]) < RTE_ETHER_HDR_LEN +
-		    sizeof(struct rte_ipv4_hdr) + sizeof(*es))
-			break;      /* too short to be inbound ESP */
+		/* Bounds-check against the FIRST segment (data_len), not the
+		 * whole packet: a multi-segment or crafted frame must never make
+		 * us read past the segment we pointer-walk. */
+		if (rte_pktmbuf_data_len(bufs[i]) <
+		    RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
+			goto bad;                    /* too short for IP */
+		ip = (struct rte_ipv4_hdr *)((uint8_t *)eh + RTE_ETHER_HDR_LEN);
 		ihl = (ip->version_ihl & 0x0f) * 4;
+		if (ihl < sizeof(struct rte_ipv4_hdr))   /* IHL < 5 */
+			goto bad;
+		/* ESP header must fit within this segment after the IP header. */
+		if (rte_pktmbuf_data_len(bufs[i]) <
+		    RTE_ETHER_HDR_LEN + ihl + sizeof(*es))
+			goto bad;
+		/* IP total-length must match a sane minimum (don't trust it for
+		 * crypto, but reject absurd values early). */
+		ipsize = ntohs(ip->total_length);
+		if (ipsize < ihl + sizeof(*es))
+			goto bad;
 		es = (struct rte_esp_hdr *)((uint8_t *)ip + ihl);
 
 		/* librte_ipsec's inbound decrypt expects the bare IP+ESP packet
@@ -503,6 +540,13 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		keys[nk] = &kkey[nk];
 		pm[nk] = bufs[i];
 		nk++;
+		continue;
+bad:
+		/* malformed/undersized frame: drop it and move on so the rest of
+		 * the burst is still processed (a `break` here would leak every
+		 * remaining mbuf -- a remote pool-exhaustion DoS). */
+		d->n_drop++;
+		rte_pktmbuf_free(bufs[i]);
 	}
 	if (nk == 0) {
 		if (nout) *nout = 0;
@@ -876,9 +920,10 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 
 		memset(&conf, 0, sizeof(conf));
 		conf.socket_id = SOCKET_ID_ANY;
-		conf.max_sa[RTE_IPSEC_SAD_SPI_ONLY] = MAX_SA;
+		/* Only the SPI_DIP key flavor is used (inbound ESP lookup).  Leave
+		 * the other table types unsized (0) so the SAD doesn't preallocate
+		 * SPI_ONLY / SPI_DIP_SIP tables we never query. */
 		conf.max_sa[RTE_IPSEC_SAD_SPI_DIP] = MAX_SA;
-		conf.max_sa[RTE_IPSEC_SAD_SPI_DIP_SIP] = MAX_SA;
 		conf.flags = RTE_IPSEC_SAD_FLAG_RW_CONCURRENCY;
 		d->sad = rte_ipsec_sad_create("r2dp_sad", &conf);
 		if (!d->sad) {
@@ -920,7 +965,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	dpdk_ops.stop   = dpd_stop;
 	dp->ops = &dpdk_ops;
 	if (dp->ops->caps)
-		dp->ops->caps(dp->ops->caps_bits_enc, dp->ops->caps_bits_integ);
+		dp->ops->caps(dp);
 	if (dp->ops->start)
 		dp->ops->start(dp);   /* bring up the worker + port */
 	fprintf(stderr, "r2dp-fwd: DPDK dataplane ready (port=%d cdev=%d sad=%p)\n",

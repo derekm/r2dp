@@ -22,8 +22,9 @@
 struct fwd_dp;
 
 struct fwd_dp_ops {
-	/* Set a capability word bit for IANA encr/integ transforms. */
-	void (*caps)(uint32_t enc_caps[8], uint32_t integ_caps[8]);
+	/* Fill the dataplane's supported-crypto bitmaps (enc_caps/integ_caps)
+	 * in the fwd_dp, not a const member of this ops table. */
+	void (*caps)(struct fwd_dp *dp);
 
 	/* Install (add=1) or remove (add=0) an SA in the dataplane.
 	 * `blob` is the AEAD key material (cipher key || salt, enckeylen
@@ -39,16 +40,16 @@ struct fwd_dp_ops {
 	/* Optional: start/stop the datapath packet threads. */
 	int (*start)(struct fwd_dp *dp);
 	void (*stop)(struct fwd_dp *dp);
-
-	/* Capability bitmaps the dataplane actually supports. */
-	uint32_t caps_bits_enc[8];
-	uint32_t caps_bits_integ[8];
 };
 
 struct fwd_dp {
 	const struct fwd_dp_ops *ops;
 	void *priv;             /* backend private state */
 	uint32_t flags;
+
+	/* Capability bitmaps the dataplane actually supports. */
+	uint32_t caps_bits_enc[8];
+	uint32_t caps_bits_integ[8];
 };
 
 /* Defaults: zero -> no backend (ctl.c still answers protocol). */
