@@ -160,8 +160,16 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	 * uses. */
 	aead.aead.iv.offset = sizeof(struct rte_crypto_op) +
 	    sizeof(struct rte_crypto_sym_op);
+	/* RFC 4106 GCM AAD is SPI‖SeqNo (8 bytes, 12 with ESN) as a *wire*
+	 * concept, but librte_ipsec materialises it as the 16-byte packed
+	 * aead_gcm_aad {spi,u64 sqn,align0} and points the crypto op's
+	 * aad.data at it.  The OpenSSL PMD authenticates xform->aead.aad_length
+	 * bytes from that pointer, so the session must carry the full struct
+	 * size or the ICV never verifies (AUTH_FAILED on every real packet).
+	 * ipsec-secgw/sa.c sets aad_length = sa->aad_len = sizeof(aead_gcm_aad).
+	 * (Internal struct not in a public header; 4+u64+4 = 16 packed.) */
+	aead.aead.aad_length = 16;
 	aead.aead.digest_length = 16;
-	aead.aead.aad_length = 0;
 	aead.aead.key.data = (uint8_t *)key;
 	cur = &aead;
 	prm.crypto_xform = cur;
@@ -526,9 +534,28 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		if (cop[0] == NULL)
 			continue;
 		rte_crypto_op_attach_sym_session(cop[0], ss->crypto.ses);
-		uint16_t np = rte_ipsec_pkt_crypto_prepare(ss, &pm[i], cop, 1);
 		if (d->verbose)
-			fprintf(stderr, "r2dp-fwd: esp prepare np=%u i=%u\n", np, i);
+			fprintf(stderr,
+			    "r2dp-fwd: pre-prepare pkt_len=%u data_len=%u data_off=%u "
+			    "l2=%u l3=%u\n",
+			    (unsigned)rte_pktmbuf_pkt_len(pm[i]),
+			    (unsigned)rte_pktmbuf_data_len(pm[i]),
+			    (unsigned)rte_pktmbuf_headroom(pm[i]),
+			    (unsigned)pm[i]->l2_len, (unsigned)pm[i]->l3_len);
+		uint16_t np = rte_ipsec_pkt_crypto_prepare(ss, &pm[i], cop, 1);
+		if (d->verbose) {
+			uint8_t *b = rte_pktmbuf_mtod(pm[i], uint8_t *);
+			fprintf(stderr,
+			    "r2dp-fwd: post-prepare pkt=%u len=%u data.off=%u "
+			    "data.len=%u msrc=%p aadoff=%ld ivec=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+			    (unsigned)rte_pktmbuf_pkt_len(pm[i]),
+			    (unsigned)rte_pktmbuf_data_len(pm[i]),
+			    (unsigned)cop[0]->sym->aead.data.offset,
+			    (unsigned)cop[0]->sym->aead.data.length,
+			    (void *)cop[0]->sym->m_src,
+			    (long)((uint8_t *)cop[0]->sym->aead.aad.data - b),
+			    b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]);
+		}
 		if (np == 0) {
 			rte_crypto_op_free(cop[0]);
 			rte_pktmbuf_free(pm[i]);
