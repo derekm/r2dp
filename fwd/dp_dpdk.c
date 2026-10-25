@@ -52,6 +52,7 @@
 #include "r2dp/client.h"
 #include "dp.h"
 #include "ctl.h"
+#include "dp_gcm.h"
 
 #define MEMPOOL_CACHE 256
 #define MEMPOOL_SIZE  16384
@@ -60,8 +61,6 @@
 #define NB_TX_QUEUE   1
 #define BURST_SZ      128
 #define TAP_IF_DEFAULT "r2dp-tap"
-/* AES-GCM standard IV is 12 bytes (RFC 4106). */
-#define R2DP_GCM_IV_LEN 12
 
 struct dp_sa {
 	struct rte_ipsec_sa *sa;      /* opaque, allocated from the ipsec lib */
@@ -73,6 +72,7 @@ struct dp_sa {
 	                              * and the lookup both use this numeric) */
 	uint8_t            proto;
 	uint8_t            used;
+	uint8_t            inbound;  /* in the inbound SAD (our GETSPI) */
 };
 
 struct dpdk_priv {
@@ -123,105 +123,26 @@ addr4_to_u32(const struct r2dp_addr *a, uint32_t *out)
 }
 
 /* r2dp SA -> rte_ipsec_sa + crypto session + ipsec session.  M1: AES-GCM-16
- * tunnel.  AEAD key blob = cipher key (16) || salt (4) = 20 bytes (M0 f3). */
+ * tunnel.  AEAD key blob = cipher key (16) || salt (4) = 20 bytes (M0 f3).
+ * `inbound` distinguishes an SA protecting traffic TO us (our GETSPI: install
+ * in the inbound SAD, INGRESS+DECRYPT) from the peer's (EGRESS+ENCRYPT for
+ * the egress leg, not yet in the SAD). */
 static int
 dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
-    const void *key, size_t keylen)
+    const void *key, size_t keylen, int inbound)
 {
 	struct rte_ipsec_sa_prm prm;
-	struct rte_crypto_sym_xform aead, *cur;
+	struct rte_crypto_sym_xform aead;
+	struct rte_ipv4_hdr eh;   /* prm.tun.hdr points here: outlives init below */
 	size_t sa_sz;
-	uint32_t salt, src, dst;
+	int ret;
 
 	(void)keylen;
-	if (rsa->mode != R2DP_MODE_TUNNEL)
-		return -EOPNOTSUPP;
-	if (rsa->enc != R2DP_ENCR_AES_GCM_16)
-		return -EOPNOTSUPP;
-	if (rsa->enckeylen != 20)
-		return -EINVAL;
 	if (!d->have_cdev)
 		return -ENODEV;
-	if (addr4_to_u32(&rsa->src, &src) < 0 ||
-	    addr4_to_u32(&rsa->dst, &dst) < 0)
-		return -EAFNOSUPPORT;
-
-	memset(&prm, 0, sizeof(prm));
-	memset(&aead, 0, sizeof(aead));
-
-	/* salt is the last 4 bytes of the AEAD blob (cipher key || salt).
-	 * memcpy'd into a host-order uint32_t but used as raw bytes: librte_ipsec
-	 * treats ipsec_xform.salt as byte-copy, so this is correct for RFC 4106. */
-	memcpy(&salt, (const uint8_t *)key + 16, 4);
-
-	aead.type = RTE_CRYPTO_SYM_XFORM_AEAD;
-	aead.aead.algo = RTE_CRYPTO_AEAD_AES_GCM;
-	/* The SAD is the INBOUND decrypt table (keyed on SPI+DIP and consulted
-	 * by the inbound worker), so every session is built for DECRYPT.  The
-	 * racoon2 SA message carries direction in the SP, not the SA -- the SA
-	 * is keyed here purely for the lookup that only ever sees inbound ESP.
-	 * (Outbound encrypt rides a later SPD-driven path, not the SAD.) */
-	aead.aead.op = RTE_CRYPTO_AEAD_OP_DECRYPT;
-	aead.aead.key.length = 16;
-	aead.aead.iv.length = R2DP_GCM_IV_LEN;
-	/* IV lives in the crypto op's private area (right after op + sym_op),
-	 * where librte_ipsec writes it during prepare and the cryptodev PMD
-	 * (OpenSSL) reads it back via this offset.  iv.offset=0 would make the
-	 * PMD read the session-pointer region as the IV -- near-NULL deref and
-	 * a crash on the first packet.  Same IV_OFFSET convention ipsec-secgw
-	 * uses. */
-	aead.aead.iv.offset = sizeof(struct rte_crypto_op) +
-	    sizeof(struct rte_crypto_sym_op);
-	/* RFC 4106 AAD = SPI‖SeqNo = 8 bytes (12 with ESN).  librte_ipsec
-	 * materialises a 16-byte internal aead_gcm_aad {spi, u64 sqn, align0}
-	 * into the op and points aad.data at it, but the OpenSSL PMD
-	 * authenticates exactly xform->aead.aad_length bytes from that pointer
-	 * (rte_openssl_pmd.c:788/1791).  ipsec-secgw and every real peer (Linux
-	 * XFRM, strongSwan, EVP) use aad_length = 8 (+4 ESN) = the true RFC 4106
-	 * AAD; sizeof(aead_gcm_aad)=16 is librte's internal *buffer* size, not
-	 * the wire AAD.  Setting 16 makes two r2dp ends round-trip (both same
-	 * mistake) but fails every real peer with AUTH_FAILED. */
-	aead.aead.aad_length = (rsa->saflags & R2DP_SAF_ESN) ? 12 : 8;
-	aead.aead.digest_length = 16;
-	aead.aead.key.data = (uint8_t *)key;
-	cur = &aead;
-	prm.crypto_xform = cur;
-
-	prm.ipsec_xform.proto = RTE_SECURITY_IPSEC_SA_PROTO_ESP;
-	prm.ipsec_xform.mode = RTE_SECURITY_IPSEC_SA_MODE_TUNNEL;
-	/* CRITICAL: librte_ipsec derives the SA's packet-functions and the
-	 * encrypt/decrypt data placement from ipsec_xform.direction, and
-	 * RTE_SECURITY_IPSEC_SA_DIR_EGRESS is enum value 0 -- so a memset-zero
-	 * prm silently builds an OUTBOUND (encrypt) SA.  The SAD is the inbound
-	 * decrypt table, so this must be INGRESS or prepare() will try to
-	 * encapsulate (grow the packet, rewrite the IP header) and the decrypt
-	 * op fails with RTE_CRYPTO_OP_STATUS_ERROR.  This was the root of the
-	 * persistent data-plane AUTH_FAILED/ERROR. */
-	prm.ipsec_xform.direction = RTE_SECURITY_IPSEC_SA_DIR_INGRESS;
-	prm.ipsec_xform.spi = ntohl(rsa->spi);
-	prm.ipsec_xform.salt = salt;
-	prm.ipsec_xform.options.esn = (rsa->saflags & R2DP_SAF_ESN) ? 1 : 0;
-	prm.ipsec_xform.replay_win_sz = rsa->wsize ? rsa->wsize : 64;
-	prm.ipsec_xform.tunnel.type = RTE_SECURITY_IPSEC_TUNNEL_IPV4;
-
-	{
-		struct rte_ipv4_hdr eh;
-
-		memset(&eh, 0, sizeof(eh));
-		eh.version_ihl = 0x45;
-		eh.time_to_live = 64;
-		eh.next_proto_id = IPPROTO_ESP;   /* OUTER IP carries ESP */
-		memcpy(&eh.src_addr, &src, 4);
-		memcpy(&eh.dst_addr, &dst, 4);
-		prm.tun.hdr_len = sizeof(eh);
-		prm.tun.hdr_l3_off = 0;
-		/* tun.next_proto is the INNER protocol (what rides inside the ESP
-		 * tunnel), not ESP.  For an IPv4-in-IPv4 tunnel that is IPIP;
-		 * rte_ipsec_sa_size returns -EINVAL if this is wrongly set to
-		 * IPPROTO_ESP (fill_sa_type rejects the nested case). */
-		prm.tun.next_proto = IPPROTO_IPIP;
-		prm.tun.hdr = &eh;
-	}
+	ret = r2dp_gcm_sa_prm(rsa, key, inbound, &prm, &aead, &eh);
+	if (ret < 0)
+		return ret;
 
 	/* Size the SA from the *filled* prm (rte_ipsec_sa_size(NULL) returns
 	 * -EINVAL, i.e. -22).  Mirrors ipsec-secgw/sa.c ipsec_sa_init. */
@@ -288,7 +209,7 @@ sa_slot_free(struct dpdk_priv *d, struct dp_sa *ds)
 /* ------------------------------------------------------------------ */
 static int
 sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
-    const void *key, size_t keylen, int remove)
+    const void *key, size_t keylen, int remove, int inbound)
 {
 	union rte_ipsec_sad_key keyv;
 	uint32_t dip = 0;
@@ -303,10 +224,13 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		for (int i = 0; i < MAX_SA; i++) {
 			if (d->sa_tab[i].used && d->sa_tab[i].spi == ntohl(rsa->spi) &&
 			    d->sa_tab[i].proto == rsa->proto) {
-				memset(&keyv, 0, sizeof(keyv));
-				keyv.v4.spi = ntohl(rsa->spi);
-				keyv.v4.dip = dip;
-				rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
+				if (d->sa_tab[i].inbound) {
+					memset(&keyv, 0, sizeof(keyv));
+					keyv.v4.spi = ntohl(rsa->spi);
+					keyv.v4.dip = dip;
+					rte_ipsec_sad_del(d->sad, &keyv,
+					    RTE_IPSEC_SAD_SPI_DIP);
+				}
 				sa_slot_free(d, &d->sa_tab[i]);
 				break;
 			}
@@ -357,10 +281,23 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		return -ENOSPC;
 	}
 
-	ret = dp_sa_init(d, &d->sa_tab[idx], rsa, key, keylen);
+	ret = dp_sa_init(d, &d->sa_tab[idx], rsa, key, keylen, inbound);
 	if (ret < 0) {
 		rte_spinlock_unlock(&d->lock);
 		return ret;
+	}
+
+	/* Only inbound SAs (protecting traffic TO us) belong in the (SPI,DIP)
+	 * inbound SAD; outbound SAs stay in sa_tab for the SPD-driven egress
+	 * leg.  The SAD is consulted only by the inbound worker. */
+	if (!inbound) {
+		d->sa_tab[idx].used = 1;
+		d->sa_tab[idx].inbound = 0;
+		d->sa_tab[idx].spi = ntohl(rsa->spi);
+		d->sa_tab[idx].proto = rsa->proto;
+		d->sa_tab[idx].dip = dip;
+		rte_spinlock_unlock(&d->lock);
+		return 0;
 	}
 
 	memset(&keyv, 0, sizeof(keyv));
@@ -383,19 +320,21 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		rte_spinlock_unlock(&d->lock);
 		return ret;
 	}
+	d->sa_tab[idx].inbound = 1;
 	d->sa_tab[idx].dip = dip;
 	rte_spinlock_unlock(&d->lock);
 	return 0;
 }
 
 /* ------------------------------------------------------------------ */
-static int
+static inline int
 dpd_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
     const void *blob, size_t blen)
 {
 	struct dpdk_priv *d = dp->priv;
 
-	return sa_install(d, sa, blob, blen, !add);
+	return sa_install(d, sa, blob, blen, !(add & 1),
+	    (add & FWD_DP_SA_INBOUND) != 0);
 }
 
 static int

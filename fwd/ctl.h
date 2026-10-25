@@ -19,6 +19,7 @@
 
 struct fwd_sa_ent {
 	int used, larval;
+	int inbound;                  /* our GETSPI reservation: ingress SA */
 	time_t larva_at;              /* when a larval reservation was made */
 	struct r2dp_sa sa;
 };

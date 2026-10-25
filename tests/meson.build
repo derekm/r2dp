@@ -29,3 +29,16 @@ test('smoke_fwd',
     link_with: libr2dp),
   args: r2dp_fwd.full_path(),
   is_parallel: false)
+
+# gcm_kat: RFC 4106 ESP known-answer test for the DPDK dataplane (crypto_openssl
+# vdev, no hugepages).  Only when DPDK is built.  SKIP (77) on a lane that has
+# DPDK but no crypto_openssl/EAL must be treated as a failure (see KAT header).
+if dpdk.found()
+  test('gcm_kat',
+    executable('gcm_kat', 'gcm_kat.c', '../fwd/dp_gcm.c',
+      include_directories: [include_directories('../include'),
+                            include_directories('../fwd')],
+      dependencies: [dpdk, dependency('libcrypto')],
+      c_args: ['-DR2DP_HAVE_DPDK=1']),
+    is_parallel: false, timeout: 60)
+endif

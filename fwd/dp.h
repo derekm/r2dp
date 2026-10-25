@@ -21,14 +21,20 @@
 
 struct fwd_dp;
 
+/* sa_add `add` flag: the SA protects traffic TO us (its SPI was allocated by
+ * our GETSPI), so install it for ingress/decrypt in the inbound SAD.  Without
+ * it an add is an outbound (egress/encrypt) SA for the SPD-driven egress leg. */
+#define FWD_DP_SA_INBOUND 0x2
+
 struct fwd_dp_ops {
 	/* Fill the dataplane's supported-crypto bitmaps (enc_caps/integ_caps)
 	 * in the fwd_dp, not a const member of this ops table. */
 	void (*caps)(struct fwd_dp *dp);
 
-	/* Install (add=1) or remove (add=0) an SA in the dataplane.
+	/* Install (add!=0) or remove (add==0) an SA in the dataplane.
 	 * `blob` is the AEAD key material (cipher key || salt, enckeylen
-	 * bytes) when present.  The dataplane keeps its own copy. */
+	 * bytes) when present.  The dataplane keeps its own copy.  `add` may
+	 * carry FWD_DP_SA_INBOUND (see above). */
 	int (*sa_add)(struct fwd_dp *dp, int add,
 	    const struct r2dp_sa *sa, const void *blob, size_t blen);
 

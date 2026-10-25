@@ -228,7 +228,11 @@ do_sa(int fd, const struct r2dp_msg *m)
 			e->used = 1;
 		}
 		{
-			int dperr = sa_apply_dp(C, 1, rq, blen ? blob : NULL, blen);
+			/* An SA completing our GETSPI reservation (a larval we handed out)
+			 * protects traffic TO us: seed the dataplane with the INBOUND flag.
+			 * The flag stays sticky across UPDATE (e->inbound). */
+			int flags = 1 | ((e->larval || e->inbound) ? FWD_DP_SA_INBOUND : 0);
+			int dperr = sa_apply_dp(C, flags, rq, blen ? blob : NULL, blen);
 			if (dperr) {
 				/* Roll back the ctl entry on dp failure.  If this was a
 				 * GETSPI larval reservation, keep it reserved; otherwise
@@ -240,6 +244,8 @@ do_sa(int fd, const struct r2dp_msg *m)
 			}
 		}
 		/* commit: promotes a larval reservation to a live SA */
+		if (e->larval)
+			e->inbound = 1;
 		e->larval = 0;
 		e->sa = *rq;
 		explicit_bzero(blob, sizeof(blob));   /* scrub key material (L5) */
@@ -252,8 +258,12 @@ do_sa(int fd, const struct r2dp_msg *m)
 			 * del-then-add, so on failure the SAD holds nothing while the
 			 * ctl table still holds the old SA -- reconcile by reverting the
 			 * ctl entry only if we had the old state.  We keep e->sa as the
-			 * last known-good so GET after a failed update is consistent. */
-			int dperr = sa_apply_dp(C, 1, rq, blen ? blob : NULL, blen);
+			 * last known-good so GET after a failed update is consistent.
+			 * racoon2 UPDATEs the larval SA it GETSPI'd: that is the inbound
+			 * SA.  An UPDATE of a live SA keeps its direction (e->inbound). */
+			int flags = 1 | ((e->larval || e->inbound) ?
+			    FWD_DP_SA_INBOUND : 0);
+			int dperr = sa_apply_dp(C, flags, rq, blen ? blob : NULL, blen);
 			if (dperr) {
 				/* e->sa was not touched: the ctl entry still reflects the
 				 * last-known-good SA, consistent with the dataplane which
@@ -262,6 +272,8 @@ do_sa(int fd, const struct r2dp_msg *m)
 				return;
 			}
 		}
+		if (e->larval)
+			e->inbound = 1;
 		e->larval = 0; e->sa = *rq;
 		explicit_bzero(blob, sizeof(blob));   /* scrub key material (L5) */
 		reply_sa(fd, m, 0, e);
