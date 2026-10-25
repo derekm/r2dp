@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -210,6 +211,27 @@ validate(void)
 	CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG, "unknown type rejected");
 }
 
+/* M1: a hung forwarder must not freeze r2dp_hello -- it times out.  Use a
+ * socketpair where the peer never answers the HELLO. */
+static void
+hello_timeout(void)
+{
+	int sv[2];
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) {
+		CHECK(0, "socketpair");
+		return;
+	}
+	/* Benchmark-safe bound: poll() runs 5s of wall clock; cap the test so a
+	 * hung HELLO can't take the suite down with it. */
+	alarm(10);
+	CHECK(r2dp_hello(sv[0], R2DP_ROLE_SPMD, NULL) == -ETIMEDOUT,
+	    "hello times out against silent peer");
+	alarm(0);
+	close(sv[0]);
+	close(sv[1]);
+}
+
 int
 main(void)
 {
@@ -219,6 +241,7 @@ main(void)
 	addr_unsupported();
 	caps();
 	validate();
+	hello_timeout();
 
 	if (failures) {
 		fprintf(stderr, "test_proto: %d failure(s)\n", failures);

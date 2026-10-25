@@ -83,6 +83,10 @@ int r2dp_msg_validate(const struct r2dp_msg *m, size_t n);
 /* Size a receiver buffer for r2dp_recv. */
 #define R2DP_MSG_INIT() ((struct r2dp_msg){ 0 })
 
+/* HELLO handshake timeout (ms).  A hung forwarder must not freeze the
+ * racoon2 daemon at startup; r2dp_hello returns -ETIMEDOUT past this. */
+#define R2DP_HELLO_TIMEOUT_MS 5000
+
 /* ---- handshake / capabilities ---------------------------------------- */
 /*
  * Perform the HELLO handshake: send a HELLO for `role` and read the

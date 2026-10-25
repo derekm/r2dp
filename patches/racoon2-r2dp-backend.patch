@@ -1,3 +1,27 @@
+diff --git a/README.md b/README.md
+index 5511998..d85dc1c 100644
+--- a/README.md
++++ b/README.md
+@@ -88,6 +88,19 @@ A userspace dataplane backend (same rcpfk_* ABI) is
+ That loopbacks SA/SPD to iked and optionally mirrors to
+ `RACOON2_DATAPLANE_SOCK`. There is no DPDK forwarding process in
+ this tree, and the userspace backend ignores mark/if_id/offload.
++
++An external-forwarder backend (same rcpfk_* ABI, request/reply over
++a unix SEQPACKET socket) is
++
++	./configure --with-km-backend=r2dp --with-r2dp=PREFIX
++
++That is Mark Wilcox's r2dp M0: iked/spmd drive a forwarder instead of
++the kernel. Wire values are IANA IKEv2 transform IDs; GETSPI is
++allocated by the forwarder. Needs an installed `libr2dp` from the
++stand-alone project: **https://github.com/derekm/r2dp** (proto.h,
++`client.h`, `libr2dp/`, mock forwarder, M0 tests + CI). The r2dp
++`--with-r2dp=PREFIX` config resolves it via pkg-config (`r2dp.pc`).
++
+ On the Linux XFRM backend, XFRM mark, if_id and ESP device offload
+ (`XFRMA_OFFLOAD_DEV`) are wired (config grammar and emit paths, see
+ doc/xfrm-offload.md) but **experimental**: no hardware-backed matrix
 diff --git a/configure.ac b/configure.ac
 index 3968eae..e47d9ef 100644
 --- a/configure.ac
@@ -130,10 +154,10 @@ index bb89924..307ceb3 100644
  
 diff --git a/lib/if_r2dp.c b/lib/if_r2dp.c
 new file mode 100644
-index 0000000..d742f4d
+index 0000000..f0f8557
 --- /dev/null
 +++ b/lib/if_r2dp.c
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,712 @@
 +/*
 + * lib/if_r2dp.c -- racoon2 SAD/SPD backend that speaks the r2dp control
 + * protocol to an external forwarder (e.g. the DPDK dataplane).
@@ -555,9 +579,14 @@ index 0000000..d742f4d
 +	sa->lft_hard_bytes = rc->lft_hard_bytes;
 +	sa->lft_soft_time = rc->lft_soft_time;
 +	sa->lft_soft_bytes = rc->lft_soft_bytes;
-+	if (pack_addr(rc, &sa->src, rc->sa_src) || pack_addr(rc, &sa->dst, rc->sa_dst) ||
-+	    pack_addr(rc, &sa->natoa_src, rc->sa_natoa_src) ||
-+	    pack_addr(rc, &sa->natoa_dst, rc->sa_natoa_dst))
++	if (pack_addr(rc, &sa->src, rc->sa_src) || pack_addr(rc, &sa->dst, rc->sa_dst))
++		return -1;
++	/* NAT-OA addresses are only present when NAT-T is negotiated; absent
++	 * sockaddrs stay as AF_UNSET (memzero'd above) and must not fail the
++	 * pack (r2dp_addr_from_sa(NULL) returns EAFNOSUPPORT). */
++	if (rc->sa_natoa_src && pack_addr(rc, &sa->natoa_src, rc->sa_natoa_src))
++		return -1;
++	if (rc->sa_natoa_dst && pack_addr(rc, &sa->natoa_dst, rc->sa_natoa_dst))
 +		return -1;
 +	return 0;
 +}

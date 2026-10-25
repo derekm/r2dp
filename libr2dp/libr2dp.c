@@ -274,6 +274,20 @@ r2dp_hello(int fd, uint32_t role, struct r2dp_hello_ack *ack)
 	r = r2dp_send(fd, R2DP_HELLO, 0, 0, 0, &hello, sizeof(hello), NULL, 0);
 	if (r < 0)
 		return r;
+	/* Bound the handshake: a hung forwarder must not freeze iked/spmd at
+	 * startup forever.  Poll for the ACK with a timeout; -ETIMEDOUT on no
+	 * reply. */
+	{
+		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		int pr;
+		do {
+			pr = poll(&pfd, 1, R2DP_HELLO_TIMEOUT_MS);
+		} while (pr < 0 && errno == EINTR);
+		if (pr == 0)
+			return -ETIMEDOUT;
+		if (pr < 0)
+			return -errno;
+	}
 	memset(&m, 0, sizeof(m));
 	if ((r = r2dp_recv(fd, &m)) < 0)
 		return r;
