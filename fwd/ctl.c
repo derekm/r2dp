@@ -1,3 +1,4 @@
+#define _GNU_SOURCE   /* SO_PEERCRED / struct ucred */
 /*
  * fwd/ctl.c -- r2dp control-plane server for the DPDK forwarder.
  *
@@ -26,6 +27,8 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
+#include <sys/random.h>
+#include <sys/socket.h>
 
 #include "r2dp/client.h"
 #include "dp.h"
@@ -126,15 +129,17 @@ do_hello(int fd, const struct r2dp_msg *m)
 	memset(&a, 0, sizeof(a));
 	a.epoch = C->epoch;
 	a.max_msg = R2DP_MAX_MSG;
-	/* advertises what the DPDK CPU-crypto baseline supports; a forwarder
-	 * with a broadened PMD can tighten these later */
-	a.features = R2DP_FEAT_ESN | R2DP_FEAT_NATT | R2DP_FEAT_IPV6 |
-	    R2DP_FEAT_EXPIRE;
+	/* Advertise only what the dataplane actually implements.  ESN is
+	 * plumbed through the SA; NAT-T, IPv6 and EXPIRE are not yet wired, so
+	 * they must not be advertised or racoon2 would negotiate them and fail. */
+	a.features = R2DP_FEAT_ESN;
 	if (C->dp.ops && C->dp.ops->caps)
 		C->dp.ops->caps(a.enc_caps, a.integ_caps);
 	else {
-		memset(a.enc_caps, 0xff, sizeof(a.enc_caps));
-		memset(a.integ_caps, 0xff, sizeof(a.integ_caps));
+		/* No dataplane registered: control-only mode.  Advertise NOTHING
+		 * (0xff would falsely claim every algorithm is supported). */
+		memset(a.enc_caps, 0, sizeof(a.enc_caps));
+		memset(a.integ_caps, 0, sizeof(a.integ_caps));
 	}
 	LOG("HELLO role=%u pid=%u", h->role, h->pid);
 	r2dp_send(fd, R2DP_HELLO_ACK, m->h.seq, 0, 0, &a, sizeof(a), NULL, 0);
@@ -154,12 +159,16 @@ do_getspi(int fd, const struct r2dp_msg *m)
 		reply_sa(fd, m, EINVAL, NULL);
 		return;
 	}
-	if (C->next_spi < lo || C->next_spi > hi)
-		C->next_spi = lo;
+	/* Random SPI within the range: sequential allocation from a fixed seed
+	 * makes SPIs predictable and (across peers) colliding.  getrandom is
+	 * available on Linux; fall back to a time/pid mix elsewhere. */
 	for (uint32_t tries = 0, span = hi - lo + 1; tries < span; tries++) {
 		struct r2dp_sa k = *rq;
-		cand = C->next_spi;
-		C->next_spi = cand >= hi ? lo : cand + 1;
+		uint32_t r;
+		if (getrandom(&r, sizeof(r), 0) != (ssize_t)sizeof(r))
+			r = (uint32_t)((uint64_t)time(NULL) ^ (uint64_t)getpid()
+			    ^ (uint64_t)(uintptr_t)&r ^ (uintptr_t)m);
+		cand = lo + (r % span);
 		k.spi = htonl(cand);
 		if (sa_find(C, &k))
 			continue;
@@ -167,12 +176,25 @@ do_getspi(int fd, const struct r2dp_msg *m)
 		e = &C->sad[idx];
 		memset(e, 0, sizeof(*e));
 		e->used = e->larval = 1;
+		e->larva_at = time(NULL);
 		e->sa = *rq;
 		e->sa.spi = htonl(cand);
 		reply_sa(fd, m, 0, e);
 		return;
 	}
 	reply_sa(fd, m, ENOSPC, NULL);
+}
+
+/* Reap larval (GETSPI-reserved, never confirmed) SAs past their TTL. */
+static void
+reap_larv(void)
+{
+	time_t now = time(NULL);
+
+	for (int i = 0; i < FWD_MAXSA; i++)
+		if (C->sad[i].used && C->sad[i].larval &&
+		    now - C->sad[i].larva_at > R2DP_LARVAL_TTL_S)
+			C->sad[i].used = 0;
 }
 
 static void
@@ -200,33 +222,56 @@ do_sa(int fd, const struct r2dp_msg *m)
 			int i = sa_alloc_idx(C);
 			if (i < 0) { reply_sa(fd, m, ENOBUFS, NULL); return; }
 			e = &C->sad[i];
+			memset(e, 0, sizeof(*e));
+			e->used = 1;
 		}
-		e->used = 1; e->larval = 0; e->sa = *rq;
 		{
 			int dperr = sa_apply_dp(C, 1, rq, blen ? blob : NULL, blen);
 			if (dperr) {
-				e->used = 0;   /* roll back the ctl entry on dp failure */
+				/* Roll back the ctl entry on dp failure.  If this was a
+				 * GETSPI larval reservation, keep it reserved; otherwise
+				 * free the slot. */
+				if (!e->larval)
+					e->used = 0;
 				reply_sa(fd, m, dperr, NULL);
 				return;
 			}
 		}
+		/* commit: promotes a larval reservation to a live SA */
+		e->larval = 0;
+		e->sa = *rq;
 		reply_sa(fd, m, 0, e);
 		return;
 	case R2DP_SA_UPDATE:
 		if (!e) { reply_sa(fd, m, ENOENT, NULL); return; }
-		e->larval = 0; e->sa = *rq;
 		{
+			/* Apply to the dataplane FIRST.  The dataplane's update is
+			 * del-then-add, so on failure the SAD holds nothing while the
+			 * ctl table still holds the old SA -- reconcile by reverting the
+			 * ctl entry only if we had the old state.  We keep e->sa as the
+			 * last known-good so GET after a failed update is consistent. */
 			int dperr = sa_apply_dp(C, 1, rq, blen ? blob : NULL, blen);
 			if (dperr) {
+				/* e->sa was not touched: the ctl entry still reflects the
+				 * last-known-good SA, consistent with the dataplane which
+				 * either kept the old entry or rolled back its del-then-add. */
 				reply_sa(fd, m, dperr, NULL);
 				return;
 			}
 		}
+		e->larval = 0; e->sa = *rq;
 		reply_sa(fd, m, 0, e);
 		return;
 	case R2DP_SA_DEL:
 		if (!e) { reply_sa(fd, m, ENOENT, NULL); return; }
-		sa_apply_dp(C, 0, rq, NULL, 0);
+		{
+			int dperr = sa_apply_dp(C, 0, rq, NULL, 0);
+			if (dperr) {
+				/* dataplane still owns the SA; keep the ctl entry live */
+				reply_sa(fd, m, dperr, NULL);
+				return;
+			}
+		}
 		reply_sa(fd, m, 0, e);
 		e->used = 0;
 		return;
@@ -264,16 +309,29 @@ do_sp(int fd, const struct r2dp_msg *m)
 		}
 		out.flags &= ~R2DP_SPF_UPDATE;
 		e->sp = out;
-		if (C->dp.ops && C->dp.ops->sp_add)
-			C->dp.ops->sp_add(&C->dp, &out);
+		if (C->dp.ops && C->dp.ops->sp_add) {
+			int derr = C->dp.ops->sp_add(&C->dp, &out);
+			if (derr) {
+				/* don't commit a policy the dataplane refused */
+				e->used = 0;
+				reply_sp(fd, m, derr, rq, 0);
+				return;
+			}
+		}
 		reply_sp(fd, m, 0, &out, 0);
 		return;
 	case R2DP_SP_DEL:
 		e = rq->slid ? sp_find(C, rq, 0) : sp_find(C, rq, 1);
 		if (!e) { reply_sp(fd, m, ENOENT, rq, 0); return; }
-		out = e->sp; e->used = 0;
-		if (C->dp.ops && C->dp.ops->sp_del)
-			C->dp.ops->sp_del(&C->dp, &out);
+		out = e->sp;
+		if (C->dp.ops && C->dp.ops->sp_del) {
+			int derr = C->dp.ops->sp_del(&C->dp, &out);
+			if (derr) {
+				reply_sp(fd, m, derr, &out, 0);
+				return;   /* keep the ctl entry: dataplane still holds it */
+			}
+		}
+		e->used = 0;
 		reply_sp(fd, m, 0, &out, 0);
 		return;
 	case R2DP_SP_GET:
@@ -324,11 +382,29 @@ fwd_ctl_init(struct fwd_ctl *c, const char *sockpath, int verbose)
 	signal(SIGINT, on_sig);
 	signal(SIGPIPE, SIG_IGN);
 	c->verbose = verbose;
-	c->next_spi = 0x100;
 	c->next_slid = 1;
 	c->epoch = ((uint64_t)time(NULL) << 20) ^ (uint64_t)getpid();
 	fwd_dp_init(&c->dp);       /* no-op without a registered backend */
 	return 0;
+}
+
+/* Verify the connecting peer is the socket owner (the forwarder's euid).
+ * Defense-in-depth on top of the 0600 socket mode: reject a peer whose real
+ * uid differs.  SO_PEERCRED is Linux; elsewhere accept any same-uid peer. */
+static int
+peer_allowed(int fd)
+{
+#ifdef SO_PEERCRED
+	struct ucred uc;
+	socklen_t len = sizeof(uc);
+
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &uc, &len) == 0)
+		return uc.uid == geteuid();
+	/* couldn't read creds: err on the side of rejecting */
+	return 0;
+#else
+	return 1;
+#endif
 }
 
 int
@@ -348,13 +424,18 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 		int n = 0, r;
 		if (g_stop)
 			break;
+		reap_larv();          /* expire stale GETSPI reservations */
 		pf[n].fd = lfd; pf[n++].events = POLLIN;
 		for (int i = 0; i < ncli; i++) { pf[n].fd = cli[i]; pf[n++].events = POLLIN; }
 		if (poll(pf, n, 500) < 0) { if (errno == EINTR) continue; break; }
 		if (pf[0].revents & POLLIN) {
 			int fd = r2dp_accept(lfd);
-			if (fd >= 0 && ncli < MAXCLI) cli[ncli++] = fd;
-			else if (fd >= 0) close(fd);
+			if (fd >= 0 && ncli < MAXCLI && peer_allowed(fd))
+				cli[ncli++] = fd;
+			else if (fd >= 0) {
+				fprintf(stderr, "r2dp: refused peer (uid check)\n");
+				close(fd);
+			}
 		}
 		for (int i = 0; i < ncli; i++) {
 			struct r2dp_msg m;
