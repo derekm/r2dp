@@ -691,6 +691,45 @@ is_udp(struct rte_mbuf *mb)
 	return (ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_UDP;
 }
 
+/* True for the M1 exception-path permit set: ARP, or IPv4 UDP to the IKE
+ * ports (500 / 4500 NAT-T).  Everything else from the network must have
+ * arrived protected and is dropped (H2). */
+static int
+is_ike_arp(struct rte_mbuf *mb)
+{
+	struct rte_ipv4_hdr *ip;
+	uint8_t *p;
+	uint16_t dport;
+	int ihl;
+
+	if (rte_pktmbuf_pkt_len(mb) < RTE_ETHER_HDR_LEN)
+		return 0;
+	/* ARP: ether_type 0x0806, no IPv4 header to parse */
+	p = rte_pktmbuf_mtod(mb, uint8_t *);
+	if (p[12] == 0x08 && p[13] == 0x06)
+		return 1;
+	/* not IPv4 (0x0800) -> not on the IKE/UDP permit path */
+	if (p[12] != 0x08 || p[13] != 0x00)
+		return 0;
+	if (rte_pktmbuf_pkt_len(mb) < RTE_ETHER_HDR_LEN +
+	    sizeof(struct rte_ipv4_hdr))
+		return 0;
+	ip = (struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
+	if ((ip->version_ihl >> 4) != 4 || ip->next_proto_id != IPPROTO_UDP)
+		return 0;
+	ihl = (ip->version_ihl & 0x0f) * 4;
+	if (ihl < (int)sizeof(struct rte_ipv4_hdr))
+		return 0;
+	/* UDP header after the IPv4 header: dst port at +2 */
+	{
+		const uint8_t *u = p + RTE_ETHER_HDR_LEN + ihl;
+		if ((size_t)(u - p) + 4 > rte_pktmbuf_pkt_len(mb))
+			return 0;
+		dport = (u[2] << 8) | u[3];
+	}
+	return dport == 500 || dport == 4500;
+}
+
 /* Match addr bytes against a deprecated-free selector prefix (pref 0..32). */
 static int
 sel_match(const struct r2dp_addr *sel, uint8_t pref, const uint8_t *ip)
@@ -1011,16 +1050,32 @@ worker_outer(struct dpdk_priv *d, int port)
 		}
 		/* esp_inbound owns and frees every ESP mbuf (matched or not). */
 	}
-	/* non-ESP: exception path -> the kernel side */
+	/* non-ESP: exception path -> the kernel side.  H2: don't fail open --
+	 * only IKE (UDP 500/4500) and ARP cross; other cleartext from the network
+	 * (which should have arrived under an IN PROTECT SA) is dropped. */
 	if (nex) {
-		if (is_udp(exc[0]))   /* IKE */
-			d->n_ike += nex;
 		uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
-		uint16_t sent = rte_eth_tx_burst(to, 0, exc, nex);
-		d->n_tx += sent;
-		d->n_drop += nex - sent;
-		for (uint16_t i = sent; i < nex; i++)
-			rte_pktmbuf_free(exc[i]);
+		uint16_t nf = 0;
+		struct rte_mbuf *fwd[BURST_SZ];
+		for (uint16_t i = 0; i < nex; i++) {
+			if (is_ike_arp(exc[i]))
+				fwd[nf++] = exc[i];
+			else
+				d->n_drop++;
+		}
+		if (nf) {
+			if (is_udp(fwd[0]))
+				d->n_ike += nf;   /* IKE */
+			uint16_t sent = rte_eth_tx_burst(to, 0, fwd, nf);
+			d->n_tx += sent;
+			d->n_drop += nf - sent;
+			for (uint16_t i = sent; i < nf; i++)
+				rte_pktmbuf_free(fwd[i]);
+		}
+		/* dropped-exception mbufs are freed here */
+		for (uint16_t i = 0; i < nex; i++)
+			if (!is_ike_arp(exc[i]))
+				rte_pktmbuf_free(exc[i]);
 	}
 }
 
