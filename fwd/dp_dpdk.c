@@ -203,10 +203,15 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 		return -ENOMEM;
 	}
 
-	/* bind it into an rte_ipsec_session (direction set per SA later) */
+	/* bind it into an rte_ipsec_session.  We drive the ASYNC cryptodev path
+	 * (rte_ipsec_pkt_crypto_prepare + enqueue/dequeue on the OpenSSL device),
+	 * which librte_ipsec keys off RTE_SECURITY_ACTION_TYPE_NONE.  CPU_CRYPTO
+	 * would select the SYNC prepare (rte_ipsec_pkt_cpu_prepare) instead, so
+	 * the async call would hit the wrong function -- a crash on the first
+	 * decrypted packet. */
 	memset(&ds->sess, 0, sizeof(ds->sess));
 	ds->sess.sa = ds->sa;
-	ds->sess.type = RTE_SECURITY_ACTION_TYPE_CPU_CRYPTO;
+	ds->sess.type = RTE_SECURITY_ACTION_TYPE_NONE;
 	ds->sess.crypto.ses = ds->cses;
 	ds->sess.crypto.dev_id = d->cdev_id;
 	if (rte_ipsec_session_prepare(&ds->sess) < 0) {
