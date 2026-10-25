@@ -23,7 +23,20 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
 7. **Upstream moves fast** (136 commits between my first clone and the final one). The patch is pinned to `2fd758a`; `./build.sh e2e` is the rebase check. Upstream `make install` (out-of-tree) currently fails late on a missing `01setkey` hook; unrelated to r2dp, worked around in `build-racoon2.sh`.
 
 ## M1 — Forwarder MVP (1 port, 1 worker)
-- **Builds**: `fwd/` ctl socket, SAD/SPD tables (rte_ipsec_sad + rte_acl), run-to-completion loop, IPv4 tunnel mode, AES-GCM (CPU crypto), static routes/neighbors, TAP exception path for IKE/ARP.
+- **Done (control plane)**: `fwd/` — `r2dp-fwd` daemon. `fwd/ctl.c` serves the
+  r2dp control socket hardware-agnostically behind the `fwd/dp.h` vtable
+  (HELLO/caps, GETSPI, SA_ADD/UPDATE/DEL/GET, SP_ADD/DEL/GET/DUMP, keys
+  withheld; forwarder-allocated SPI; idempotent SP_ADD; cheap SP_DUMP).
+  `fwd/main.c` + `fwd/dp.c` wire an optional DPDK dataplane
+  (`-Denable_dpdk`); without DPDK it runs control-only.
+- **Builds (control plane)**: meson + CI 4/4 tests, incl. `smoke_fwd` which
+  drives a live `r2dp-fwd` over the real protocol via `libr2dp` (independent
+  of mockfwd) — clean under ASan/UBSan.
+- **Remaining (packet path)**: `fwd/dp_dpdk.c` — rte_ipsec_sad SAD + rte_acl
+  SPD, run-to-completion loop, IPv4 tunnel mode, AES-GCM (CPU crypto), static
+  routes/neighbors, TAP exception path for IKE/ARP. Exit gate: kernel XFRM <->
+  forwarder ESP interop both directions; iked negotiates via TAP and traffic
+  flows; `r2dpctl dump` matches SAD.
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
 
