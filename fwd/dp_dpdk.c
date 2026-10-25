@@ -48,6 +48,7 @@
 #include <rte_ether.h>
 #include <rte_lcore.h>
 #include <rte_mempool.h>
+#include <rte_rcu_qsbr.h>
 
 #include "r2dp/client.h"
 #include "dp.h"
@@ -101,6 +102,8 @@ struct dpdk_priv {
 	uint8_t             cdev_id;
 	int                 have_cdev;
 	rte_spinlock_t      lock;
+	struct rte_rcu_qsbr *rcu;   /* H5: QSBR for the ctl<->worker SA/SP handoff */
+	unsigned            rcu_tid; /* worker thread id registered with the QSBR */
 	struct dp_sa        sa_tab[MAX_SA];
 	struct dp_sp_ent    sp_tab[MAX_SA];
 	int                 verbose;
@@ -226,6 +229,31 @@ sa_slot_free(struct dpdk_priv *d, struct dp_sa *ds)
 	memset(ds, 0, sizeof(*ds));
 }
 
+/* H5: retire a slot the worker may currently be using.  Step 1 (unlink):
+ * clear `used` under the lock so SA/SP lookups stop returning this session,
+ * and drop it from the inbound SAD.  Step 2: wait for the worker to pass a
+ * grace period (it reports quiescent after each loop, i.e. after its crypto
+ * path has finished touching every session it grabbed this iteration).  Only
+ * then free the session memory -- this is what prevents the ctl<->worker
+ * use-after-free on SA_DEL / rekey under traffic.  Caller holds d->lock. */
+static void
+sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds)
+{
+	union rte_ipsec_sad_key keyv;
+	int inbound = ds->inbound;
+
+	ds->used = 0;             /* unlink from worker lookups */
+	if (inbound) {
+		memset(&keyv, 0, sizeof(keyv));
+		keyv.v4.spi = ds->spi;
+		keyv.v4.dip = ds->dip;
+		rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
+	}
+	if (d->rcu)
+		rte_rcu_qsbr_synchronize(d->rcu, d->worker_lcore);
+	sa_slot_free(d, ds);
+}
+
 /* ------------------------------------------------------------------ */
 static int
 sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
@@ -246,14 +274,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 			    d->sa_tab[i].spi == ntohl(rsa->spi) &&
 			    d->sa_tab[i].proto == rsa->proto &&
 			    d->sa_tab[i].dip == dip) {
-				if (d->sa_tab[i].inbound) {
-					memset(&keyv, 0, sizeof(keyv));
-					keyv.v4.spi = ntohl(rsa->spi);
-					keyv.v4.dip = dip;
-					rte_ipsec_sad_del(d->sad, &keyv,
-					    RTE_IPSEC_SAD_SPI_DIP);
-				}
-				sa_slot_free(d, &d->sa_tab[i]);
+				sa_slot_retire(d, &d->sa_tab[i]);
 				break;
 			}
 		}
@@ -298,24 +319,17 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		}
 		d->sa_tab[newidx] = scratch;
 	}
-	d->sa_tab[newidx].used = 1;
 	d->sa_tab[newidx].spi = ntohl(rsa->spi);
 	d->sa_tab[newidx].proto = rsa->proto;
 	d->sa_tab[newidx].reqid = rsa->reqid;
 	d->sa_tab[newidx].dip = dip;
 	d->sa_tab[newidx].inbound = inbound;
+	/* publish last: the worker only proceeds past `used` == 1 */
+	d->sa_tab[newidx].used = 1;
 
 	/* tear down the old same-SPI session (now that a replacement exists) */
-	if (idx >= 0) {
-		if (d->sa_tab[idx].inbound) {
-			memset(&keyv, 0, sizeof(keyv));
-			keyv.v4.spi = d->sa_tab[idx].spi;
-			keyv.v4.dip = d->sa_tab[idx].dip;
-			rte_ipsec_sad_del(d->sad, &keyv,
-			    RTE_IPSEC_SAD_SPI_DIP);
-		}
-		sa_slot_free(d, &d->sa_tab[idx]);
-	}
+	if (idx >= 0)
+		sa_slot_retire(d, &d->sa_tab[idx]);
 
 	/* Only inbound SAs (protecting traffic TO us) belong in the (SPI,DIP)
 	 * inbound SAD; outbound SAs stay in sa_tab for the SPD-driven egress
@@ -1181,12 +1195,22 @@ worker_main(void *arg)
 
 	fprintf(stderr, "r2dp-fwd: worker on lcore %u, outer=%u inner=%d\n",
 	    rte_lcore_id(), port, d->inner_port);
+	/* H5: register this worker as a QSBR reader so ctl can synchronize
+	 * before freeing SA/SP memory.  tid = its lcore id (< RTE_MAX_LCORE). */
+	if (d->rcu) {
+		rte_rcu_qsbr_thread_register(d->rcu, d->worker_lcore);
+		rte_rcu_qsbr_thread_online(d->rcu, d->worker_lcore);
+	}
 	while (d->running) {
 		uint64_t now = rte_rdtsc();
 
 		worker_outer(d, port);
 		if (d->inner_port >= 0)
 			worker_inner(d, d->inner_port);
+
+		/* report quiescent: ctl may now free anything read this iteration */
+		if (d->rcu)
+			rte_rcu_qsbr_quiescent(d->rcu, d->worker_lcore);
 
 		if (!last_t)
 			last_t = now;
@@ -1201,6 +1225,8 @@ worker_main(void *arg)
 			last_t = now;
 		}
 	}
+	if (d->rcu)
+		rte_rcu_qsbr_thread_offline(d->rcu, d->worker_lcore);
 	return 0;
 }
 
@@ -1226,6 +1252,20 @@ dpd_start(struct fwd_dp *dp)
 	if (d->inner_port >= 0)
 		if (port_init(d, d->inner_port) < 0)
 			fprintf(stderr, "r2dp-fwd: inner tap init failed\n");
+	/* H5: QSBR so the ctl (main) thread can free SA/SP memory only after the
+	 * worker has passed a grace period -- the worker reads sa_tab/sp_tab and
+	 * holds session pointers across its crypto path with no lock, so a
+	 * synchronize here prevents a UAF when ctl deletes/rekeys under load.
+	 * This DPDK has no rte_rcu_qsbr_alloc: size it, then rte_zmalloc. */
+	{
+		size_t rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
+		d->rcu = rte_zmalloc("r2dp-rcu", rsz, RTE_CACHE_LINE_SIZE);
+		if (!d->rcu) {
+			fprintf(stderr, "r2dp-fwd: rte_rcu_qsbr alloc failed\n");
+			return -ENOMEM;
+		}
+		rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
+	}
 	d->running = 1;
 	d->worker_lcore = lcore;
 	rte_eal_remote_launch(worker_main, d, lcore);
@@ -1240,6 +1280,11 @@ dpd_stop(struct fwd_dp *dp)
 	d->running = 0;
 	if (d->worker_lcore < RTE_MAX_LCORE)
 		rte_eal_wait_lcore(d->worker_lcore);
+	if (d->rcu) {
+		rte_rcu_qsbr_thread_unregister(d->rcu, d->worker_lcore);
+		rte_free(d->rcu);
+		d->rcu = NULL;
+	}
 }
 
 /* ------------------------------------------------------------------ */
