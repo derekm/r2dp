@@ -253,6 +253,15 @@ do_sa(int fd, const struct r2dp_msg *m)
 		return;
 	case R2DP_SA_UPDATE:
 		if (!e) { reply_sa(fd, m, ENOENT, NULL); return; }
+		/* M1: an in-place UPDATE that carries key material on a LIVE
+		 * (non-larval) SA would rebuild the rte_ipsec_sa with sqn=0,
+		 * repeating sequence numbers / GCM nonces under a reused key --
+		 * catastrophic for GCM (IV reuse).  racoon2 rekeys with a fresh SPI
+		 * (new slot), so refuse instead of corrupting replay/nonce state.
+		 * A larval UPDATE (the GETSPI completion path) is fine: it installs
+		 * the key for the first time.  Lifetime-only updates carry no blob. */
+		if (!e->larval && blen)
+			{ reply_sa(fd, m, EINVAL, NULL); return; }
 		{
 			/* Apply to the dataplane FIRST.  The dataplane's update is
 			 * del-then-add, so on failure the SAD holds nothing while the

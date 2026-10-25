@@ -242,8 +242,10 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 
 	if (remove) {
 		for (int i = 0; i < MAX_SA; i++) {
-			if (d->sa_tab[i].used && d->sa_tab[i].spi == ntohl(rsa->spi) &&
-			    d->sa_tab[i].proto == rsa->proto) {
+			if (d->sa_tab[i].used &&
+			    d->sa_tab[i].spi == ntohl(rsa->spi) &&
+			    d->sa_tab[i].proto == rsa->proto &&
+			    d->sa_tab[i].dip == dip) {
 				if (d->sa_tab[i].inbound) {
 					memset(&keyv, 0, sizeof(keyv));
 					keyv.v4.spi = ntohl(rsa->spi);
@@ -261,13 +263,10 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 
 	/* Upsert (SA_ADD on a larval, or SA_UPDATE on a live SA): the SAD key is
 	 * (SPI, DIP), so installing a new session for the same SPI requires a
-	 * del-then-add.  Find the slot holding that SPI+DIP's current session,
-	 * tear it down, and reuse it -- otherwise rte_ipsec_sad_add fails
-	 * (duplicate key) and the error is swallowed, leaving ctl's table on the
-	 * new SA while the SAD keeps the old (deep-review P2/D6).  The match and
-	 * the del must use the SAME (SPI, DIP) key; SPIs are only unique per
-	 * destination, so matching on SPI+proto alone could tear down another
-	 * peer's SA. */
+	 * del-then-add.  Find the slot holding that SPI+DIP's current session.
+	 * The match and the del must use the SAME (SPI, DIP) key; SPIs are only
+	 * unique per destination, so matching on SPI+proto alone could tear down
+	 * another peer's SA. */
 	idx = -1;
 	for (int i = 0; i < MAX_SA; i++) {
 		if (d->sa_tab[i].used && d->sa_tab[i].proto == rsa->proto &&
@@ -277,46 +276,51 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 			break;
 		}
 	}
-	if (idx >= 0) {
-		/* del using the OLD slot's stored DIP, which is the key it was
-		 * published under.  NOTE (deep-review D6): this del-then-add of a
-		 * live same-SPI SA resets its anti-replay window / ESN high bits,
-		 * so a captured packet could replay after an in-place UPDATE.
-		 * racoon2 rekeys with a fresh SPI (a new slot), so this is the
-		 * atypical path; carrying the replay state across an in-place
-		 * update is deferred to M4 (rte_rcu + replay-carrier). */
-		memset(&keyv, 0, sizeof(keyv));
-		keyv.v4.spi = d->sa_tab[idx].spi;
-		keyv.v4.dip = d->sa_tab[idx].dip;
-		rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
-		sa_slot_free(d, &d->sa_tab[idx]);
-	}
 
-	/* index the first free slot (which may be the just-freed one) */
-	idx = -1;
+	/* M2 (build-then-swap): build the NEW session first so a failure leaves
+	 * the old SA untouched (ctl still holds the old one as last-known-good).
+	 * Only after the new session exists do we tear the old one down and
+	 * publish the new one -- no window where the dataplane has nothing. */
+	int newidx = -1;
 	for (int i = 0; i < MAX_SA; i++)
-		if (!d->sa_tab[i].used) { idx = i; break; }
-	if (idx < 0) {
+		if (!d->sa_tab[i].used) { newidx = i; break; }
+	if (newidx < 0) {
 		rte_spinlock_unlock(&d->lock);
 		return -ENOSPC;
 	}
+	{
+		struct dp_sa scratch;
+		memset(&scratch, 0, sizeof(scratch));
+		ret = dp_sa_init(d, &scratch, rsa, key, keylen, inbound);
+		if (ret < 0) {
+			rte_spinlock_unlock(&d->lock);
+			return ret;
+		}
+		d->sa_tab[newidx] = scratch;
+	}
+	d->sa_tab[newidx].used = 1;
+	d->sa_tab[newidx].spi = ntohl(rsa->spi);
+	d->sa_tab[newidx].proto = rsa->proto;
+	d->sa_tab[newidx].reqid = rsa->reqid;
+	d->sa_tab[newidx].dip = dip;
+	d->sa_tab[newidx].inbound = inbound;
 
-	ret = dp_sa_init(d, &d->sa_tab[idx], rsa, key, keylen, inbound);
-	if (ret < 0) {
-		rte_spinlock_unlock(&d->lock);
-		return ret;
+	/* tear down the old same-SPI session (now that a replacement exists) */
+	if (idx >= 0) {
+		if (d->sa_tab[idx].inbound) {
+			memset(&keyv, 0, sizeof(keyv));
+			keyv.v4.spi = d->sa_tab[idx].spi;
+			keyv.v4.dip = d->sa_tab[idx].dip;
+			rte_ipsec_sad_del(d->sad, &keyv,
+			    RTE_IPSEC_SAD_SPI_DIP);
+		}
+		sa_slot_free(d, &d->sa_tab[idx]);
 	}
 
 	/* Only inbound SAs (protecting traffic TO us) belong in the (SPI,DIP)
 	 * inbound SAD; outbound SAs stay in sa_tab for the SPD-driven egress
 	 * leg.  The SAD is consulted only by the inbound worker. */
 	if (!inbound) {
-		d->sa_tab[idx].used = 1;
-		d->sa_tab[idx].inbound = 0;
-		d->sa_tab[idx].spi = ntohl(rsa->spi);
-		d->sa_tab[idx].proto = rsa->proto;
-		d->sa_tab[idx].reqid = rsa->reqid;
-		d->sa_tab[idx].dip = dip;
 		rte_spinlock_unlock(&d->lock);
 		return 0;
 	}
@@ -330,14 +334,14 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		    ntohl(rsa->spi), dip, rsa->spi, dip);
 	}
 	ret = rte_ipsec_sad_add(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP,
-	    &d->sa_tab[idx].sess);   /* SAD value = the ipsec session ptr */
+	    &d->sa_tab[newidx].sess);   /* SAD value = the ipsec session ptr */
 	if (ret < 0) {
-		if (d->sa_tab[idx].cses)
-			rte_cryptodev_sym_session_free(d->cdev_id, d->sa_tab[idx].cses);
-		if (d->sa_tab[idx].sa)
-			rte_ipsec_sa_fini(d->sa_tab[idx].sa);
-		rte_free(d->sa_tab[idx].sa);
-		memset(&d->sa_tab[idx], 0, sizeof(d->sa_tab[idx]));
+		if (d->sa_tab[newidx].cses)
+			rte_cryptodev_sym_session_free(d->cdev_id, d->sa_tab[newidx].cses);
+		if (d->sa_tab[newidx].sa)
+			rte_ipsec_sa_fini(d->sa_tab[newidx].sa);
+		rte_free(d->sa_tab[newidx].sa);
+		memset(&d->sa_tab[newidx], 0, sizeof(d->sa_tab[newidx]));
 		rte_spinlock_unlock(&d->lock);
 		return ret;
 	}
