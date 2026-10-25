@@ -135,13 +135,6 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	    addr4_to_u32(&rsa->dst, &dst) < 0)
 		return -EAFNOSUPPORT;
 
-	sa_sz = rte_ipsec_sa_size(NULL);
-	if (sa_sz == 0)
-		return -EINVAL;
-	ds->sa = rte_zmalloc(NULL, sa_sz, RTE_CACHE_LINE_SIZE);
-	if (!ds->sa)
-		return -ENOMEM;
-
 	memset(&prm, 0, sizeof(prm));
 	memset(&aead, 0, sizeof(aead));
 
@@ -180,7 +173,16 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 		prm.tun.hdr = &eh;
 	}
 
-	if (rte_ipsec_sa_init(ds->sa, &prm, 0) < 0) {
+	/* Size the SA from the *filled* prm (rte_ipsec_sa_size(NULL) returns
+	 * -EINVAL, i.e. -22).  Mirrors ipsec-secgw/sa.c ipsec_sa_init. */
+	sa_sz = rte_ipsec_sa_size(&prm);
+	if ((int)sa_sz < 0)
+		return -EINVAL;
+	ds->sa = rte_zmalloc(NULL, sa_sz, RTE_CACHE_LINE_SIZE);
+	if (!ds->sa)
+		return -ENOMEM;
+
+	if (rte_ipsec_sa_init(ds->sa, &prm, sa_sz) < 0) {
 		rte_free(ds->sa);
 		ds->sa = NULL;
 		return -EINVAL;
