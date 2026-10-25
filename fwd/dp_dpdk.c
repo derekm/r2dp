@@ -98,7 +98,8 @@ dpdk_caps(uint32_t enc_caps[R2DP_CAP_WORDS], uint32_t integ_caps[R2DP_CAP_WORDS]
 	memset(enc_caps, 0, sizeof(enc_caps[0]) * R2DP_CAP_WORDS);
 	memset(integ_caps, 0, sizeof(integ_caps[0]) * R2DP_CAP_WORDS);
 	enc_caps[0] = (1u << R2DP_ENCR_AES_GCM_16) | (1u << R2DP_ENCR_AES_CBC);
-	(void)integ_caps;
+	/* AEAD transforms carry their auth inside; the INTEG side is NONE. */
+	integ_caps[0] = (1u << R2DP_INTEG_NONE);
 }
 
 static int

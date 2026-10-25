@@ -120,3 +120,20 @@ r2dp contract; earlier milestones are the baseline, not a fork):
 Keeping these in every backend is what prevents "multi-backend" from decaying
 into per-backend protocol forks.
 
+
+### M1 interop lab (2026-10-24) — control-plane KM↔forwarder proven
+- **Built** racoon2 `--with-km-backend=r2dp --with-r2dp=PREFIX` (autoreconf +
+  configure detects libr2dp via pkg-config `r2dp.pc`).
+- **Fixed** `r2dp.pc` Cflags: must be `-I{includedir}`, not `-I{includedir}/r2dp`
+  (headers are `include/r2dp/*.h`, included as `<r2dp/proto.h>`) — without this,
+  the racoon2 r2dp build fails `fatal error: r2dp/proto.h: No such file`.
+- **Interop proven (control plane)**: kernel-xfrm iked (netns A) <-> r2dp iked
+  (netns B, both spmd+iked over libr2dp to this forwarder), IKEv2 over the TAP;
+  both reach `ESTABLISHED`; iked B does GETSPI + SA_ADD (ESP/tunnel/AES-GCM,
+  enckeylen=20) to the forwarder — the external forwarder is the SAD.  Requires
+  all daemons `-F` (foreground: no pidfile, per matrix) + distinct
+  `RACOON2_ADMIN_SOCK` + per-netns spmif (two-peers-on-one-host).
+- **Known incomplete**: forwarder dataplane `esp=0` in this layout — the packet
+  path exists and is unit-verified, but the netns/bridge topology routes ESP to
+  the kernel rather than through the forwarder's tap; finishing the
+  data-plane-through-forwarder leg is the remaining exit-gate item.
