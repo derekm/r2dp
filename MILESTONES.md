@@ -41,3 +41,48 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
 - **Builds**: `rte_security` inline crypto path, ACQUIRE for on-demand SAs, fragmentation + PMTU/ICMP, resync-on-reconnect snapshot hardening.
 - **Deps**: inline-crypto NIC (hardware; optional, gated behind caps).
 - **Exit gate**: forwarder restart mid-session resyncs without iked restart; PMTU black-hole test passes; inline path matches CPU path byte-for-byte.
+
+## Multi-backend strategy (r2dp forwarders)
+
+r2dp is a **control-plane protocol** (`proto.h`: SAD/SPD CRUD over a unix
+SOCK_SEQPACKET socket); it is not a datapath API. A "backend" is therefore a
+*forwarder implementation* that owns a packet engine and speaks the same r2dp
+southbound. racoon2, `libr2dp`, and the shim are shared and unchanged across
+backends; the `HELLO`/`HELLO_ACK` `features` + `enc_caps[8]`/`integ_caps[8]`
+bitmaps (queried via `rcpfk_supported_enc/auth` / `r2dp_cap`) already let
+each engine advertise what it can do and let racoon2 refuse the rest. That
+handshake is the multi-backend seam — never fork the wire protocol per
+backend.
+
+**Target backend sequence** (each is a separate forwarder behind the same
+r2dp contract; earlier milestones are the baseline, not a fork):
+
+1. **DPDK** — M1–M4 as scoped. Userspace poll-mode, `librte_ipsec`, no special
+   hardware, CI-testable. The always-available software baseline.
+2. **P4-DPDK** — P4 datapath compiled onto DPDK (`p4c`/PNA backend). Same
+   protocol, software-testable in CI, but the *same* `.p4` can later target a
+   switch ASIC (Tofino-class) or SmartNIC. Gives the write-once →
+   silicon-upgrade path; P4's portability only pays once the P4 abstraction is
+   kept, so it is **not** parallel work in M1.
+3. **XDP2** — [xdp2-dev/xdp2](https://github.com/xdp2-dev/xdp2) (rc3) is a
+   **programming model / compiler**, not a competing engine: define a parse
+   graph once and it emits an XDP/eBPF program *and* a standalone
+   userspace/DPDK app. That matches the "external forwarder that can also run
+   in-kernel" story and avoids hand-maintaining two datapaths. Young (rc3,
+   some BPF-stack test skips), so treat as a *spike*, not the near-term bet.
+
+**Protocol invariants every backend must honor** (from the M0 run, above):
+- Forwarder is the SAD source of truth: `GETSPI` allocates; `SA_ADD`/`SP_ADD`
+  must be idempotent; `SP_DUMP` is called at spmd startup and must be cheap.
+- Bind SA ↔ policy by tunnel endpoints/selector + (SPI+dst inbound); never by
+  `reqid` alone (finding 1).
+- AEAD key blob = cipher key ‖ 4-byte salt (`enclen=20` AES-128-GCM), matching
+  `librte_ipsec` (finding 3).
+- Datapath must honor the ~16 UDP IKE bypass SPs or route IKE via the
+  exception path (finding 4).
+- Unknown transforms / XFRM-native `mark`/`if_id` are refused (`EOPNOTSUPP`),
+  not silently widened (findings 5, 6).
+
+Keeping these in every backend is what prevents "multi-backend" from decaying
+into per-backend protocol forks.
+
