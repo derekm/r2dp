@@ -82,6 +82,8 @@ struct dp_sa {
 	uint8_t            used;
 	uint8_t            inbound;  /* in the inbound SAD (our GETSPI) */
 	uint8_t            natt;     /* R2DP_NATT_*; ESP-in-UDP demux (NAT-T) */
+	uint64_t           bytes;    /* total bytes crypted on this SA (soft/hard
+	                              * byte lifetime accounting, young seq) */
 };
 
 /* SPD entry mirror for the egress (outbound) worker: populated by dpd_sp_add/
@@ -114,6 +116,20 @@ struct dpdk_priv {
 	/* per-queue counters for the worker (single rx/tx queue) */
 	uint64_t            n_rx, n_tx, n_esp, n_ike, n_drop;
 };
+
+/* The inbound SAD stores &dp_sa.sess as its value, so a session handed back
+ * from rte_ipsec_sad_lookup is the sess member of a dp_sa; recover the owner
+ * and add `n` to its byte counter (byte-lifetime accounting). */
+static inline void
+sa_bytes_add(struct dpdk_priv *d, struct rte_ipsec_session *ss, uint64_t n)
+{
+	uintptr_t off = offsetof(struct dp_sa, sess);
+	struct dp_sa *ds = (struct dp_sa *)((uint8_t *)ss - off);
+	/* sanity: the recovered pointer must land inside sa_tab */
+	uintptr_t base = (uintptr_t)d->sa_tab, end = base + sizeof(d->sa_tab);
+	if ((uintptr_t)ds >= base && (uintptr_t)ds < end && ds->used)
+		ds->bytes += n;
+}
 
 /* ------------------------------------------------------------------ */
 static void
@@ -430,6 +446,22 @@ dpd_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 
 /* dataplane vtable (process-static so it outlives the probe).  Not const:
  * the .caps callback fills dp->ops->caps_bits_* in place. */
+static int64_t
+dpd_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
+{
+	struct dpdk_priv *d = dp->priv;
+	int64_t v = -1;
+	rte_spinlock_lock(&d->lock);
+	for (int i = 0; i < MAX_SA; i++)
+		if (d->sa_tab[i].used && d->sa_tab[i].spi == spi &&
+		    d->sa_tab[i].dip == dip) {
+			v = (int64_t)d->sa_tab[i].bytes;
+			break;
+		}
+	rte_spinlock_unlock(&d->lock);
+	return v;
+}
+
 static struct fwd_dp_ops dpdk_ops;
 
 /* ------------------------------------------------------------------ */
@@ -723,8 +755,12 @@ bad:
 			 * selector check and trim to the inner IP length; drop on
 			 * mismatch/spoof. */
 			if (proc == 1 && out && no < BURST_SZ &&
-			    in_inner_ok(d, p_dip[i], pm[i]))
+			    in_inner_ok(d, p_dip[i], pm[i])) {
+				/* byte-lifetime: count what was crypted on this SA */
+				sa_bytes_add(d, ss,
+				    rte_pktmbuf_pkt_len(pm[i]));
 				out[no++] = pm[i];
+			}
 			else {
 				if (proc == 1 && d->verbose)
 					fprintf(stderr, "r2dp-fwd: inner SEL reject\n");
@@ -1085,6 +1121,8 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		proc = rte_ipsec_pkt_process(&ds->sess, &bufs[i], dq);
 		rte_crypto_op_free(cop);
 		if (proc == 1 && out && no < BURST_SZ) {
+			/* byte-lifetime: count the crypted bytes on this egress SA */
+			ds->bytes += rte_pktmbuf_pkt_len(bufs[i]);
 			struct rte_ipv4_hdr *oip =
 			    rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
 			/* NAT-T egress: insert UDP(8)+marker(4) after the outer IP
@@ -1609,6 +1647,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	/* wire the vtable: caps/sa/sp plus the worker start/stop */
 	dpdk_ops.caps   = dpdk_caps;
 	dpdk_ops.sa_add = dpd_sa_add;
+	dpdk_ops.sa_bytes = dpd_sa_bytes;
 	dpdk_ops.sp_add = dpd_sp_add;
 	dpdk_ops.sp_del = dpd_sp_del;
 	dpdk_ops.start  = dpd_start;

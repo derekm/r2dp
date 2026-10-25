@@ -195,33 +195,55 @@ do_getspi(int fd, const struct r2dp_msg *m)
 	reply_sa(fd, m, ENOSPC, NULL);
 }
 
-/* soft/hard TIME lifetime expiry -> unsolicited EXPIRE to every client
-	 * (racoon2's cb_expire hunts the SAD by SPI and rekeys).  The forwarder
-	 * is the SAD source of truth; the threshold resets on each reinstantiation.
-	 * BYTE lifetimes need per-SA counters in the dataplane and are skipped
-	 * here (0 is "infinite"), matching the mock and the M1 contract. */
+/* soft/hard TIME and BYTE lifetime expiry -> unsolicited EXPIRE to every client
+ * (racoon2's cb_expire hunts the SAD by SPI and rekeys).  The forwarder is the
+ * SAD source of truth; the threshold resets on each reinstantiation.  TIME is
+ * tracked here (available to every backend); BYTE needs a per-SA counter in the
+ * dataplane and is skipped when the backend offers no ->sa_bytes (0 is
+ * "infinite").  Notify flags are shared per level: whichever threshold (time or
+ * bytes) trips first for soft/hard fires the one EXPIRE. */
 static void
 check_lifetimes(const int *cli, int ncli)
 {
 	time_t now = time(NULL);
 	for (int i = 0; i < FWD_MAXSA; i++) {
 		struct fwd_sa_ent *e = &C->sad[i];
-		uint64_t el, soft, hard;
+		uint64_t el, soft_t, hard_t, soft_b, hard_b;
+		int64_t nbytes = -1;
 		struct r2dp_sa sp;
 		char stale;
 
 		if (!e->used || e->larval || !e->installed_at)
 			continue;
 		el = (uint64_t)(now - e->installed_at);
-		soft = e->sa.lft_soft_time;
-		hard = e->sa.lft_hard_time;
+		soft_t = e->sa.lft_soft_time;
+		hard_t = e->sa.lft_hard_time;
+		soft_b = e->sa.lft_soft_bytes;
+		hard_b = e->sa.lft_hard_bytes;
+		/* byte lifetimes: read the dataplane's counter keyed by this SA.
+		 * ctl's repo keeps spi network-order; the dp keys on host spi and
+		 * raw-wire dip bytes (addr4_to_u32 memcpy). */
+		if ((soft_b || hard_b) && C->dp.ops && C->dp.ops->sa_bytes) {
+			uint32_t hspi = ntohl(e->sa.spi);
+			uint32_t ndip;
+			memcpy(&ndip, &e->sa.dst.addr, 4);
+			nbytes = C->dp.ops->sa_bytes(&C->dp, hspi, ndip);
+		}
 		stale = 0;
 		/* hard expiry just fires (once); racoon2 dislikes a second one for
-		 * an SA already teared down.  We tear it out of the SAD here too.*/
-		if (hard && el >= hard && !e->hard_notified) {
+		 * an SA already teared down.  We tear it out of the SAD here. */
+		if (hard_t && el >= hard_t && !e->hard_notified) {
 			e->hard_notified = 1; e->soft_notified = 1;
 			sp = e->sa; sp.expired = 2; stale = 1;
-		} else if (soft && el >= soft && !e->soft_notified) {
+		} else if (hard_b && nbytes >= 0 &&
+		    (uint64_t)nbytes >= hard_b && !e->hard_notified) {
+			e->hard_notified = 1; e->soft_notified = 1;
+			sp = e->sa; sp.expired = 2; stale = 1;
+		} else if (soft_t && el >= soft_t && !e->soft_notified) {
+			e->soft_notified = 1;
+			sp = e->sa; sp.expired = 1;
+		} else if (soft_b && nbytes >= 0 &&
+		    (uint64_t)nbytes >= soft_b && !e->soft_notified) {
 			e->soft_notified = 1;
 			sp = e->sa; sp.expired = 1;
 		} else {

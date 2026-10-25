@@ -43,6 +43,10 @@ struct fwd_dp_ops {
 	int (*sp_add)(struct fwd_dp *dp, struct r2dp_sp *sp);
 	int (*sp_del)(struct fwd_dp *dp, const struct r2dp_sp *sp);
 
+	/* Optional: current byte count crypted on the SA keyed by (spi, dip),
+	 * for byte-lifetime EXPIRE.  Returns -1 if the SA is unknown. */
+	int64_t (*sa_bytes)(struct fwd_dp *dp, uint32_t spi, uint32_t dip);
+
 	/* Optional: start/stop the datapath packet threads. */
 	int (*start)(struct fwd_dp *dp);
 	void (*stop)(struct fwd_dp *dp);
