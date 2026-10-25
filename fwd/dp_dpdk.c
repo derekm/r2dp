@@ -144,8 +144,22 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 
 	aead.type = RTE_CRYPTO_SYM_XFORM_AEAD;
 	aead.aead.algo = RTE_CRYPTO_AEAD_AES_GCM;
+	/* The SAD is the INBOUND decrypt table (keyed on SPI+DIP and consulted
+	 * by the inbound worker), so every session is built for DECRYPT.  The
+	 * racoon2 SA message carries direction in the SP, not the SA -- the SA
+	 * is keyed here purely for the lookup that only ever sees inbound ESP.
+	 * (Outbound encrypt rides a later SPD-driven path, not the SAD.) */
+	aead.aead.op = RTE_CRYPTO_AEAD_OP_DECRYPT;
 	aead.aead.key.length = 16;
 	aead.aead.iv.length = R2DP_GCM_IV_LEN;
+	/* IV lives in the crypto op's private area (right after op + sym_op),
+	 * where librte_ipsec writes it during prepare and the cryptodev PMD
+	 * (OpenSSL) reads it back via this offset.  iv.offset=0 would make the
+	 * PMD read the session-pointer region as the IV -- near-NULL deref and
+	 * a crash on the first packet.  Same IV_OFFSET convention ipsec-secgw
+	 * uses. */
+	aead.aead.iv.offset = sizeof(struct rte_crypto_op) +
+	    sizeof(struct rte_crypto_sym_op);
 	aead.aead.digest_length = 16;
 	aead.aead.aad_length = 0;
 	aead.aead.key.data = (uint8_t *)key;
@@ -311,6 +325,11 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	memset(&keyv, 0, sizeof(keyv));
 	keyv.v4.spi = ntohl(rsa->spi);
 	keyv.v4.dip = dip;
+	if (d->verbose) {
+		fprintf(stderr,
+		    "r2dp-fwd: SA_ADD key spi=%08x dip=%08x (rsa.spi=%08x raw dip=%08x)\n",
+		    ntohl(rsa->spi), dip, rsa->spi, dip);
+	}
 	ret = rte_ipsec_sad_add(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP,
 	    &d->sa_tab[idx].sess);   /* SAD value = the ipsec session ptr */
 	if (ret < 0) {
@@ -429,9 +448,18 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		bufs[i]->ol_flags |= RTE_MBUF_F_RX_SEC_OFFLOAD;
 		bufs[i]->packet_type = RTE_PTYPE_L3_IPV4;
 		kkey[nk].v4.spi = ntohl(es->spi);
-		/* dst_addr is network order; addr4_to_u32 (SA insert) produced the
-		 * same numeric, so match it here without a second byte-swap */
-		kkey[nk].v4.dip = rte_be_to_cpu_32(ip->dst_addr);
+		/* SAD key is keyed on (SPI, DIP) with DIP held in raw wire-order
+		 * bytes -- addr4_to_u32 (SA insert) memcpy's rsa->dst.addr[0..4]
+		 * verbatim, so match that exact numeric here, NO byte-swap.
+		 * rte_be_to_cpu_32() would swap it and never match an installed
+		 * SA (nlook==0 on every real packet). */
+		kkey[nk].v4.dip = ip->dst_addr;
+		if (d->verbose) {
+			fprintf(stderr,
+			    "r2dp-fwd: lookup spi=%08x dip=%08x (es.spi=%08x ip.dst=%08x)\n",
+			    ntohl(es->spi), rte_be_to_cpu_32(ip->dst_addr),
+			    es->spi, ip->dst_addr);
+		}
 		keys[nk] = &kkey[nk];
 		pm[nk] = bufs[i];
 		nk++;
@@ -442,6 +470,11 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 	}
 
 	uint32_t nlook = rte_ipsec_sad_lookup(d->sad, keys, sas, nk);
+
+	if (d->verbose) {
+		fprintf(stderr, "r2dp-fwd: esp_inbound nk=%u nlook=%u\n",
+		    (unsigned)nk, (unsigned)nlook);
+	}
 
 	if (nlook == 0) {
 		/* no SA matched -- drop the whole burst */
@@ -455,6 +488,8 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 	struct rte_crypto_op *cop[1];
 	for (uint32_t i = 0; i < nk; i++) {
 		if (sas[i] == NULL) {
+			if (d->verbose)
+				fprintf(stderr, "r2dp-fwd: esp sas[%u]=NULL\n", i);
 			rte_pktmbuf_free(pm[i]);   /* partial match: drop */
 			continue;
 		}
@@ -464,14 +499,33 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 			continue;
 		rte_crypto_op_attach_sym_session(cop[0], ss->crypto.ses);
 		uint16_t np = rte_ipsec_pkt_crypto_prepare(ss, &pm[i], cop, 1);
+		if (d->verbose)
+			fprintf(stderr, "r2dp-fwd: esp prepare np=%u i=%u\n", np, i);
 		if (np == 0) {
 			rte_crypto_op_free(cop[0]);
 			rte_pktmbuf_free(pm[i]);
 			continue;
 		}
+		if (d->verbose) {
+			fprintf(stderr,
+			    "r2dp-fwd: esp opsess=%p data.off=%u data.len=%u "
+			    "aad=%p dig=%p msrc=%p\n",
+			    (void *)cop[0]->sym->session,
+			    (unsigned)cop[0]->sym->aead.data.offset,
+			    (unsigned)cop[0]->sym->aead.data.length,
+			    (void *)cop[0]->sym->aead.aad.data,
+			    (void *)cop[0]->sym->aead.digest.data,
+			    (void *)cop[0]->sym->m_src);
+		}
 		uint16_t enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, np);
 		uint16_t dq = enq ?
 		    rte_cryptodev_dequeue_burst(d->cdev_id, 0, cop, enq) : 0;
+		if (d->verbose) {
+			fprintf(stderr,
+			    "r2dp-fwd: esp crypto np=%u enq=%u dq=%u st=%u\n",
+			    np, enq, dq,
+			    (dq && cop[0]->status) ? cop[0]->status : 0);
+		}
 		/* Packet i is the one due back from crypto.  rte_ipsec_pkt_process
 		 * on dq (==1 here) leaves the DECRYPTED inner packet in pm[i];
 		 * forward it.  On any failure drop it. */
@@ -745,7 +799,10 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 				fprintf(stderr, "r2dp-fwd: sess pool failed\n");
 			d->cop_mp = rte_crypto_op_pool_create(
 			    "r2dp_cop", RTE_CRYPTO_OP_TYPE_SYMMETRIC, MAX_SA, 0,
-			    0, SOCKET_ID_ANY);
+			    sizeof(struct rte_crypto_op) +
+			      sizeof(struct rte_crypto_sym_op) +
+			      R2DP_GCM_IV_LEN,
+			    SOCKET_ID_ANY);
 			if (!d->cop_mp)
 				fprintf(stderr, "r2dp-fwd: crypto-op pool failed\n");
 		}
