@@ -1085,12 +1085,40 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		proc = rte_ipsec_pkt_process(&ds->sess, &bufs[i], dq);
 		rte_crypto_op_free(cop);
 		if (proc == 1 && out && no < BURST_SZ) {
-			/* bufs[i] is now the ESP datagram (outer IP + ESP).  librte's
-			 * outbound tunnel prepare only patches total_length/packet_id;
-			 * it leaves hdr_checksum=0, which every real peer drops
-			 * (ip_rcv -> InHdrErrors).  Compute it here (H1). */
 			struct rte_ipv4_hdr *oip =
 			    rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
+			/* NAT-T egress: insert UDP(8)+marker(4) after the outer IP
+			 * and retag proto to UDP (RFC 3948).  memmove the ESP part
+			 * up 12 B, then fill UDP hdr (sport/dport 4500) + marker. */
+			if (ds->natt == R2DP_NATT_ESPINUDP && oip &&
+			    (oip->version_ihl >> 4) == 4) {
+				uint8_t ihl = (oip->version_ihl & 0x0f) * 4;
+				uint32_t len = rte_pktmbuf_pkt_len(bufs[i]);
+				uint8_t *base = rte_pktmbuf_mtod(bufs[i], uint8_t*);
+				uint16_t plen;
+				if (rte_pktmbuf_append(bufs[i], 12)) {
+					memmove(base + ihl + 12, base + ihl,
+					    len - ihl);
+					base[ihl+0] = 0x11; base[ihl+1] = 0x94;
+					base[ihl+2] = 0x11; base[ihl+3] = 0x94;
+					plen = (uint16_t)(len - ihl + 12);
+					base[ihl+4] = plen >> 8; base[ihl+5] = plen & 0xff;
+					base[ihl+6] = 0; base[ihl+7] = 0;  /* UDP csum */
+					base[ihl+8]=0;base[ihl+9]=0;base[ihl+10]=0;base[ihl+11]=0;
+					oip->next_proto_id = IPPROTO_UDP;
+					/* bump outer IP total_length by the 12 encap bytes */
+					{
+						uint16_t tl = (
+						    ((uint16_t)base[2] << 8) | base[3]) + 12;
+						base[2] = tl >> 8; base[3] = tl & 0xff;
+					}
+					oip->hdr_checksum = 0;
+				}
+			}
+			/* librte's outbound tunnel prepare only patches
+			 * total_length/packet_id; it leaves hdr_checksum=0, which
+			 * every real peer drops (ip_rcv -> InHdrErrors).  Compute
+			 * it here (H1). */
 			if ((oip->version_ihl >> 4) == 4) {
 				oip->hdr_checksum = 0;
 				oip->hdr_checksum = rte_ipv4_cksum(oip);
