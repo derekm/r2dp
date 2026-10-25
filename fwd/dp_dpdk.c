@@ -22,6 +22,7 @@
  */
 #ifdef R2DP_HAVE_DPDK
 
+#include <stdbool.h>
 #include <errno.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -217,6 +218,19 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	return 0;
 }
 
+/* Tear down one slot: free the crypto session, ipsec SA, and zero it.
+ * Caller holds d->lock. */
+static void
+sa_slot_free(struct dpdk_priv *d, struct dp_sa *ds)
+{
+	if (ds->cses)
+		rte_cryptodev_sym_session_free(d->cdev_id, ds->cses);
+	if (ds->sa)
+		rte_ipsec_sa_fini(ds->sa);
+	rte_free(ds->sa);
+	memset(ds, 0, sizeof(*ds));
+}
+
 /* ------------------------------------------------------------------ */
 static int
 sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
@@ -239,13 +253,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 				keyv.v4.spi = ntohl(rsa->spi);
 				keyv.v4.dip = dip;
 				rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
-				if (d->sa_tab[i].cses)
-					rte_cryptodev_sym_session_free(d->cdev_id,
-					    d->sa_tab[i].cses);
-				if (d->sa_tab[i].sa)
-					rte_ipsec_sa_fini(d->sa_tab[i].sa);
-				rte_free(d->sa_tab[i].sa);
-				memset(&d->sa_tab[i], 0, sizeof(d->sa_tab[i]));
+				sa_slot_free(d, &d->sa_tab[i]);
 				break;
 			}
 		}
@@ -253,6 +261,30 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		return 0;
 	}
 
+	/* Upsert (SA_ADD on a larval, or SA_UPDATE on a live SA): the SAD key is
+	 * (SPI, DIP), so installing a new session for the same SPI requires a
+	 * del-then-add.  Find the slot holding that SPI's current session, tear it
+	 * down, and reuse it -- otherwise rte_ipsec_sad_add fails (duplicate key)
+	 * and the error is swallowed, leaving ctl's table on the new SA while the
+	 * SAD keeps the old (review finding). */
+	idx = -1;
+	for (int i = 0; i < MAX_SA; i++) {
+		if (d->sa_tab[i].used && d->sa_tab[i].proto == rsa->proto &&
+		    d->sa_tab[i].spi == ntohl(rsa->spi)) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx >= 0) {
+		memset(&keyv, 0, sizeof(keyv));
+		keyv.v4.spi = ntohl(rsa->spi);
+		keyv.v4.dip = dip;
+		rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
+		sa_slot_free(d, &d->sa_tab[idx]);
+	}
+
+	/* index the first free slot (which may be the just-freed one) */
+	idx = -1;
 	for (int i = 0; i < MAX_SA; i++)
 		if (!d->sa_tab[i].used) { idx = i; break; }
 	if (idx < 0) {
