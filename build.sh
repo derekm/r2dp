@@ -147,16 +147,18 @@ cmd_e2e() { # clean clone -> patch -> build racoon2 -> two-peer IKEv2 over veth 
     || run meson setup "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Denable_dpdk=disabled >/dev/null
   run meson install -C "$W/mbuild" >/dev/null
   info "build racoon2 with the r2dp backend"
-  if [ -x "$ROOT/tests/e2e/build-racoon2.sh" ]; then
-    run "$ROOT/tests/e2e/build-racoon2.sh" "$RACOON2_SRC" "$W" "$W/prefix"
+  if [ -x "$ROOT/build-racoon2.sh" ]; then
+    run "$ROOT/build-racoon2.sh" "$RACOON2_SRC" "$W" "$W/prefix"
   else
-    warn "tests/e2e/build-racoon2.sh not in tree yet; run the racoon2 shim build manually"
+    # The e2e gate is a real gate: if it cannot run, that is a FAILURE, not a
+    # silent success.  build-racoon2.sh is how the racoon2 shim gets built.
+    die "build-racoon2.sh not found in the tree -- e2e can't build the r2dp backend"
   fi
   info "IKEv2 end-to-end (needs root + iproute2)"
-  if [ -x "$ROOT/tests/e2e/ike_e2e.sh" ]; then
-    run "$ROOT/tests/e2e/ike_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-mockfwd"
+  if [ -x "$ROOT/ike_e2e.sh" ]; then
+    run "$ROOT/ike_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-mockfwd"
   else
-    warn "tests/e2e/ike_e2e.sh not in tree yet (the M1 netns interop exit gate); skipping"
+    die "ike_e2e.sh not found in the tree -- e2e can't run the interop gate"
   fi
 }
 

@@ -441,14 +441,27 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 				close(fd);
 			}
 		}
+		/* Process ready clients, deferring removals until after the pass so
+		 * the pf[] revents stay aligned with cli[] (M6): removing a client
+		 * mid-loop both skips other ready fds and desyncs pf[]. */
 		for (int i = 0; i < ncli; i++) {
 			struct r2dp_msg m;
 			if (!(pf[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
 			r = r2dp_recv(cli[i], &m);
 			if (r == 0) { dispatch(cli[i], &m); continue; }
-			close(cli[i]); cli[i--] = cli[--ncli];
-			break;
+			close(cli[i]); cli[i] = -1;   /* mark for removal */
+		}
+		/* compact out the -1 slots */
+		{
+			int w = 0;
+			for (int i = 0; i < ncli; i++)
+				if (cli[i] >= 0)
+					cli[w++] = cli[i];
+			ncli = w;
 		}
 	}
+	/* stop the dataplane worker threads on the way out (M4) */
+	if (C->dp.ops && C->dp.ops->stop)
+		C->dp.ops->stop(&C->dp);
 	return 0;
 }

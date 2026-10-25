@@ -772,7 +772,7 @@ worker_main(void *arg)
 
 	fprintf(stderr, "r2dp-fwd: worker on lcore %u, outer=%u inner=%d\n",
 	    rte_lcore_id(), port, d->inner_port);
-	for (;;) {
+	while (d->running) {
 		uint64_t now = rte_rdtsc();
 
 		worker_outer(d, port);
