@@ -9,7 +9,10 @@ a separate project that speaks a PF_KEY-shaped protocol over a unix socket.
 
 ## Status
 **M0 done** (protocol, client/server lib, mock forwarder, racoon2 backend, and a
-real two-peer IKEv2 test). **M1+ (the DPDK forwarder) not started.**
+real two-peer IKEv2 test). **M1 (the DPDK `r2dp-fwd` forwarder) in progress**:
+the SAD + ESP decrypt pipeline is implemented and the data plane runs, but the
+end-to-end "real ESP decrypts through the forwarder" proof and the iked-over-
+veth interop exit gate are still open.
 See `MILESTONES.md` for the full plan, exit gates, and findings.
 
 ## Layout
@@ -18,7 +21,7 @@ See `MILESTONES.md` for the full plan, exit gates, and findings.
 | `include/r2dp/proto.h` | the wire contract (algorithms = IANA IKEv2 IDs, protocols = IP proto numbers) |
 | `include/r2dp/client.h`, `libr2dp/` | transport, validation, address helpers (client + server side) |
 | `tools/mockfwd.c` | `r2dp-mockfwd`: protocol-faithful forwarder with no dataplane |
-| `patches/racoon2-r2dp-backend.patch` | applies to racoon2 `2fd758a`: 52 glue lines + `lib/if_r2dp.c` |
+| `patches/racoon2-r2dp-backend.patch` | applies to racoon2 `93e3511` (pre-r2dp base): the r2dp backend |
 | `tests/` | `test_proto`, `test_mock`, `shim_contract` (meson); spin `r2dp-mockfwd` |
 | `build.sh` | deps / check / build / test / sanitize / e2e / milestones |
 
