@@ -172,15 +172,16 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	 * uses. */
 	aead.aead.iv.offset = sizeof(struct rte_crypto_op) +
 	    sizeof(struct rte_crypto_sym_op);
-	/* RFC 4106 GCM AAD is SPI‖SeqNo (8 bytes, 12 with ESN) as a *wire*
-	 * concept, but librte_ipsec materialises it as the 16-byte packed
-	 * aead_gcm_aad {spi,u64 sqn,align0} and points the crypto op's
-	 * aad.data at it.  The OpenSSL PMD authenticates xform->aead.aad_length
-	 * bytes from that pointer, so the session must carry the full struct
-	 * size or the ICV never verifies (AUTH_FAILED on every real packet).
-	 * ipsec-secgw/sa.c sets aad_length = sa->aad_len = sizeof(aead_gcm_aad).
-	 * (Internal struct not in a public header; 4+u64+4 = 16 packed.) */
-	aead.aead.aad_length = 16;
+	/* RFC 4106 AAD = SPI‖SeqNo = 8 bytes (12 with ESN).  librte_ipsec
+	 * materialises a 16-byte internal aead_gcm_aad {spi, u64 sqn, align0}
+	 * into the op and points aad.data at it, but the OpenSSL PMD
+	 * authenticates exactly xform->aead.aad_length bytes from that pointer
+	 * (rte_openssl_pmd.c:788/1791).  ipsec-secgw and every real peer (Linux
+	 * XFRM, strongSwan, EVP) use aad_length = 8 (+4 ESN) = the true RFC 4106
+	 * AAD; sizeof(aead_gcm_aad)=16 is librte's internal *buffer* size, not
+	 * the wire AAD.  Setting 16 makes two r2dp ends round-trip (both same
+	 * mistake) but fails every real peer with AUTH_FAILED. */
+	aead.aead.aad_length = (rsa->saflags & R2DP_SAF_ESN) ? 12 : 8;
 	aead.aead.digest_length = 16;
 	aead.aead.key.data = (uint8_t *)key;
 	cur = &aead;
@@ -188,6 +189,15 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 
 	prm.ipsec_xform.proto = RTE_SECURITY_IPSEC_SA_PROTO_ESP;
 	prm.ipsec_xform.mode = RTE_SECURITY_IPSEC_SA_MODE_TUNNEL;
+	/* CRITICAL: librte_ipsec derives the SA's packet-functions and the
+	 * encrypt/decrypt data placement from ipsec_xform.direction, and
+	 * RTE_SECURITY_IPSEC_SA_DIR_EGRESS is enum value 0 -- so a memset-zero
+	 * prm silently builds an OUTBOUND (encrypt) SA.  The SAD is the inbound
+	 * decrypt table, so this must be INGRESS or prepare() will try to
+	 * encapsulate (grow the packet, rewrite the IP header) and the decrypt
+	 * op fails with RTE_CRYPTO_OP_STATUS_ERROR.  This was the root of the
+	 * persistent data-plane AUTH_FAILED/ERROR. */
+	prm.ipsec_xform.direction = RTE_SECURITY_IPSEC_SA_DIR_INGRESS;
 	prm.ipsec_xform.spi = ntohl(rsa->spi);
 	prm.ipsec_xform.salt = salt;
 	prm.ipsec_xform.options.esn = (rsa->saflags & R2DP_SAF_ESN) ? 1 : 0;
@@ -606,17 +616,19 @@ bad:
 			    (void *)cop[0]->sym->m_src,
 			    (long)((uint8_t *)cop[0]->sym->aead.aad.data - b),
 			    b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]);
-		}
-		if (np == 0) {
-			rte_crypto_op_free(cop[0]);
-			rte_pktmbuf_free(pm[i]);
-			continue;
-		}
-		if (d->verbose) {
+		fprintf(stderr, "r2dp-fwd: sa_type=%u\n",
+		    (unsigned)rte_ipsec_sa_type(ss->sa));
+	}
+	if (np == 0) {
+		rte_crypto_op_free(cop[0]);
+		rte_pktmbuf_free(pm[i]);
+		continue;
+	}
+	if (d->verbose) {
 			uint8_t *b = rte_pktmbuf_mtod(pm[i], uint8_t *);
 			uint32_t pl = rte_pktmbuf_pkt_len(pm[i]);
 			fprintf(stderr,
-			    "r2dp-fwd: esp pkt=%u b20hex=", pl);
+			    "r2dp-fwd: esp pkt=%u b20=", pl);
 			for (int z = 0; z < 24 && z < (int)pl; z++)
 				fprintf(stderr, "%02x", b[z]);
 			fprintf(stderr, "\n");
@@ -635,6 +647,15 @@ bad:
 		 * forward it.  On any failure drop it. */
 		if (dq == 1) {
 			uint16_t proc = rte_ipsec_pkt_process(ss, &pm[i], dq);
+			if (d->verbose) {
+				uint8_t *bb = rte_pktmbuf_mtod(pm[i], uint8_t *);
+				fprintf(stderr,
+				    "r2dp-fwd: post-proc proc=%u pkt=%u ol=%08llx "
+				    "b0=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+				    proc, (unsigned)rte_pktmbuf_pkt_len(pm[i]),
+				    (unsigned long long)pm[i]->ol_flags,
+				    bb[0],bb[1],bb[2],bb[3],bb[4],bb[5],bb[6],bb[7]);
+			}
 			/* processed packets have the inner (cleartext) frame */
 			if (proc == 1 && out && no < BURST_SZ)
 				out[no++] = pm[i];
@@ -693,6 +714,22 @@ worker_outer(struct dpdk_priv *d, int port)
 	if (nr == 0)
 		return;
 	d->n_rx += nr;
+	if (d->verbose) {
+		/* Dump the first raw frame as the tap delivered it, BEFORE any L2
+		 * strip, so we can compare it byte-for-byte against what was
+		 * injected (esp.bin wrapped in eth).  If these don't match, the
+		 * tap/framing assumption is wrong and every offset downstream is
+		 * garbage. */
+		struct rte_mbuf *f = bufs[0];
+		uint8_t *fr = rte_pktmbuf_mtod(f, uint8_t *);
+		uint32_t fl = rte_pktmbuf_pkt_len(f);
+		fprintf(stderr, "r2dp-fwd: RX raw pkt_len=%u data_len=%u data_off=%u: ",
+		    fl, (unsigned)rte_pktmbuf_data_len(f),
+		    (unsigned)rte_pktmbuf_headroom(f));
+		for (uint32_t z = 0; z < 40 && z < fl; z++)
+			fprintf(stderr, "%02x", fr[z]);
+		fprintf(stderr, "\n");
+	}
 	uint16_t nesp = 0, nex = 0;
 	for (uint16_t i = 0; i < nr; i++) {
 		if (is_esp(bufs[i])) {
@@ -708,11 +745,58 @@ worker_outer(struct dpdk_priv *d, int port)
 		uint16_t ndec = 0;
 		esp_inbound(d, esp, nesp, dec, &ndec);
 		if (ndec) {
+			/* rte_ipsec_pkt_process leaves the decrypted INNER packet as
+			 * bare IP (l2_len=0, no Ethernet header).  net_tap transmits
+			 * the mbuf into the kernel tap as an Ethernet frame, so a
+			 * header must be prepended or the tap sees a frameless
+			 * <64-byte packet and the peer never receives the inner
+			 * IP.  Fabricate a minimal eth header (dummy MACs -- the
+			 * next hop reads the inner IP; this matches ipsec-secgw's
+			 * tunneled-inner handling). */
+			for (uint16_t i = 0; i < ndec; i++) {
+				struct rte_ether_hdr *eh;
+				char *h = rte_pktmbuf_prepend(dec[i],
+				    RTE_ETHER_HDR_LEN);
+				if (h == NULL) {   /* no headroom: drop */
+					rte_pktmbuf_free(dec[i]);
+					dec[i] = NULL;
+					continue;
+				}
+				eh = rte_pktmbuf_mtod(dec[i],
+				    struct rte_ether_hdr *);
+				memset(eh->dst_addr.addr_bytes, 0xff, 6);
+				memset(eh->src_addr.addr_bytes, 0x00, 6);
+				eh->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+				dec[i]->l2_len = RTE_ETHER_HDR_LEN;
+				/* bump l3_len so inner IP is at eth+ip */
+				dec[i]->l3_len = 20;
+				/* Linux tap drops Ethernet frames shorter than the
+				 * 60-byte (non-VLAN) minimum.  A 44-byte decrypted ICMP
+				 * + 14 eth = 58, so pad the L2 frame to 60. */
+				{
+					uint32_t cur = rte_pktmbuf_pkt_len(dec[i]);
+					uint32_t need = RTE_ETHER_MIN_LEN;
+					if (cur < need) {
+						void *pad = rte_pktmbuf_append(dec[i],
+						    need - cur);
+						if (pad)
+							memset(pad, 0, need - cur);
+					}
+				}
+			}
 			uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
-			uint16_t sent = rte_eth_tx_burst(to, 0, dec, ndec);
+			uint16_t ntx = 0;
+			struct rte_mbuf *txq[BURST_SZ];
+			for (uint16_t i = 0; i < ndec; i++)
+				if (dec[i])
+					txq[ntx++] = dec[i];
+			uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
 			d->n_tx += sent;
-			for (uint16_t i = sent; i < ndec; i++)
-				rte_pktmbuf_free(dec[i]);
+			if (d->verbose)
+				fprintf(stderr, "r2dp-fwd: esp-tx ndec=%u ntx=%u sent=%u\n",
+				    ndec, ntx, sent);
+			for (uint16_t i = sent; i < ntx; i++)
+				rte_pktmbuf_free(txq[i]);
 		}
 		/* esp_inbound owns and frees every ESP mbuf (matched or not). */
 	}
