@@ -67,11 +67,15 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   mode brings up `r2dp-tap` + `r2dp-tap-inner` in PROMISC, worker runs
   `outer=0 inner=1`, control-plane SA install unaffected.  Commit `444d287`.
 - **Remaining (data-plane crypto proof + outbound)**: the outbound encrypt
-  leg (inner plaintext → ESP out outer) is not yet wired; and no real
-  encrypted ESP packet has yet been shown to decrypt through the forwarder
-  (the esp=0 counters).  Both are one focused pass: add outbound, then a
-  crafted/iked ESP round-trip that raises the ESP counters and delivers
-  cleartext on the inner tap.
+  leg (inner plaintext → ESP out outer) is not yet wired; a real encrypted
+  ESP packet has not yet been shown to decrypt through the forwarder.
+  CRITICAL FIX 2026-10-25 discovered during this work: the tunnel SA was
+  NEVER actually installed in the dataplane (`prm.tun.next_proto` was set to
+  ESP instead of IPIP → `rte_ipsec_sa_size()` = -22), and ctl.c swallowed the
+  error (always replied status 0).  Fixed (`0185dad`): next_proto=IPIP +
+  error propagation + SA table rollback.  The interop still reaches
+  ESTABLISHED; the SA now genuinely lands in the SAD, so the data-plane
+  crypto test has a real path to run on.
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
 
