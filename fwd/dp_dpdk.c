@@ -81,6 +81,7 @@ struct dp_sa {
 	uint8_t            proto;
 	uint8_t            used;
 	uint8_t            inbound;  /* in the inbound SAD (our GETSPI) */
+	uint8_t            natt;     /* R2DP_NATT_*; ESP-in-UDP demux (NAT-T) */
 };
 
 /* SPD entry mirror for the egress (outbound) worker: populated by dpd_sp_add/
@@ -160,9 +161,12 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	if (!d->have_cdev)
 		return -ENODEV;
 	/* D10: refuse what the data plane cannot honour, instead of accepting
-	 * and silently misbehaving.  M1 is IPv4 AES-GCM tunnel only. */
-	if (rsa->natt_type != R2DP_NATT_NONE)
-		return -EOPNOTSUPP;              /* NAT-T (UDP 4500 ESP) not wired */
+	 * and silently misbehaving.  M1 is IPv4 AES-GCM tunnel; NAT-T (ESP-in-UDP
+	 * 4500) is now handled by the outer-tap demux (uf1), so a NAT-T SA is
+	 * acceptable -- its ESP decrypts the same way after the encap is stripped. */
+	if (rsa->natt_type != R2DP_NATT_NONE &&
+	    rsa->natt_type != R2DP_NATT_ESPINUDP)
+		return -EOPNOTSUPP;              /* unknown NAT-T encapsulation */
 	if (rsa->src.family != R2DP_AF_INET4 ||
 	    rsa->dst.family != R2DP_AF_INET4)
 		return -EAFNOSUPPORT;           /* IPv4 only */
@@ -333,6 +337,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	d->sa_tab[newidx].reqid = rsa->reqid;
 	d->sa_tab[newidx].dip = dip;
 	d->sa_tab[newidx].inbound = inbound;
+	d->sa_tab[newidx].natt = rsa->natt_type;
 	/* publish last: the worker only proceeds past `used` == 1 */
 	d->sa_tab[newidx].used = 1;
 
@@ -491,6 +496,7 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		struct rte_esp_hdr *es;
 		uint8_t ihl;
 		uint16_t ipsize;
+		uint16_t natlen = 0;   /* NAT-T: extra 12 B (UDP hdr + 4-B marker) */
 
 		/* Bounds-check against the FIRST segment (data_len), not the
 		 * whole packet: a multi-segment or crafted frame must never make
@@ -502,16 +508,33 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		ihl = (ip->version_ihl & 0x0f) * 4;
 		if (ihl < sizeof(struct rte_ipv4_hdr))   /* IHL < 5 */
 			goto bad;
+		/* NAT-T (RFC 3948): outer IP proto is UDP, dst port 4500, and the
+		 * ESP packet follows a 4-byte non-ESP marker.  Detect it here so
+		 * the encap (UDP hdr 8 + marker 4 = 12 B) can be stripped before
+		 * librte_ipsec, which wants bare IP+ESP. */
+		natlen = 0;
+		if (ip->next_proto_id == IPPROTO_UDP) {
+			const uint8_t *up;
+			uint16_t dport;
+			if (rte_pktmbuf_data_len(bufs[i]) <
+			    RTE_ETHER_HDR_LEN + ihl + 8u + 4u)
+				goto bad;
+			up = (const uint8_t *)ip + ihl;
+			dport = ((uint16_t)up[2] << 8) | up[3];
+			if (dport == 4500 &&
+			    up[8] == 0 && up[9] == 0 && up[10] == 0 && up[11] == 0)
+				natlen = 8 + 4;   /* non-ESP marker present */
+		}
 		/* ESP header must fit within this segment after the IP header. */
 		if (rte_pktmbuf_data_len(bufs[i]) <
-		    RTE_ETHER_HDR_LEN + ihl + sizeof(*es))
+		    RTE_ETHER_HDR_LEN + ihl + natlen + sizeof(*es))
 			goto bad;
 		/* IP total-length must match a sane minimum (don't trust it for
 		 * crypto, but reject absurd values early). */
 		ipsize = ntohs(ip->total_length);
-		if (ipsize < ihl + sizeof(*es))
+		if (ipsize < ihl + natlen + sizeof(*es))
 			goto bad;
-		es = (struct rte_esp_hdr *)((uint8_t *)ip + ihl);
+		es = (struct rte_esp_hdr *)((uint8_t *)ip + ihl + natlen);
 
 		/* librte_ipsec's inbound decrypt expects the bare IP+ESP packet
 		 * (L2 already consumed), not the Ethernet-framed one the tap
@@ -521,6 +544,22 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		 * on every real packet. */
 		(void)rte_pktmbuf_adj(bufs[i], RTE_ETHER_HDR_LEN);
 		ip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
+		if (natlen) {
+			/* NAT-T: after the eth strip the frame is IP + UDP(8) +
+			 * marker(4) + ESP.  rte_pktmbuf_adj would strip from the FRONT
+			 * (the IP header), which is wrong.  Instead move the ESP payload
+			 * down so it sits immediately after the IP header (bare IP + ESP
+			 * for librte), then trim the now-empty UDP+marker tail. */
+			int payload = rte_pktmbuf_pkt_len(bufs[i]) - ihl - natlen;
+			uint8_t *base = rte_pktmbuf_mtod(bufs[i], uint8_t *);
+			if (payload > 0)
+				memmove(base + ihl, base + ihl + natlen,
+				    (size_t)payload);
+			if (natlen)
+				rte_pktmbuf_trim(bufs[i], natlen);
+			ip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
+			ip->next_proto_id = IPPROTO_ESP;
+		}
 		ihl = (ip->version_ihl & 0x0f) * 4;
 		es = (struct rte_esp_hdr *)((uint8_t *)ip + ihl);
 
@@ -714,6 +753,53 @@ is_esp(struct rte_mbuf *mb)
 	    sizeof(struct rte_ipv4_hdr))
 		return 0;
 	return (ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_ESP;
+}
+
+/* NAT-T (RFC 3948) ESP detection.  UDP/4500 is shared by ESP (the 4-byte
+ * non-ESP marker then the ESP packet) and by IKE-over-NAT-T; the wire cannot
+ * be trusted to tell them apart, so disambiguate by probing the inbound SAD:
+ * only a frame whose (SPI, DIP) matches an installed NAT-T SA is ESP.  IKE
+ * candidates stay on the exception path. */
+static int
+is_nat_esp(struct dpdk_priv *d, struct rte_mbuf *mb)
+{
+	uint8_t *p = rte_pktmbuf_mtod(mb, uint8_t *);
+	uint32_t pl = rte_pktmbuf_pkt_len(mb);
+	struct rte_ipv4_hdr *ip;
+	struct rte_esp_hdr *es;
+	uint8_t ihl;
+	uint16_t dport;
+	int i;
+
+	if (pl < RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
+		return 0;
+	ip = (struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
+	if ((ip->version_ihl >> 4) != 4 || ip->next_proto_id != IPPROTO_UDP)
+		return 0;
+	ihl = (ip->version_ihl & 0x0f) * 4;
+	if (ihl < sizeof(struct rte_ipv4_hdr))
+		return 0;
+	if (pl < RTE_ETHER_HDR_LEN + ihl + 8u + 4u)
+		return 0;
+	dport = ((uint16_t)p[RTE_ETHER_HDR_LEN + ihl + 2] << 8) |
+	    p[RTE_ETHER_HDR_LEN + ihl + 3];
+	/* non-ESP marker (4 zero bytes) must be present after the UDP hdr */
+	if (dport != 4500 ||
+	    p[RTE_ETHER_HDR_LEN + ihl + 8] || p[RTE_ETHER_HDR_LEN + ihl + 9] ||
+	    p[RTE_ETHER_HDR_LEN + ihl + 10] || p[RTE_ETHER_HDR_LEN + ihl + 11])
+		return 0;
+	es = (struct rte_esp_hdr *)(p + RTE_ETHER_HDR_LEN + ihl + 12);
+	/* is (SPI, outer-dst) an installed inbound SA?  Try each sa_tab entry. */
+	for (i = 0; i < MAX_SA; i++) {
+		const struct dp_sa *ds = &d->sa_tab[i];
+		if (!ds->used || !ds->inbound)
+			continue;
+		if (ds->spi != ntohl(es->spi) || ds->dip != ip->dst_addr)
+			continue;
+		if (ds->natt == R2DP_NATT_ESPINUDP)
+			return 1;
+	}
+	return 0;
 }
 
 static inline int
@@ -1072,7 +1158,7 @@ worker_outer(struct dpdk_priv *d, int port)
 	}
 	uint16_t nesp = 0, nex = 0;
 	for (uint16_t i = 0; i < nr; i++) {
-		if (is_esp(bufs[i])) {
+		if (is_esp(bufs[i]) || is_nat_esp(d, bufs[i])) {
 			d->n_esp++;
 			esp[nesp++] = bufs[i];
 		} else {
