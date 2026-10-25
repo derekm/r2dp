@@ -531,8 +531,11 @@ esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		}
 		struct rte_ipsec_session *ss = sas[i];
 		cop[0] = rte_crypto_op_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
-		if (cop[0] == NULL)
+		if (cop[0] == NULL) {
+			/* pool exhausted: drop the packet, don't leak it */
+			rte_pktmbuf_free(pm[i]);
 			continue;
+		}
 		rte_crypto_op_attach_sym_session(cop[0], ss->crypto.ses);
 		if (d->verbose)
 			fprintf(stderr,
@@ -625,32 +628,37 @@ is_udp(struct rte_mbuf *mb)
 
 /* Process a burst received on the OUTER tap (ESP side): ESP -> decrypt ->
  * forward the inner (cleartext) packet out the inner tap; non-ESP (IKE, ARP)
- * is the exception path and crosses to the inner (kernel) side. */
+ * is the exception path and crosses to the inner (kernel) side.
+ *
+ * Classify ONCE into separate arrays.  Compacting in place
+ * (bufs[nesp]=bufs[i]) overwrites the slots that still hold unclassified
+ * mbufs, and re-scanning bufs[] afterwards re-reads ESP mbufs that
+ * esp_inbound() already stripped and freed -- a doble-handling/double-free.
+ * Never touch bufs[] again after the single pass below. */
 static void
 worker_outer(struct dpdk_priv *d, int port)
 {
 	struct rte_mbuf *bufs[BURST_SZ];
+	struct rte_mbuf *esp[BURST_SZ], *exc[BURST_SZ];
 	uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
 
 	if (nr == 0)
 		return;
 	d->n_rx += nr;
-	uint16_t np = 0;
-	uint16_t nesp = 0;
+	uint16_t nesp = 0, nex = 0;
 	for (uint16_t i = 0; i < nr; i++) {
 		if (is_esp(bufs[i])) {
 			d->n_esp++;
-			bufs[nesp] = bufs[i];
-			nesp++;
+			esp[nesp++] = bufs[i];
 		} else {
-			np++;
+			exc[nex++] = bufs[i];
 		}
 	}
 
 	if (nesp) {
 		struct rte_mbuf *dec[BURST_SZ];
 		uint16_t ndec = 0;
-		esp_inbound(d, bufs, nesp, dec, &ndec);
+		esp_inbound(d, esp, nesp, dec, &ndec);
 		if (ndec) {
 			uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
 			uint16_t sent = rte_eth_tx_burst(to, 0, dec, ndec);
@@ -658,23 +666,18 @@ worker_outer(struct dpdk_priv *d, int port)
 			for (uint16_t i = sent; i < ndec; i++)
 				rte_pktmbuf_free(dec[i]);
 		}
+		/* esp_inbound owns and frees every ESP mbuf (matched or not). */
 	}
 	/* non-ESP: exception path -> the kernel side */
-	if (np) {
-		struct rte_mbuf *plain[BURST_SZ];
-		uint16_t nplain = 0;
-		for (uint16_t i = 0; i < nr; i++) {
-			if (!is_esp(bufs[i]))
-				plain[nplain++] = bufs[i];
-		}
-		if (nplain && is_udp(plain[0]))   /* IKE */
-			d->n_ike += nplain;
+	if (nex) {
+		if (is_udp(exc[0]))   /* IKE */
+			d->n_ike += nex;
 		uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
-		uint16_t sent = rte_eth_tx_burst(to, 0, plain, nplain);
+		uint16_t sent = rte_eth_tx_burst(to, 0, exc, nex);
 		d->n_tx += sent;
-		d->n_drop += nplain - sent;
-		for (uint16_t i = sent; i < nplain; i++)
-			rte_pktmbuf_free(plain[i]);
+		d->n_drop += nex - sent;
+		for (uint16_t i = sent; i < nex; i++)
+			rte_pktmbuf_free(exc[i]);
 	}
 }
 
