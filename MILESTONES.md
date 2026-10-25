@@ -159,6 +159,12 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   NAT-T SAs.  Verified inbound (UDP-encapped ESP decrypts st=0, pkt=44) and
   outbound (wire shows 4500/4500 + marker + our SPI).  IPv6 stays refused --
   it broadens SAD keys/selectors/framing and is a separate milestone item.
+- **Lifecycle EXPIRE — FIXED AND VERIFIED (da3d753 TIME, b7b9f1e BYTE)**:
+  TIME lifetimes (soft/hard, fwd/ctl.c) fire R2DP_EXPIRE(.expired=1/2) and
+  withdraw the SA on hard expiry; BYTE lifetimes use a per-SA dataplane
+  counter (dp_sa.bytes, incremented on decrypt/encrypt; ops->sa_bytes read by
+  ctl).  Verified live: soft=2s/hard=4s -> EXPIRE 1 then 2; soft_bytes=4000
+  inbound -> EXPIRE 1; soft_bytes=3000 egress -> EXPIRE 1.
 - **OPEN (deferred)**: D5 SPD priority-order + port selectors +
   IPv6; M9 egress/EVP/replay tests (gcm_kat SKIP=fail and the DPDK CI lane are
   done under b29b5bc); L1/L2/L3 doc+license+handles; L4 wsize=0->64; L6
