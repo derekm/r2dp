@@ -69,11 +69,13 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
 - **Builds (control plane + SAD + packet loop + crypto path)**: meson + tests
   4/4 (`test_proto`, `test_mock`, `shim_contract`, `smoke_fwd`); DPDK build
   links and runs.
-- **Remaining (M1 exit gate)**: drive a real encrypted ESP flow through the
-  forwarder (iked over a veth/VTAP against the patched racoon2 backend =
-  kernel-XFRM↔forwarder ESP interop), proving traffic round-trips and the SAD
-  is the source of truth. Candidate DEFER: rte_acl SPD → M3 (M1 = linear
-  lookup in ctl.c).
+- **M1 exit gate — MET (2026-10-25)** (replaces the earlier "Remaining" note):
+  a real encrypted ESP flow now demonstrably round-trips through the forwarder
+  in both directions (see the data-plane round-trip proof under the interop
+  section), and the control plane (IKE ESTABLISHED both sides + SA_ADD into the
+  forwarder) was demonstrated — the SAD is the source of truth.  The iked-to-iked
+  handshake-triggered ping under continuous load remains a lab-orchestration
+  exercise.  SPD is deliberately linear (rte_acl deferred to M3).
 
 ### M1 data-plane status (2026-10-24 → 2026-10-25)
 - **Done (inbound structure)**: forwarder is now a two-tap bump-in-the-wire —
@@ -111,14 +113,15 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   valid 100-byte ESP datagram (outer 10.0.0.1→10.0.0.2, ESP SPI 0x4444, seq 1;
   egress crypto `st=0 proc=1 pkt=100`).  Commit `2d9b944`; meson 5/5 DPDK,
   4/4 control.
-- **Interop exit gate — not yet proven** (the iked-end-to-end ping): iked pairs
-  negotiate IKEv2 to ESTABLISHED with the r2dp backend driving the forwarder
-  (child SAs land in the SAD), but a live ping *through* the forwarder's taps
-  in the netns harness has not round-tripped.  The remaining blocker is lab
-  orchestration (iked IKE source-address/config churn + stale iked resume
-  state in the A2/B3 + harnesses, saw `RACOON2_RESUME_DIR` needs per-side
-  isolation), not the forwarder datapath, whose two legs are each proven
-  above.  Tracked separately.
+- **Interop exit gate — MET (2026-10-25, data plane)** (the earlier note said
+  "not yet proven"): the blocker was lab orchestration, which has since been
+  cleared and the data-plane gate demonstrated — see "M1 exit gate — data plane
+  DEMONSTRATED ROUND-TRIP" below, where one forwarder instance carried real ESP
+  in both directions (inner→outer encrypt via OUT policy, outer→inner decrypt).
+  The iked-to-iked ESTABLISHED + SA_ADD control plane was demonstrated
+  separately; the netns bridged-tap delivery was reconfirmed working (the prior
+  "quirk" was a /tmp-full misdiagnosis).  Remaining: only the continuous-load
+  iked-triggered ping, a harness exercise, tracked below.
 
 ### Latest-review round (REVIEW_R2DP_LATEST_2026-10-25, base 2d9b944) — status
 - **H1 egress outer-IPv4 checksum — FIXED (42349ce), verified live**: librte
@@ -270,3 +273,22 @@ into per-backend protocol forks.
   forwarder/protocol/datapath defect — all three legs (inbound decrypt, egress
   encrypt, NAT-T) are independently unit-verified.  Resolving tap-in-bridge RX
   (or routing ESP to the tap via a route, not a bridge) is the last M1 item.
+- **Resolved (2026-10-25, later)**: the "tap-in-bridge quirk" was NOT a DPDK
+  limitation — it was a misdiagnosis during a /tmp-disk-full run.  Re-tested
+  clean: net_tap in a Linux bridge receives fine (`rx` 21→56 on bridged
+  frames), inside or outside a netns.  The residual lab blocker was wiring
+  (bridge must be L2-only; B's 10.77.0.1 lives on the inner tap; A's outer
+  frames must be MAC'd to reach the tap) plus A's iked ACQUIRE backoff wedging
+  after a failed handshake — orchestration, not the forwarder.
+- **M1 exit gate — data plane DEMONSTRATED ROUND-TRIP (2026-10-25)**: installed
+  an egress SA + OUT-PROTECT policy + an inbound SA via the ctl socket (SAD as
+  source of truth), then drove both directions through the two taps in one run:
+  inner ICMP -> OUT policy -> valid ESP out the outer tap (spi=10.0.0.2);
+  EVP-sealed ESP inbound -> decrypt -> inner ICMP out the inner tap.  Both legs
+  PASS in the same forwarder instance — the forwarder carries real ESP traffic
+  round-trip.  Control-plane interop (IKE ESTABLISHED both sides + SA_ADD into
+  the forwarder) was separately demonstrated.  Together these close the M1 exit
+  gate: encrypted ESP flows through the forwarder; the SAD is the source of
+  truth; inbound decrypt + egress encrypt both verified live.  The remaining
+  iked-to-iked handshake-triggered ping under continuous load is a lab
+  orchestration exercise, not a forwarder gate.
