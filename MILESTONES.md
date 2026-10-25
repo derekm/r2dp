@@ -75,23 +75,50 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   is the source of truth. Candidate DEFER: rte_acl SPD → M3 (M1 = linear
   lookup in ctl.c).
 
-### M1 data-plane status (2026-10-24)
+### M1 data-plane status (2026-10-24 → 2026-10-25)
 - **Done (inbound structure)**: forwarder is now a two-tap bump-in-the-wire —
   outer tap (ESP side) + inner tap (plaintext side); worker polls both;
   inbound ESP → SAD lookup → AES-GCM decrypt → cleartext forwarded to the
   inner tap (previously dropped).  **Verified on Fedora 24.11.4**: two-tap
   mode brings up `r2dp-tap` + `r2dp-tap-inner` in PROMISC, worker runs
   `outer=0 inner=1`, control-plane SA install unaffected.  Commit `444d287`.
-- **Remaining (data-plane crypto proof + outbound)**: the outbound encrypt
-  leg (inner plaintext → ESP out outer) is not yet wired; a real encrypted
-  ESP packet has not yet been shown to decrypt through the forwarder.
-  CRITICAL FIX 2026-10-25 discovered during this work: the tunnel SA was
-  NEVER actually installed in the dataplane (`prm.tun.next_proto` was set to
-  ESP instead of IPIP → `rte_ipsec_sa_size()` = -22), and ctl.c swallowed the
-  error (always replied status 0).  Fixed (`0185dad`): next_proto=IPIP +
-  error propagation + SA table rollback.  The interop still reaches
-  ESTABLISHED; the SA now genuinely lands in the SAD, so the data-plane
-  crypto test has a real path to run on.
+- **Done — inbound decrypt PROVEN (real ESP to cleartext)**: two root causes
+  fixed after the AUTH_FAILED hunt: (1) `prm.ipsec_xform.direction` was never
+  set — EGRESS is enum 0, so every memset-zero SA silently built an OUTBOUND
+  encrypt SA that mangled received packets (`sa_type=14` → fixed to 10 by
+  `RTE_SECURITY_IPSEC_SA_DIR_INGRESS`); (2) `aead.aad_length` was 16 but RFC
+  4106 §5 needs 8 (12 with ESN) — librte's internal `aead_gcm_aad` buffer is
+  16 bytes but OpenSSL PMD authenticates exactly `aad_length` bytes.  With
+  direction=INGRESS + aad=8, a real EVP-sealed RFC 4106 ESP datagram
+  (rt_esp.bin, tag `99327b18…` verified against EVP) decrypted
+  `st=0 proc=1 pkt=44` to the inner ICMP, captured cleartext on
+  `r2dp-tap-inner` (`4500 002c …` at inner_sniff.bin@0x1d0), eth-preprended +
+  padded to 60.  Commit `5450f26`.  This was the M1 AUTH_FAILED/D1 blocker.
+- **Done — gcm_kat regression**: tests/gcm_kat.c runs the production
+  `r2dp_gcm_sa_prm()` builder (fwd/dp_gcm.c, extracted from the reviewer's
+  direction+AAD patch) against an EVP-sealed KAT; `aad_tweak` proves aad=8
+  decrypts while aad=16 fails a real peer; tampered-ICV rejected.
+- **Done — outbound (egress) encrypt leg, PROVEN**: fwd/dp_dpdk.c gains an
+  in-dataplane SPD table (`sp_tab`, slid-keyed `dpd_sp_add/del`),
+  prefix `sel_match`, `reqid`→egress-SA binding, and `esp_outbound`; `dp.h`
+  `FWD_DP_SA_INBOUND 0x2` marks an SA completing our GETSPI reservation as
+  ingress/decrypt vs a plain add as egress/encrypt.  `worker_inner` drops
+  ESP-in, encrypts policy-matched inner plaintext via `esp_outbound`
+  (L2-strip → EGRESS prepare/process → L2-prepend + 60-byte pad), tx to the
+  outer tap, and passes IKE/ARP/no-policy frames through the exception path.
+  **Verified on Fedora**: installed an egress SA (SPI 0x4444, reqid 0x2222) +
+  an OUT-PROTECT policy, injected an inner ICMP, and the outer tap captured a
+  valid 100-byte ESP datagram (outer 10.0.0.1→10.0.0.2, ESP SPI 0x4444, seq 1;
+  egress crypto `st=0 proc=1 pkt=100`).  Commit `2d9b944`; meson 5/5 DPDK,
+  4/4 control.
+- **Interop exit gate — not yet proven** (the iked-end-to-end ping): iked pairs
+  negotiate IKEv2 to ESTABLISHED with the r2dp backend driving the forwarder
+  (child SAs land in the SAD), but a live ping *through* the forwarder's taps
+  in the netns harness has not round-tripped.  The remaining blocker is lab
+  orchestration (iked IKE source-address/config churn + stale iked resume
+  state in the A2/B3 + harnesses), not the forwarder datapath, whose two legs
+  are each proven above.  Tracked separately from "Medium row."
+
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
 
