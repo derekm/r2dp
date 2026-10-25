@@ -1,0 +1,61 @@
+/*
+ * fwd/dp.h -- dataplane abstraction for the r2dp forwarder.
+ *
+ * ctl.c (the r2dp control server) is hardware-agnostic: it applies SAD/SPD
+ * to the dataplane through this small vtable.  The DPDK dataplane
+ * (fwd/dp_dpdk.c) implements it with rte_ipsec_sad / rte_acl and the
+ * run-to-completion packet loop; a P4/XDP2 backend would implement the same
+ * interface behind the identical r2dp socket.
+ *
+ * MT: the control thread and the packet threads share the dataplane.  The
+ * implementation must serialize (usually an rte_spinlock or RCU) so a
+ * mid-flight SA_ADD never races a lookup.
+ */
+#ifndef R2DP_FWD_DP_H
+#define R2DP_FWD_DP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "r2dp/proto.h"
+
+struct fwd_dp;
+
+struct fwd_dp_ops {
+	/* Set a capability word bit for IANA encr/integ transforms. */
+	void (*caps)(uint32_t enc_caps[8], uint32_t integ_caps[8]);
+
+	/* Install (add=1) or remove (add=0) an SA in the dataplane.
+	 * `blob` is the AEAD key material (cipher key || salt, enckeylen
+	 * bytes) when present.  The dataplane keeps its own copy. */
+	int (*sa_add)(struct fwd_dp *dp, int add,
+	    const struct r2dp_sa *sa, const void *blob, size_t blen);
+
+	/* Install or remove a policy.  ->sp_add returns the assigned slid
+	 * (for SP_ADD with slid=0) via sp->slid. */
+	int (*sp_add)(struct fwd_dp *dp, struct r2dp_sp *sp);
+	int (*sp_del)(struct fwd_dp *dp, const struct r2dp_sp *sp);
+
+	/* Optional: start/stop the datapath packet threads. */
+	int (*start)(struct fwd_dp *dp);
+	void (*stop)(struct fwd_dp *dp);
+
+	/* Capability bitmaps the dataplane actually supports. */
+	uint32_t caps_bits_enc[8];
+	uint32_t caps_bits_integ[8];
+};
+
+struct fwd_dp {
+	const struct fwd_dp_ops *ops;
+	void *priv;             /* backend private state */
+	uint32_t flags;
+};
+
+/* Defaults: zero -> no backend (ctl.c still answers protocol). */
+void fwd_dp_init(struct fwd_dp *dp);
+
+/* DPDK backend (fwd/dp_dpdk.c).  argc/argv after DPDK EAL init. */
+int fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
+    const char *sockpath, int verbose);
+
+#endif /* R2DP_FWD_DP_H */

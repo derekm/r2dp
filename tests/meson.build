@@ -20,3 +20,12 @@ test('shim_contract',
     link_with: libr2dp),
   args: mockfwd_path,
   is_parallel: false)
+
+# smoke_fwd drives a LIVE r2dp-fwd (control plane) via libr2dp, not the mock.
+# It spawns the r2dp-fwd binary itself (path passed as arg 1).
+test('smoke_fwd',
+  executable('smoke_fwd', 'smoke_fwd.c',
+    include_directories: include_directories('../include'),
+    link_with: libr2dp),
+  args: r2dp_fwd.full_path(),
+  is_parallel: false)

@@ -26,6 +26,8 @@ r2dp_mockfwd = executable('r2dp-mockfwd',
   link_with: libr2dp,
   install: false)
 
+subdir('fwd')
+
 subdir('tests')
 
 # Install headers + pkg-config so racoon2's --with-r2dp=PREFIX can find it.
