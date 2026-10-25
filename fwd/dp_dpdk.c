@@ -608,19 +608,27 @@ bad:
 			fprintf(stderr, "\n");
 		}
 		uint16_t enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, np);
+		if (d->verbose)
+			fprintf(stderr,
+			    "r2dp-fwd: esp crypto np=%u enq=%u st=%u\n",
+			    np, enq, (enq && cop[0]->status) ? cop[0]->status : 0);
 		uint16_t dq = enq ?
 		    rte_cryptodev_dequeue_burst(d->cdev_id, 0, cop, enq) : 0;
-		if (d->verbose) {
-			fprintf(stderr,
-			    "r2dp-fwd: esp crypto np=%u enq=%u dq=%u st=%u\n",
-			    np, enq, dq,
-			    (dq && cop[0]->status) ? cop[0]->status : 0);
+		/* CPU-crypto path is synchronous (dq == enq).  An enqueue failure
+		 * (enq==0) or async PMD with ops left in flight (dq < enq) means we
+		 * don't own every op yet: refund only what completed, drop the
+		 * packet, never free an mbuf the device still holds. */
+		if (!enq) {
+			for (uint16_t k = 0; k < np; k++)
+				rte_crypto_op_free(cop[k]);
+			rte_pktmbuf_free(pm[i]);
+			continue;
 		}
 		/* Packet i is the one due back from crypto.  rte_ipsec_pkt_process
 		 * on dq (==1 here) leaves the DECRYPTED inner packet in pm[i];
 		 * forward it.  On any failure drop it. */
-		if (dq == 1) {
-			uint16_t proc = rte_ipsec_pkt_process(ss, &pm[i], dq);
+		if (dq >= 1) {
+			uint16_t proc = rte_ipsec_pkt_process(ss, &pm[i], 1);
 			if (d->verbose) {
 				uint8_t *bb = rte_pktmbuf_mtod(pm[i], uint8_t *);
 				fprintf(stderr,
@@ -636,9 +644,10 @@ bad:
 			else
 				rte_pktmbuf_free(pm[i]);
 		} else {
-			rte_pktmbuf_free(pm[i]);
+			/* op still in flight (async): drop the packet, leave cop. */
+			d->n_drop += dq == 0 ? 1 : 0;
 		}
-		/* completed ops are safe to return/refund after process */
+		/* refund the ops that actually came back */
 		for (uint16_t k = 0; k < dq; k++)
 			rte_crypto_op_free(cop[k]);
 	}
@@ -724,8 +733,10 @@ sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip,
 		if (!e->used)
 			continue;
 		sp = &e->sp;
-		if (sp->dir != R2DP_DIR_OUT || sp->action != R2DP_ACT_PROTECT)
+		if (sp->dir != R2DP_DIR_OUT)
 			continue;
+		/* match any action so DISCARD/BYPASS policies can override a
+		 * PROTECT (M6); esp_outbound then enforces the disposition */
 		if (sp->ul_proto != R2DP_PROTO_ANY &&
 		    sp->ul_proto != ip->next_proto_id)
 			continue;
@@ -741,7 +752,8 @@ sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip,
 			best = sp;
 		}
 	}
-	if (sa) *sa = best ? sa_by_reqid(d, best->reqid) : NULL;
+	*sa = (best && best->action == R2DP_ACT_PROTECT) ?
+	    sa_by_reqid(d, best->reqid) : NULL;
 	return best;
 }
 
@@ -774,8 +786,20 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		    rte_pktmbuf_mtod(bufs[i], uint8_t *) + RTE_ETHER_HDR_LEN);
 		if ((ip->version_ihl >> 4) != 4) { nb++; continue; }
 		sp = sp_match_out(d, ip, &ds);
-		if (!sp || !ds) { nb++; continue; }   /* no OUT policy / SA: bypass */
+		if (!sp) { nb++; continue; }   /* no matching OUT policy: bypass */
 
+		/* A matched policy decides the disposition (H2, RFC 4301 5.1):
+		 * DISCARD always drops; PROTECT with no SA drops (fail-closed, the
+		 * SA must exist before we protect); only BYPASS forwards clear. */
+		if (sp->action == R2DP_ACT_DISCARD)
+			goto drop;
+		if (sp->action == R2DP_ACT_PROTECT && !ds)
+			goto drop;
+		if (sp->action != R2DP_ACT_PROTECT) { nb++; continue; } /* BYPASS */
+
+		/* Once the packet matched a policy, failure below must DROP it, never
+		 * leak it back as cleartext: the L2 header is about to be stripped,
+		 * so the mbuf is no longer a forwardable frame (H4/H2). */
 		(void)rte_pktmbuf_adj(bufs[i], RTE_ETHER_HDR_LEN);
 		bufs[i]->l2_len = 0;
 		lip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
@@ -784,19 +808,33 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		bufs[i]->packet_type = RTE_PTYPE_L3_IPV4;
 
 		cop = rte_crypto_op_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
-		if (!cop) { nb++; continue; }
+		if (!cop) goto drop;
 		rte_crypto_op_attach_sym_session(cop, ds->sess.crypto.ses);
 		np = rte_ipsec_pkt_crypto_prepare(&ds->sess, &bufs[i], &cop, 1);
-		if (np == 0) { rte_crypto_op_free(cop); nb++; continue; }
+		if (np == 0) { rte_crypto_op_free(cop); goto drop; }
 		enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, &cop, np);
-		dq = enq ? rte_cryptodev_dequeue_burst(d->cdev_id, 0, &cop, enq) : 0;
+		if (enq == 0) { rte_crypto_op_free(cop); goto drop; }
+		dq = rte_cryptodev_dequeue_burst(d->cdev_id, 0, &cop, enq);
+		/* CPU-crypto path is synchronous (dq == enq); a PMD that reports
+		 * dq < enq means ops still in flight and this single-op loop does
+		 * not own them yet -- free only what came back, drop the rest. */
 		if (d->verbose)
 			fprintf(stderr, "r2dp-fwd: egress crypto np=%u enq=%u dq=%u st=%u\n",
 			    np, enq, dq, (dq && cop->status) ? cop->status : 0);
-		proc = (dq == 1) ? rte_ipsec_pkt_process(&ds->sess, &bufs[i], dq) : 0;
-		if (dq) rte_crypto_op_free(cop);
+		if (dq == 0) { rte_crypto_op_free(cop); goto drop; }
+		proc = rte_ipsec_pkt_process(&ds->sess, &bufs[i], dq);
+		rte_crypto_op_free(cop);
 		if (proc == 1 && out && no < BURST_SZ) {
-			/* bufs[i] is now the ESP datagram (outer IP + ESP) */
+			/* bufs[i] is now the ESP datagram (outer IP + ESP).  librte's
+			 * outbound tunnel prepare only patches total_length/packet_id;
+			 * it leaves hdr_checksum=0, which every real peer drops
+			 * (ip_rcv -> InHdrErrors).  Compute it here (H1). */
+			struct rte_ipv4_hdr *oip =
+			    rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
+			if ((oip->version_ihl >> 4) == 4) {
+				oip->hdr_checksum = 0;
+				oip->hdr_checksum = rte_ipv4_cksum(oip);
+			}
 			if (d->verbose) {
 				uint8_t *b = rte_pktmbuf_mtod(bufs[i], uint8_t *);
 				fprintf(stderr,
@@ -807,10 +845,17 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 			d->n_esp++;
 			out[no++] = bufs[i];
 			bufs[i] = NULL;      /* consumed: mark for caller */
-		} else {
-			rte_pktmbuf_free(bufs[i]);   /* consumed, freed: mark slot */
-			bufs[i] = NULL;
+			continue;
 		}
+		/* Crypto/decrypt failed or the processed packet was invalid: drop. */
+		goto drop;
+drop:
+		/* Single drop path: never forward cleartext after a policy matched,
+		 * and never leak the mbuf (H4).  Count and mark the slot NULL so
+		 * worker_inner does not forward or free it again. */
+		d->n_drop++;
+		rte_pktmbuf_free(bufs[i]);
+		bufs[i] = NULL;
 	}
 	if (nout) *nout = no;
 	if (nbypass) *nbypass = nb;
