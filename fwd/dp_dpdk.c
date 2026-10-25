@@ -43,14 +43,20 @@
 #include <rte_spinlock.h>
 #include <rte_cryptodev.h>
 #include <rte_errno.h>
+#include <rte_ether.h>
+#include <rte_lcore.h>
+#include <rte_mempool.h>
 
 #include "r2dp/client.h"
 #include "dp.h"
 #include "ctl.h"
 
 #define MEMPOOL_CACHE 256
-#define MEMPOOL_SIZE  4096
+#define MEMPOOL_SIZE  16384
 #define MAX_SA        FWD_MAXSA
+#define NB_RX_QUEUE   1
+#define NB_TX_QUEUE   1
+#define BURST_SZ      128
 #define TAP_IF_DEFAULT "r2dp-tap"
 /* AES-GCM standard IV is 12 bytes (RFC 4106). */
 #define R2DP_GCM_IV_LEN 12
@@ -74,6 +80,10 @@ struct dpdk_priv {
 	struct dp_sa        sa_tab[MAX_SA];
 	int                 verbose;
 	char                tap_if[IFNAMSIZ];
+	volatile int        running;
+	unsigned            worker_lcore;
+	/* per-queue counters for the worker (single rx/tx queue) */
+	uint64_t            n_rx, n_tx, n_esp, n_ike, n_drop;
 };
 
 /* ------------------------------------------------------------------ */
@@ -264,12 +274,135 @@ dpd_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 
 /* dataplane vtable (process-static so it outlives the probe).  Not const:
  * the .caps callback fills dp->ops->caps_bits_* in place. */
-static struct fwd_dp_ops dpdk_ops = {
-	.caps   = dpdk_caps,
-	.sa_add = dpd_sa_add,
-	.sp_add = dpd_sp_add,
-	.sp_del = dpd_sp_del,
-};
+static struct fwd_dp_ops dpdk_ops;
+
+/* ------------------------------------------------------------------ */
+/* M1 packet path: run-to-completion on one lcore.  rx from the tap port,
+ * classify, and tx back (the M1 topology is a TAP bridged to a kernel
+ * interface; ESP is later processed, non-ESP IKE/ARP rides the exception
+ * path -- both re-emit on the same port so the kernel sees them). */
+static int
+port_init(struct dpdk_priv *d)
+{
+	struct rte_eth_conf conf;
+	struct rte_eth_dev_info dev_info;
+	uint16_t port = d->port_id;
+
+	if (port >= RTE_MAX_ETHPORTS)
+		return -1;
+	memset(&conf, 0, sizeof(conf));
+	rte_eth_dev_info_get(port, &dev_info);
+	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+		conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
+	uint16_t nrxq = NB_RX_QUEUE, ntxq = NB_TX_QUEUE;
+	if (rte_eth_dev_configure(port, nrxq, ntxq, &conf) < 0)
+		return -rte_errno;
+	for (uint16_t q = 0; q < nrxq; q++)
+		if (rte_eth_rx_queue_setup(port, q, 1024, rte_eth_dev_socket_id(port),
+		    NULL, d->pool) < 0)
+			return -rte_errno;
+	for (uint16_t q = 0; q < ntxq; q++)
+		if (rte_eth_tx_queue_setup(port, q, 1024, rte_eth_dev_socket_id(port),
+		    NULL) < 0)
+			return -rte_errno;
+	if (rte_eth_dev_start(port) < 0)
+		return -rte_errno;
+	rte_eth_promiscuous_enable(port);
+	return 0;
+}
+
+static inline void
+classify(struct dpdk_priv *d, struct rte_mbuf *mb)
+{
+	struct rte_ether_hdr *eh = rte_pktmbuf_mtod(mb, struct rte_ether_hdr *);
+	struct rte_ipv4_hdr *ip;
+
+	if (rte_pktmbuf_pkt_len(mb) < RTE_ETHER_HDR_LEN +
+	    sizeof(struct rte_ipv4_hdr))
+		return;
+	ip = (struct rte_ipv4_hdr *)((uint8_t *)eh + RTE_ETHER_HDR_LEN);
+	if ((ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_ESP)
+		/* ESP: handled by the crypto path (next M1 step); count only. */
+		d->n_esp++;
+	else if ((ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_UDP)
+		/* IKE is UDP 500/4500 -- the exception path; count. */
+		d->n_ike++;
+}
+
+static int
+worker_main(void *arg)
+{
+	struct dpdk_priv *d = arg;
+	uint16_t port = d->port_id;
+	uint64_t last_t = 0;
+
+	fprintf(stderr, "r2dp-fwd: worker on lcore %u, port %u\n",
+	    rte_lcore_id(), port);
+	for (;;) {
+		struct rte_mbuf *bufs[BURST_SZ];
+		uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
+		uint64_t now = rte_rdtsc();
+
+		if (nr == 0) {
+			if (!last_t)
+				last_t = now;
+			else if (now - last_t >= rte_get_timer_hz()) {  /* ~1s */
+				fprintf(stderr,
+				    "r2dp-fwd: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu\n",
+				    (unsigned long long)d->n_rx,
+				    (unsigned long long)d->n_tx,
+				    (unsigned long long)d->n_esp,
+				    (unsigned long long)d->n_ike,
+				    (unsigned long long)d->n_drop);
+				last_t = now;
+			}
+			continue;
+		}
+		d->n_rx += nr;
+		for (uint16_t i = 0; i < nr; i++)
+			classify(d, bufs[i]);
+		uint16_t sent = rte_eth_tx_burst(port, 0, bufs, nr);
+		d->n_tx += sent;
+		d->n_drop += nr - sent;
+		for (uint16_t i = sent; i < nr; i++)
+			rte_pktmbuf_free(bufs[i]);
+	}
+	return 0;
+}
+
+static int
+dpd_start(struct fwd_dp *dp)
+{
+	struct dpdk_priv *d = dp->priv;
+	unsigned lcore;
+
+	if (d->port_id < 0)
+		return -ENODEV;
+	/* pick a slave lcore, skipping the main (calling) lcore */
+	lcore = rte_get_next_lcore(-1, 1, 1);
+	if (lcore >= RTE_MAX_LCORE) {
+		fprintf(stderr, "r2dp-fwd: no spare lcore for the worker "
+		    "(run with -l 0,<n>, e.g. -l 0-1)\n");
+		return -EAGAIN;
+	}
+	if (port_init(d) < 0)
+		return -rte_errno;
+	d->running = 1;
+	d->worker_lcore = lcore;
+	rte_eal_remote_launch(worker_main, d, lcore);
+	return 0;
+}
+
+static void
+dpd_stop(struct fwd_dp *dp)
+{
+	struct dpdk_priv *d = dp->priv;
+
+	d->running = 0;
+	if (d->worker_lcore < RTE_MAX_LCORE)
+		rte_eal_wait_lcore(d->worker_lcore);
+}
 
 /* ------------------------------------------------------------------ */
 int
@@ -348,9 +481,18 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	}
 
 	dp->priv = d;
+	/* wire the vtable: caps/sa/sp plus the worker start/stop */
+	dpdk_ops.caps   = dpdk_caps;
+	dpdk_ops.sa_add = dpd_sa_add;
+	dpdk_ops.sp_add = dpd_sp_add;
+	dpdk_ops.sp_del = dpd_sp_del;
+	dpdk_ops.start  = dpd_start;
+	dpdk_ops.stop   = dpd_stop;
 	dp->ops = &dpdk_ops;
 	if (dp->ops->caps)
 		dp->ops->caps(dp->ops->caps_bits_enc, dp->ops->caps_bits_integ);
+	if (dp->ops->start)
+		dp->ops->start(dp);   /* bring up the worker + port */
 	fprintf(stderr, "r2dp-fwd: DPDK dataplane ready (port=%d cdev=%d sad=%p)\n",
 	    d->port_id, d->cdev_id, (void *)d->sad);
 	return 0;
