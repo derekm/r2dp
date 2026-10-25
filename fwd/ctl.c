@@ -163,14 +163,20 @@ do_getspi(int fd, const struct r2dp_msg *m)
 	}
 	/* Random SPI within the range: sequential allocation from a fixed seed
 	 * makes SPIs predictable and (across peers) colliding.  getrandom is
-	 * available on Linux; fall back to a time/pid mix elsewhere. */
-	for (uint32_t tries = 0, span = hi - lo + 1; tries < span; tries++) {
+	 * available on Linux; fall back to a time/pid mix elsewhere.
+	 * NOTE (L7): hi-lo+1 overflows to 0 for the full 32-bit range, so bound
+	 * the tries by the span only when it fits, else by UINT32_MAX. */
+	{
+		uint64_t span64 = (uint64_t)hi - (uint64_t)lo + 1;
+		uint32_t span = span64 > UINT32_MAX ? UINT32_MAX : (uint32_t)span64;
+		for (uint32_t tries = 0, lim = span ? span : UINT32_MAX;
+		    tries < lim; tries++) {
 		struct r2dp_sa k = *rq;
 		uint32_t r;
 		if (getrandom(&r, sizeof(r), 0) != (ssize_t)sizeof(r))
 			r = (uint32_t)((uint64_t)time(NULL) ^ (uint64_t)getpid()
 			    ^ (uint64_t)(uintptr_t)&r ^ (uintptr_t)m);
-		cand = lo + (r % span);
+		cand = lo + (uint32_t)((uint64_t)r % span64);
 		k.spi = htonl(cand);
 		if (sa_find(C, &k))
 			continue;
@@ -183,6 +189,7 @@ do_getspi(int fd, const struct r2dp_msg *m)
 		e->sa.spi = htonl(cand);
 		reply_sa(fd, m, 0, e);
 		return;
+		}
 	}
 	reply_sa(fd, m, ENOSPC, NULL);
 }

@@ -1184,7 +1184,10 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	int ret;
 
 	(void)sockpath;
-	d = calloc(1, sizeof(*d));
+	/* sa_tab[] holds struct rte_ipsec_session (64-byte aligned); calloc only
+	 * guarantees natural (8-byte) alignment, which is UB (UBSan flags it in
+	 * gcm_kat too).  Use rte_zmalloc with cache-line alignment (M3). */
+	d = rte_zmalloc("r2dp-dpdk", sizeof(*d), RTE_CACHE_LINE_SIZE);
 	if (!d)
 		return -ENOMEM;
 	d->verbose = verbose;

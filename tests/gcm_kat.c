@@ -37,7 +37,7 @@ static uint8_t keymat[20] = {
     0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,0xab,0xf7,
     0xcf,0x15,0x88,0x09,0xcf,0x4f,  0xf2,0x6b,0x58,0x0c };
 #define SPI 0x1234u
-static uint8_t cdev;
+static int cdev;
 static struct rte_mempool *mp, *sess_mp, *cop_mp;
 static int fails = 0;
 #define CHECK(c, m) do { if (c) { printf("ok   %s\n", m); } else { printf("FAIL %s\n", m); fails++; } } while (0)
@@ -48,7 +48,7 @@ setup(void)
 {
 	struct rte_cryptodev_config cc; struct rte_cryptodev_qp_conf qc;
 	cdev = rte_cryptodev_get_dev_id("crypto_openssl0");
-	if ((int)cdev < 0) return -1;
+	if (cdev < 0) return -1;
 	memset(&cc, 0, sizeof(cc)); cc.socket_id = SOCKET_ID_ANY; cc.nb_queue_pairs = 1;
 	if (rte_cryptodev_configure(cdev, &cc) < 0) return -1;
 	memset(&qc, 0, sizeof(qc)); qc.nb_descriptors = 1024;
@@ -72,7 +72,8 @@ mk_sess(unsigned aad_tweak)
 	struct rte_ipsec_sa_prm prm; struct rte_crypto_sym_xform aead;
 	struct rte_ipv4_hdr eh; size_t sz;
 	struct r2dp_sa r; int ret;
-	struct rte_ipsec_session *ss = calloc(1, sizeof(*ss));
+	struct rte_ipsec_session *ss = rte_zmalloc(NULL, sizeof(*ss),
+	    RTE_CACHE_LINE_SIZE);   /* rte_ipsec_session is 64-byte aligned */
 
 	memset(&r, 0, sizeof(r));
 	r.mode = R2DP_MODE_TUNNEL; r.enc = R2DP_ENCR_AES_GCM_16;
