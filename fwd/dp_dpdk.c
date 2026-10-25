@@ -63,6 +63,8 @@
 
 struct dp_sa {
 	struct rte_ipsec_sa *sa;      /* opaque, allocated from the ipsec lib */
+	struct rte_ipsec_session sess;/* ipsec session bound to the crypto dev */
+	struct rte_cryptodev_sym_session *cses;   /* crypto sym session */
 	uint32_t           spi;      /* host order */
 	uint32_t           dip;      /* host order */
 	uint8_t            proto;
@@ -72,6 +74,8 @@ struct dp_sa {
 struct dpdk_priv {
 	int                 port_id;
 	struct rte_mempool *pool;
+	struct rte_mempool *sess_mp;   /* crypto session mempool */
+	struct rte_mempool *cop_mp;    /* crypto operation mempool */
 	struct rte_ipsec_sad *sad;
 	struct rte_cryptodev_info cdev_info;
 	uint8_t             cdev_id;
@@ -105,14 +109,14 @@ addr4_to_u32(const struct r2dp_addr *a, uint32_t *out)
 	return 0;
 }
 
-/* r2dp SA -> rte_ipsec_sa.  M1: AES-GCM-16 tunnel.  AEAD key blob =
- * cipher key (16) || salt (4) = 20 bytes (M0 finding 3). */
+/* r2dp SA -> rte_ipsec_sa + crypto session + ipsec session.  M1: AES-GCM-16
+ * tunnel.  AEAD key blob = cipher key (16) || salt (4) = 20 bytes (M0 f3). */
 static int
-dp_sa_init(struct dp_sa *ds, const struct r2dp_sa *rsa,
+dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
     const void *key, size_t keylen)
 {
 	struct rte_ipsec_sa_prm prm;
-	struct rte_crypto_sym_xform aead;
+	struct rte_crypto_sym_xform aead, *cur;
 	size_t sa_sz;
 	uint32_t salt, src, dst;
 
@@ -123,6 +127,8 @@ dp_sa_init(struct dp_sa *ds, const struct r2dp_sa *rsa,
 		return -EOPNOTSUPP;
 	if (rsa->enckeylen != 20)
 		return -EINVAL;
+	if (!d->have_cdev)
+		return -ENODEV;
 	if (addr4_to_u32(&rsa->src, &src) < 0 ||
 	    addr4_to_u32(&rsa->dst, &dst) < 0)
 		return -EAFNOSUPPORT;
@@ -146,18 +152,17 @@ dp_sa_init(struct dp_sa *ds, const struct r2dp_sa *rsa,
 	aead.aead.digest_length = 16;
 	aead.aead.aad_length = 0;
 	aead.aead.key.data = (uint8_t *)key;
-	prm.crypto_xform = &aead;
+	cur = &aead;
+	prm.crypto_xform = cur;
 
 	prm.ipsec_xform.proto = RTE_SECURITY_IPSEC_SA_PROTO_ESP;
 	prm.ipsec_xform.mode = RTE_SECURITY_IPSEC_SA_MODE_TUNNEL;
-	prm.ipsec_xform.direction = RTE_SECURITY_IPSEC_SA_DIR_EGRESS;
 	prm.ipsec_xform.spi = ntohl(rsa->spi);
 	prm.ipsec_xform.salt = salt;
 	prm.ipsec_xform.options.esn = (rsa->saflags & R2DP_SAF_ESN) ? 1 : 0;
-	prm.ipsec_xform.replay_win_sz = rsa->wsize;
+	prm.ipsec_xform.replay_win_sz = rsa->wsize ? rsa->wsize : 64;
 	prm.ipsec_xform.tunnel.type = RTE_SECURITY_IPSEC_TUNNEL_IPV4;
 
-	/* outer IPv4 tunnel header template (by value; no pointers into rsa) */
 	{
 		struct rte_ipv4_hdr eh;
 
@@ -178,6 +183,30 @@ dp_sa_init(struct dp_sa *ds, const struct r2dp_sa *rsa,
 		ds->sa = NULL;
 		return -EINVAL;
 	}
+
+	/* crypto session on the openssl device */
+	ds->cses = rte_cryptodev_sym_session_create(d->cdev_id, &aead, d->sess_mp);
+	if (!ds->cses) {
+		rte_ipsec_sa_fini(ds->sa);
+		rte_free(ds->sa);
+		ds->sa = NULL;
+		return -ENOMEM;
+	}
+
+	/* bind it into an rte_ipsec_session (direction set per SA later) */
+	memset(&ds->sess, 0, sizeof(ds->sess));
+	ds->sess.sa = ds->sa;
+	ds->sess.type = RTE_SECURITY_ACTION_TYPE_CPU_CRYPTO;
+	ds->sess.crypto.ses = ds->cses;
+	ds->sess.crypto.dev_id = d->cdev_id;
+	if (rte_ipsec_session_prepare(&ds->sess) < 0) {
+		rte_cryptodev_sym_session_free(d->cdev_id, ds->cses);
+		rte_ipsec_sa_fini(ds->sa);
+		rte_free(ds->sa);
+		ds->sa = NULL; ds->cses = NULL;
+		return -EINVAL;
+	}
+
 	ds->spi = ntohl(rsa->spi);
 	ds->proto = rsa->proto;
 	ds->used = 1;
@@ -206,6 +235,9 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 				keyv.v4.spi = ntohl(rsa->spi);
 				keyv.v4.dip = dip;
 				rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
+				if (d->sa_tab[i].cses)
+					rte_cryptodev_sym_session_free(d->cdev_id,
+					    d->sa_tab[i].cses);
 				if (d->sa_tab[i].sa)
 					rte_ipsec_sa_fini(d->sa_tab[i].sa);
 				rte_free(d->sa_tab[i].sa);
@@ -224,7 +256,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		return -ENOSPC;
 	}
 
-	ret = dp_sa_init(&d->sa_tab[idx], rsa, key, keylen);
+	ret = dp_sa_init(d, &d->sa_tab[idx], rsa, key, keylen);
 	if (ret < 0) {
 		rte_spinlock_unlock(&d->lock);
 		return ret;
@@ -234,9 +266,12 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	keyv.v4.spi = ntohl(rsa->spi);
 	keyv.v4.dip = dip;
 	ret = rte_ipsec_sad_add(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP,
-	    d->sa_tab[idx].sa);
+	    &d->sa_tab[idx].sess);   /* SAD value = the ipsec session ptr */
 	if (ret < 0) {
-		rte_ipsec_sa_fini(d->sa_tab[idx].sa);
+		if (d->sa_tab[idx].cses)
+			rte_cryptodev_sym_session_free(d->cdev_id, d->sa_tab[idx].cses);
+		if (d->sa_tab[idx].sa)
+			rte_ipsec_sa_fini(d->sa_tab[idx].sa);
 		rte_free(d->sa_tab[idx].sa);
 		memset(&d->sa_tab[idx], 0, sizeof(d->sa_tab[idx]));
 		rte_spinlock_unlock(&d->lock);
@@ -445,6 +480,39 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		d->cdev_id = (uint8_t)ret;
 		rte_cryptodev_info_get(d->cdev_id, &d->cdev_info);
 		d->have_cdev = 1;
+		/* configure + start the crypto device with one qp */
+		struct rte_cryptodev_config cconf;
+		struct rte_cryptodev_qp_conf qconf;
+		memset(&cconf, 0, sizeof(cconf));
+		cconf.socket_id = SOCKET_ID_ANY;
+		cconf.nb_queue_pairs = 1;
+		cconf.ff_disable = 0;
+		if (rte_cryptodev_configure(d->cdev_id, &cconf) < 0) {
+			fprintf(stderr, "r2dp-fwd: cryptodev configure failed\n");
+			d->have_cdev = 0;
+		} else {
+			memset(&qconf, 0, sizeof(qconf));
+			qconf.nb_descriptors = 2048;
+			if (rte_cryptodev_queue_pair_setup(d->cdev_id, 0, &qconf,
+			    SOCKET_ID_ANY) < 0)
+				fprintf(stderr, "r2dp-fwd: cryptodev qp setup failed\n");
+			else if (rte_cryptodev_start(d->cdev_id) < 0)
+				fprintf(stderr, "r2dp-fwd: cryptodev start failed\n");
+		}
+		if (d->have_cdev) {
+			/* crypto session + op mempools */
+			d->sess_mp = rte_cryptodev_sym_session_pool_create(
+			    "r2dp_sess", MAX_SA,
+			    rte_cryptodev_sym_get_private_session_size(d->cdev_id),
+			    0, 0, SOCKET_ID_ANY);
+			if (!d->sess_mp)
+				fprintf(stderr, "r2dp-fwd: sess pool failed\n");
+			d->cop_mp = rte_crypto_op_pool_create(
+			    "r2dp_cop", RTE_CRYPTO_OP_TYPE_SYMMETRIC, MAX_SA, 0,
+			    0, SOCKET_ID_ANY);
+			if (!d->cop_mp)
+				fprintf(stderr, "r2dp-fwd: crypto-op pool failed\n");
+		}
 	} else {
 		fprintf(stderr, "r2dp-fwd: warning: no crypto device; add "
 		    "--vdev crypto_openssl0 for AES-GCM\n");
