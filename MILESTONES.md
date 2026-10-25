@@ -140,7 +140,7 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   drop (free+count+slot NULL), never leak as L2-stripped cleartext; crypto ops
   always freed when not in flight; inbound tail fixed for enq==0 and async
   dq<enq.
-- **H5 ctl/worker race — OPEN** (needs full rte_rcu_qsbr; see below).
+- **H5 ctl/worker race — FIXED (c2480fc)**: QSBR; worker quiescent per loop, sa_slot_retire unlinks + synchronize before free.  Verified: 150 SA churn cycles err=0 under live traffic, no crash.
 - **M1 keyed in-place UPDATE refused — FIXED (bc646e2)** (GCM IV reuse).
 - **M2 build-then-swap — FIXED (bc646e2)**: new session built first, old torn
   down only after; no dataplane-empty window on init failure.  Delete path
@@ -151,7 +151,7 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
 - **M5 parse/trim — FIXED (4572fde)**: trim tap eth padding before
   encrypt (M5a); IHL bounds check (M5c).
 - **L7 getspi span overflow — FIXED (5280fee)** (64-bit span/modulus).
-- **OPEN (deferred)**: H5 rte_rcu teardown race; D5 SPD priority-order + port
+- **OPEN (deferred)**: D5 SPD priority-order + port
   selectors + IPv6 refusal at SP_ADD; M4 inner-selector check after decrypt;
   M7 key scrub on error paths; M9 egress/EVP/replay tests + gcm_kat SKIP=fail;
   M10 DPDK CI lane (no libdpdk-dev in ci.yml); L1/L2/L3 doc+license+handles;
