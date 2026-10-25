@@ -116,8 +116,46 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   (child SAs land in the SAD), but a live ping *through* the forwarder's taps
   in the netns harness has not round-tripped.  The remaining blocker is lab
   orchestration (iked IKE source-address/config churn + stale iked resume
-  state in the A2/B3 + harnesses), not the forwarder datapath, whose two legs
-  are each proven above.  Tracked separately from "Medium row."
+  state in the A2/B3 + harnesses, saw `RACOON2_RESUME_DIR` needs per-side
+  isolation), not the forwarder datapath, whose two legs are each proven
+  above.  Tracked separately.
+
+### Latest-review round (REVIEW_R2DP_LATEST_2026-10-25, base 2d9b944) — status
+- **H1 egress outer-IPv4 checksum — FIXED (42349ce), verified live**: librte
+  leaves `hdr_checksum=0` (only patches total_length/packet_id); esp_outbound
+  now computes it.  Captured ESP: stored==computed 0x6665 (was 0x0000).
+- **H2 fail-closed SPD — FIXED (42349ce + ecf7a32), verified live**:
+  sp_match_out matches any action and returns the SA only for PROTECT;
+  ESP drop on DISCARD and on PROTECT-no-SA (RFC 4301 5.1).  Live: out PROTECT
+  w/ reqid-no-SA -> drop 0->12, esp=0, no cleartext leak.  Inbound exception
+  path tightened to IKE(500/4500)+ARP only (is_ike_arp); other network
+  cleartext is dropped; inbound decrypt still forwards (esp-tx sent=1).
+- **H3 egress SA selection by tunnel endpoints — FIXED (4213486), verified**:
+  racoon2 sends reqid=0 for every SP/SA, so reqid-keyed selection collapsed
+  tunnels onto the first outbound SA.  dp_sa records srca/dsta (addr[0..3]),
+  sa_by_policy matches policy tun_src/tun_dst.  Live: two reqid=0 egress SAs
+  (dst .2 SPI 0x4444, dst .3 SPI 0x5555) + tun A->B policy -> SPI 0x4444/dst
+  .2 emitted.
+- **H4 error-path leaks/UAF — FIXED (42349ce)**: matched-but-failed packets
+  drop (free+count+slot NULL), never leak as L2-stripped cleartext; crypto ops
+  always freed when not in flight; inbound tail fixed for enq==0 and async
+  dq<enq.
+- **H5 ctl/worker race — OPEN** (needs full rte_rcu_qsbr; see below).
+- **M1 keyed in-place UPDATE refused — FIXED (bc646e2)** (GCM IV reuse).
+- **M2 build-then-swap — FIXED (bc646e2)**: new session built first, old torn
+  down only after; no dataplane-empty window on init failure.  Delete path
+  matches (SPI, proto, DIP) not SPI+proto.
+- **M3 alignment — FIXED (5280fee, 4572fde)**: dpdk_priv + gcm_kat session via
+  aligned_alloc/rte_zmalloc(64).  dpdk_priv must use aligned_alloc PRE-EAL
+  (rte_zmalloc before rte_eal_init fails -> dataplane silently lost).
+- **M5 parse/trim — FIXED (4572fde)**: trim tap eth padding before
+  encrypt (M5a); IHL bounds check (M5c).
+- **L7 getspi span overflow — FIXED (5280fee)** (64-bit span/modulus).
+- **OPEN (deferred)**: H5 rte_rcu teardown race; D5 SPD priority-order + port
+  selectors + IPv6 refusal at SP_ADD; M4 inner-selector check after decrypt;
+  M7 key scrub on error paths; M9 egress/EVP/replay tests + gcm_kat SKIP=fail;
+  M10 DPDK CI lane (no libdpdk-dev in ci.yml); L1/L2/L3 doc+license+handles;
+  L4 wsize=0->64; L6 per-packet IKE counter; L5/formatting.
 
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
