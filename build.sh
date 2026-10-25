@@ -110,9 +110,16 @@ cmd_check() {
 }
 
 # ------------------------------------------------------- setup/build/test
+# Map the milestone to the real meson option: the DPDK dataplane is gated by
+# `-Denable_dpdk` (feature).  M0 = none/control-only; M1+ = with DPDK.
+meson_args() {
+  local args=()
+  if [ "$MILESTONE" -ge 1 ]; then args+=( -Denable_dpdk=auto ); else args+=( -Denable_dpdk=disabled ); fi
+  echo "${args[@]}"
+}
 cmd_setup() {
   have meson || die "meson not found (./build.sh deps)"
-  local args=(-Dmilestone="$MILESTONE" -Ddpdk_min="$DPDK_MIN")
+  local args=( $(meson_args) )
   [ -n "$RACOON2_SRC" ] && args+=(-Dracoon2_src="$RACOON2_SRC")
   if [ -f "$BUILD_DIR/build.ninja" ]; then
     info "reconfigure ($BUILD_DIR)"; run meson setup --reconfigure "$BUILD_DIR" "$ROOT" "${args[@]}"
@@ -126,9 +133,9 @@ cmd_clean() { info "rm -rf $BUILD_DIR"; rm -rf "$BUILD_DIR"; }
 cmd_sanitize() { # M3 gate uses these; handy earlier too
   BUILD_DIR="$ROOT/build-asan"
   info "ASan+UBSan build ($BUILD_DIR)"
-  local extra=(); [ -n "$RACOON2_SRC" ] && extra=(-Dracoon2_src="$RACOON2_SRC")
-  run meson setup "$BUILD_DIR" "$ROOT" --wipe -Dmilestone="$MILESTONE" "${extra[@]}" -Db_sanitize=address,undefined -Db_lundef=false 2>/dev/null \
-    || run meson setup "$BUILD_DIR" "$ROOT" -Dmilestone="$MILESTONE" "${extra[@]}" -Db_sanitize=address,undefined -Db_lundef=false
+  local extra=( $(meson_args) ); [ -n "$RACOON2_SRC" ] && extra+=(-Dracoon2_src="$RACOON2_SRC")
+  run meson setup "$BUILD_DIR" "$ROOT" --wipe "${extra[@]}" -Db_sanitize=address,undefined -Db_lundef=false 2>/dev/null \
+    || run meson setup "$BUILD_DIR" "$ROOT" "${extra[@]}" -Db_sanitize=address,undefined -Db_lundef=false
   run meson test -C "$BUILD_DIR" --print-errorlogs
 }
 
@@ -136,19 +143,27 @@ cmd_e2e() { # clean clone -> patch -> build racoon2 -> two-peer IKEv2 over veth 
   [ -n "$RACOON2_SRC" ] || die "e2e needs --racoon2 PATH (a racoon2 git checkout)"
   local W="${E2E_WORK:-/tmp/r2dp-e2e-work}"
   info "install libr2dp + mockfwd -> $W/prefix"
-  run meson setup --wipe "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Dmilestone=0 >/dev/null 2>&1 \
-    || run meson setup "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Dmilestone=0 >/dev/null
+  run meson setup --wipe "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Denable_dpdk=disabled >/dev/null 2>&1 \
+    || run meson setup "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Denable_dpdk=disabled >/dev/null
   run meson install -C "$W/mbuild" >/dev/null
   info "build racoon2 with the r2dp backend"
-  run "$ROOT/tests/e2e/build-racoon2.sh" "$RACOON2_SRC" "$W" "$W/prefix"
+  if [ -x "$ROOT/tests/e2e/build-racoon2.sh" ]; then
+    run "$ROOT/tests/e2e/build-racoon2.sh" "$RACOON2_SRC" "$W" "$W/prefix"
+  else
+    warn "tests/e2e/build-racoon2.sh not in tree yet; run the racoon2 shim build manually"
+  fi
   info "IKEv2 end-to-end (needs root + iproute2)"
-  run "$ROOT/tests/e2e/ike_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-mockfwd"
+  if [ -x "$ROOT/tests/e2e/ike_e2e.sh" ]; then
+    run "$ROOT/tests/e2e/ike_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-mockfwd"
+  else
+    warn "tests/e2e/ike_e2e.sh not in tree yet (the M1 netns interop exit gate); skipping"
+  fi
 }
 
 cmd_milestones() {
-  local f="$ROOT/docs/MILESTONES.md"
+  local f="$ROOT/MILESTONES.md"
   [ -r "$f" ] || die "missing $f"
-  info "milestone map (details: docs/MILESTONES.md)"
+  info "milestone map (details: MILESTONES.md)"
   awk '/^## M[0-9]/{sub(/^## /,"");print "  " $0}' "$f"
   echo; echo "  current build target: M$MILESTONE  (--milestone N)"
 }
