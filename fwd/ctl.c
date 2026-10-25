@@ -64,12 +64,13 @@ sa_find(struct fwd_ctl *c, const struct r2dp_sa *k)
 	return NULL;
 }
 
-static void
+static int
 sa_apply_dp(struct fwd_ctl *c, int add, const struct r2dp_sa *sa,
     const void *blob, size_t blen)
 {
 	if (c->dp.ops && c->dp.ops->sa_add)
-		c->dp.ops->sa_add(&c->dp, add, sa, blob, blen);
+		return c->dp.ops->sa_add(&c->dp, add, sa, blob, blen);
+	return 0;
 }
 
 /* ------------------------------------------------------------ SPD */
@@ -201,13 +202,26 @@ do_sa(int fd, const struct r2dp_msg *m)
 			e = &C->sad[i];
 		}
 		e->used = 1; e->larval = 0; e->sa = *rq;
-		sa_apply_dp(C, 1, rq, blen ? blob : NULL, blen);
+		{
+			int dperr = sa_apply_dp(C, 1, rq, blen ? blob : NULL, blen);
+			if (dperr) {
+				e->used = 0;   /* roll back the ctl entry on dp failure */
+				reply_sa(fd, m, dperr, NULL);
+				return;
+			}
+		}
 		reply_sa(fd, m, 0, e);
 		return;
 	case R2DP_SA_UPDATE:
 		if (!e) { reply_sa(fd, m, ENOENT, NULL); return; }
 		e->larval = 0; e->sa = *rq;
-		sa_apply_dp(C, 1, rq, blen ? blob : NULL, blen);
+		{
+			int dperr = sa_apply_dp(C, 1, rq, blen ? blob : NULL, blen);
+			if (dperr) {
+				reply_sa(fd, m, dperr, NULL);
+				return;
+			}
+		}
 		reply_sa(fd, m, 0, e);
 		return;
 	case R2DP_SA_DEL:

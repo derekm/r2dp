@@ -166,12 +166,16 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 		memset(&eh, 0, sizeof(eh));
 		eh.version_ihl = 0x45;
 		eh.time_to_live = 64;
-		eh.next_proto_id = IPPROTO_ESP;
+		eh.next_proto_id = IPPROTO_ESP;   /* OUTER IP carries ESP */
 		memcpy(&eh.src_addr, &src, 4);
 		memcpy(&eh.dst_addr, &dst, 4);
 		prm.tun.hdr_len = sizeof(eh);
 		prm.tun.hdr_l3_off = 0;
-		prm.tun.next_proto = IPPROTO_ESP;
+		/* tun.next_proto is the INNER protocol (what rides inside the ESP
+		 * tunnel), not ESP.  For an IPv4-in-IPv4 tunnel that is IPIP;
+		 * rte_ipsec_sa_size returns -EINVAL if this is wrongly set to
+		 * IPPROTO_ESP (fill_sa_type rejects the nested case). */
+		prm.tun.next_proto = IPPROTO_IPIP;
 		prm.tun.hdr = &eh;
 	}
 
