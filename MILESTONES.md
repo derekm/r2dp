@@ -29,14 +29,18 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   withheld; forwarder-allocated SPI; idempotent SP_ADD; cheap SP_DUMP).
   `fwd/main.c` + `fwd/dp.c` wire an optional DPDK dataplane
   (`-Denable_dpdk`); without DPDK it runs control-only.
-- **Builds (control plane)**: meson + CI 4/4 tests, incl. `smoke_fwd` which
-  drives a live `r2dp-fwd` over the real protocol via `libr2dp` (independent
-  of mockfwd) — clean under ASan/UBSan.
-- **Remaining (packet path)**: `fwd/dp_dpdk.c` — rte_ipsec_sad SAD + rte_acl
-  SPD, run-to-completion loop, IPv4 tunnel mode, AES-GCM (CPU crypto), static
-  routes/neighbors, TAP exception path for IKE/ARP. Exit gate: kernel XFRM <->
-  forwarder ESP interop both directions; iked negotiates via TAP and traffic
-  flows; `r2dpctl dump` matches SAD.
+- **Done (DPDK dataplane, SA layer)**: `fwd/dp_dpdk.c` — `rte_ipsec_sad`
+  (SPI_DIP key, RW-concurrency) storing an opaque `rte_ipsec_sa` per installed
+  SA; `crypto_openssl0` AES-GCM + `net_tap0` ingress vdevs; SA install/delete
+  lowered from the r2dp control socket into the SAD. EAL args passthrough.
+  **Verified on Fedora 24.11.4**: EAL + crypto + tap come up; a raw client
+  drives HELLO→GETSPI→SA_ADD→SA_DEL all status 0 into the SAD, keys withheld.
+- **Builds (control plane + SAD)**: meson + tests 4/4 (`test_proto`,
+  `test_mock`, `shim_contract`, `smoke_fwd`); DPDK build links and runs.
+- **Remaining (packet path)**: the run-to-completion worker loop over
+  `net_tap0` with `librte_ipsec` crypto sessions (ESP in/out, IPv4 tunnel
+  AES-GCM, static routes/neighbors), the tap exception path for IKE/ARP, and
+  the kernel XFRM <-> forwarder ESP interop exit gate over veth with iked.
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
 
