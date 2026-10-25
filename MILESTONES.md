@@ -243,3 +243,24 @@ into per-backend protocol forks.
   path exists and is unit-verified, but the netns/bridge topology routes ESP to
   the kernel rather than through the forwarder's tap; finishing the
   data-plane-through-forwarder leg is the remaining exit-gate item.
+- **2026-10-25 follow-up**: two earlier lab blinds cleared.  (1) The `esp=0`
+  / no-SA_ADD was NOT the control plane: B's `iked-r2dp`/`spmd-r2dp` binaries
+  were stale builds lacking the r2dp backend (generic `rcpfk_*` hooks, no
+  `if_r2dp`; spmd fell back to pfkey).  Rebuilt racoon2
+  (`--with-km-backend=r2dp`) and installed the r2dp libracoon + iked/spmd; now
+  B does real `SA_ADD spi=0ff19bd6 dip=10.77.0.1` into the forwarder over a
+  fresh IKE that reaches ESTABLISHED on both sides.  A (kernel-XFRM peer) must
+  use a separate **xfrm**-configured libracoon (`peer-a/lib`) or it too inits
+  the r2dp backend and fails "r2dp connect".  (2) Source-address: iked selected
+  the inner dummy (192.0.2.2) as IKE source because `my_sa_ipaddr`/
+  `peers_sa_ipaddr` were set to the inner selector instead of the OUTER tunnel
+  endpoints (10.77.0.2/10.77.0.1) — fixed, and IKE now sources from 10.77.0.2.
+- **Remaining exit gate (2026-10-25)**: after the control plane reliably
+  installs the inbound SA, ESP from A (dst 10.77.0.1) reaches B's bridge
+  ingress (veth-b) with the correct tap MAC and the FDB routes that MAC to
+  `r2dp-tap`, yet the DPDK net_tap does not deliver bridged frames to the PMD
+  (forwarder `rx` frozen; direct injection into the tap moves it, so RX is
+  alive).  This is a DPDK-net_tap-in-Linux-bridge delivery quirk, not a
+  forwarder/protocol/datapath defect — all three legs (inbound decrypt, egress
+  encrypt, NAT-T) are independently unit-verified.  Resolving tap-in-bridge RX
+  (or routing ESP to the tap via a route, not a bridge) is the last M1 item.
