@@ -58,6 +58,20 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   kernel-XFRM↔forwarder ESP interop), proving traffic round-trips and the SAD
   is the source of truth. Candidate DEFER: rte_acl SPD → M3 (M1 = linear
   lookup in ctl.c).
+
+### M1 data-plane status (2026-10-24)
+- **Done (inbound structure)**: forwarder is now a two-tap bump-in-the-wire —
+  outer tap (ESP side) + inner tap (plaintext side); worker polls both;
+  inbound ESP → SAD lookup → AES-GCM decrypt → cleartext forwarded to the
+  inner tap (previously dropped).  **Verified on Fedora 24.11.4**: two-tap
+  mode brings up `r2dp-tap` + `r2dp-tap-inner` in PROMISC, worker runs
+  `outer=0 inner=1`, control-plane SA install unaffected.  Commit `444d287`.
+- **Remaining (data-plane crypto proof + outbound)**: the outbound encrypt
+  leg (inner plaintext → ESP out outer) is not yet wired; and no real
+  encrypted ESP packet has yet been shown to decrypt through the forwarder
+  (the esp=0 counters).  Both are one focused pass: add outbound, then a
+  crafted/iked ESP round-trip that raises the ESP counters and delivers
+  cleartext on the inner tap.
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
 
