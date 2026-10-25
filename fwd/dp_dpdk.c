@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include <rte_ip.h>
+#include <rte_esp.h>
 #include <rte_ipsec.h>
 #include <rte_ipsec_sa.h>
 #include <rte_ipsec_sad.h>
@@ -347,22 +348,110 @@ port_init(struct dpdk_priv *d)
 	return 0;
 }
 
-static inline void
-classify(struct dpdk_priv *d, struct rte_mbuf *mb)
+/* Inbound ESP: SAD-lookup by (SPI, DIP), run AES-GCM decrypt through the
+ * OpenSSL cryptodev, then finalize with rte_ipsec_pkt_process.  One
+ * enqueue/dequeue round per matched packet on the same lcore. */
+static uint16_t
+esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr)
 {
-	struct rte_ether_hdr *eh = rte_pktmbuf_mtod(mb, struct rte_ether_hdr *);
-	struct rte_ipv4_hdr *ip;
+	union rte_ipsec_sad_key kkey[BURST_SZ];
+	const union rte_ipsec_sad_key *keys[BURST_SZ];
+	struct rte_mbuf *pm[BURST_SZ];
+	void *sas[BURST_SZ];
+	uint32_t nk = 0;
 
+	if (nr > BURST_SZ) nr = BURST_SZ;
+
+	for (uint16_t i = 0; i < nr; i++) {
+		struct rte_ether_hdr *eh =
+		    rte_pktmbuf_mtod(bufs[i], struct rte_ether_hdr *);
+		struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)
+		    ((uint8_t *)eh + RTE_ETHER_HDR_LEN);
+		struct rte_esp_hdr *es;
+		uint8_t ihl;
+
+		if (rte_pktmbuf_pkt_len(bufs[i]) < RTE_ETHER_HDR_LEN +
+		    sizeof(struct rte_ipv4_hdr) + sizeof(*es))
+			break;      /* too short to be inbound ESP */
+		ihl = (ip->version_ihl & 0x0f) * 4;
+		es = (struct rte_esp_hdr *)((uint8_t *)ip + ihl);
+
+		bufs[i]->l2_len = RTE_ETHER_HDR_LEN;
+		bufs[i]->l3_len = ihl;
+		bufs[i]->ol_flags |= RTE_MBUF_F_RX_SEC_OFFLOAD;
+		bufs[i]->packet_type = RTE_PTYPE_L3_IPV4;
+		kkey[nk].v4.spi = ntohl(es->spi);
+		/* dst_addr is network order; addr4_to_u32 (SA insert) produced the
+		 * same numeric, so match it here without a second byte-swap */
+		kkey[nk].v4.dip = rte_be_to_cpu_32(ip->dst_addr);
+		keys[nk] = &kkey[nk];
+		pm[nk] = bufs[i];
+		nk++;
+	}
+	if (nk == 0)
+		return 0;
+
+	uint32_t nlook = rte_ipsec_sad_lookup(d->sad, keys, sas, nk);
+
+	if (nlook == 0) {
+		/* no SA matched -- drop the whole burst */
+		for (uint32_t i = 0; i < nk; i++)
+			rte_pktmbuf_free(pm[i]);
+		return nk;
+	}
+
+	/* per matched packet: prepare -> enqueue -> dequeue -> process */
+	struct rte_crypto_op *cop[1];
+	for (uint32_t i = 0; i < nk; i++) {
+		if (sas[i] == NULL) {
+			rte_pktmbuf_free(pm[i]);   /* partial match: drop */
+			continue;
+		}
+		struct rte_ipsec_session *ss = sas[i];
+		cop[0] = rte_crypto_op_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
+		if (cop[0] == NULL)
+			continue;
+		rte_crypto_op_attach_sym_session(cop[0], ss->crypto.ses);
+		uint16_t np = rte_ipsec_pkt_crypto_prepare(ss, &pm[i], cop, 1);
+		if (np == 0) {
+			rte_crypto_op_free(cop[0]);
+			continue;
+		}
+		uint16_t enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, np);
+		uint16_t dq = enq ?
+		    rte_cryptodev_dequeue_burst(d->cdev_id, 0, cop, enq) : 0;
+		uint16_t proc = dq ?
+		    rte_ipsec_pkt_process(ss, &pm[i], dq) : 0;
+		for (uint16_t k = proc; k < dq; k++)
+			rte_pktmbuf_free(pm[i]);
+		/* completed ops are safe to return/refund after process */
+		for (uint16_t k = 0; k < dq; k++)
+			rte_crypto_op_free(cop[k]);
+	}
+	(void)nlook;
+	return nk;
+}
+
+static inline int
+is_esp(struct rte_mbuf *mb)
+{
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)
+	    ((uint8_t *)rte_pktmbuf_mtod(mb, uint8_t *) + RTE_ETHER_HDR_LEN);
 	if (rte_pktmbuf_pkt_len(mb) < RTE_ETHER_HDR_LEN +
 	    sizeof(struct rte_ipv4_hdr))
-		return;
-	ip = (struct rte_ipv4_hdr *)((uint8_t *)eh + RTE_ETHER_HDR_LEN);
-	if ((ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_ESP)
-		/* ESP: handled by the crypto path (next M1 step); count only. */
-		d->n_esp++;
-	else if ((ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_UDP)
-		/* IKE is UDP 500/4500 -- the exception path; count. */
-		d->n_ike++;
+		return 0;
+	return (ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_ESP;
+}
+
+static inline int
+is_udp(struct rte_mbuf *mb)
+{
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)
+	    ((uint8_t *)rte_pktmbuf_mtod(mb, uint8_t *) + RTE_ETHER_HDR_LEN);
+	if (rte_pktmbuf_pkt_len(mb) < RTE_ETHER_HDR_LEN +
+	    sizeof(struct rte_ipv4_hdr))
+		return 0;
+	return (ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_UDP;
 }
 
 static int
@@ -395,13 +484,35 @@ worker_main(void *arg)
 			continue;
 		}
 		d->n_rx += nr;
-		for (uint16_t i = 0; i < nr; i++)
-			classify(d, bufs[i]);
-		uint16_t sent = rte_eth_tx_burst(port, 0, bufs, nr);
+
+		/* split: ESP -> crypto path (consumed), non-ESP -> exception
+		 * path (re-emitted on the tap so the kernel sees it) */
+		struct rte_mbuf *plain[BURST_SZ];
+		uint16_t nplain = 0;
+		for (uint16_t i = 0; i < nr; i++) {
+			if (is_esp(bufs[i]))
+				d->n_esp++;
+			else
+				plain[nplain++] = bufs[i];
+		}
+		/* count IKE among the exception path */
+		for (uint16_t i = 0; i < nplain; i++)
+			if (is_udp(bufs[i]))
+				d->n_ike++;
+
+		uint16_t sent = rte_eth_tx_burst(port, 0, plain, nplain);
 		d->n_tx += sent;
-		d->n_drop += nr - sent;
-		for (uint16_t i = sent; i < nr; i++)
-			rte_pktmbuf_free(bufs[i]);
+		d->n_drop += nplain - sent;
+		for (uint16_t i = sent; i < nplain; i++)
+			rte_pktmbuf_free(plain[i]);
+
+		/* ESP packets: run the crypto pipeline (SAD lookup + decrypt) */
+		uint16_t espc = 0;
+		for (uint16_t i = 0; i < nr; i++)
+			if (is_esp(bufs[i]))
+				bufs[espc++] = bufs[i];
+		if (espc)
+			esp_inbound(d, bufs, espc);
 	}
 	return 0;
 }
