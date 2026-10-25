@@ -129,10 +129,10 @@ do_hello(int fd, const struct r2dp_msg *m)
 	memset(&a, 0, sizeof(a));
 	a.epoch = C->epoch;
 	a.max_msg = R2DP_MAX_MSG;
-	/* Advertise only what the dataplane actually implements.  ESN is
-	 * plumbed through the SA; NAT-T, IPv6 and EXPIRE are not yet wired, so
-	 * they must not be advertised or racoon2 would negotiate them and fail. */
-	a.features = R2DP_FEAT_ESN;
+	/* Advertise only what the dataplane actually implements.  ESN and NAT-T
+	 * (ESP-in-UDP 4500) are wired; IPv6 and EXPIRE are not, so they must not
+	 * be advertised or racoon2 would negotiate them and fail. */
+	a.features = R2DP_FEAT_ESN | R2DP_FEAT_NATT;
 	if (C->dp.ops && C->dp.ops->caps) {
 		C->dp.ops->caps(&C->dp);
 		memcpy(a.enc_caps, C->dp.caps_bits_enc, sizeof(a.enc_caps));
