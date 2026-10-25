@@ -836,8 +836,21 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		bufs[i]->l2_len = 0;
 		lip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
 		ihl = (lip->version_ihl & 0x0f) * 4;
+		if (ihl < 20 || ihl > (uint8_t)rte_pktmbuf_data_len(bufs[i]))
+			goto drop;   /* M5c: reject malformed/oversized IHL */
 		bufs[i]->l3_len = ihl;
 		bufs[i]->packet_type = RTE_PTYPE_L3_IPV4;
+		/* M5a: drop Ethernet padding.  A short inner IP (< 60B with the tap's
+		 * eth frame) carries trailing pad after ip->total_length; that pad
+		 * would be encrypted into the ESP payload and break the inner ICV at
+		 * a real peer that authenticated only the padded length.  Trim to
+		 * the IP length so the ESP payload carries exactly the inner packet. */
+		{
+			uint16_t iplen = rte_be_to_cpu_16(lip->total_length);
+			uint16_t cur = rte_pktmbuf_pkt_len(bufs[i]);
+			if (iplen < cur)
+				rte_pktmbuf_trim(bufs[i], cur - iplen);
+		}
 
 		cop = rte_crypto_op_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
 		if (!cop) goto drop;
@@ -1186,8 +1199,11 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	(void)sockpath;
 	/* sa_tab[] holds struct rte_ipsec_session (64-byte aligned); calloc only
 	 * guarantees natural (8-byte) alignment, which is UB (UBSan flags it in
-	 * gcm_kat too).  Use rte_zmalloc with cache-line alignment (M3). */
-	d = rte_zmalloc("r2dp-dpdk", sizeof(*d), RTE_CACHE_LINE_SIZE);
+	 * gcm_kat too).  rte_zmalloc can't be used here: this struct is allocated
+	 * BEFORE rte_eal_init (no DPDK heap yet, so rte_zmalloc fails with
+	 * ENOMEM and the dataplane is silently lost).  aligned_alloc from the C
+	 * library gives the required alignment without the EAL heap (M3). */
+	d = aligned_alloc(RTE_CACHE_LINE_SIZE, sizeof(*d));
 	if (!d)
 		return -ENOMEM;
 	d->verbose = verbose;
