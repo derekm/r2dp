@@ -461,6 +461,7 @@ port_init(struct dpdk_priv *d, uint16_t port)
  * enqueue/dequeue round per matched packet on the same lcore.  Decrypted
  * inner packets are written into `out` (up to *nout); unmatched/undecryptable
  * packets are freed.  Returns the number of mbufs consumed from `in`. */
+static int in_inner_ok(struct dpdk_priv *d, uint32_t dip, struct rte_mbuf *mb);
 static uint16_t
 esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout)
@@ -581,6 +582,10 @@ bad:
 
 	/* per matched packet: prepare -> enqueue -> dequeue -> process */
 	struct rte_crypto_op *cop[1];
+	/* DIP each packet was keyed/looked-up under, for the IN-selector check */
+	uint32_t p_dip[BURST_SZ];
+	for (uint32_t i = 0; i < nk; i++)
+		p_dip[i] = kkey[i].v4.dip;
 	for (uint32_t i = 0; i < nk; i++) {
 		if (sas[i] == NULL) {
 			if (d->verbose)
@@ -665,11 +670,19 @@ bad:
 				    (unsigned long long)pm[i]->ol_flags,
 				    bb[0],bb[1],bb[2],bb[3],bb[4],bb[5],bb[6],bb[7]);
 			}
-			/* processed packets have the inner (cleartext) frame */
-			if (proc == 1 && out && no < BURST_SZ)
+			/* processed packets have the inner (cleartext) frame.  D8:
+			 * after a successful decrypt, apply the RFC 4301 s5.2 IN
+			 * selector check and trim to the inner IP length; drop on
+			 * mismatch/spoof. */
+			if (proc == 1 && out && no < BURST_SZ &&
+			    in_inner_ok(d, p_dip[i], pm[i]))
 				out[no++] = pm[i];
-			else
+			else {
+				if (proc == 1 && d->verbose)
+					fprintf(stderr, "r2dp-fwd: inner SEL reject\n");
+				d->n_drop++;
 				rte_pktmbuf_free(pm[i]);
+			}
 		} else {
 			/* op still in flight (async): drop the packet, leave cop. */
 			d->n_drop += dq == 0 ? 1 : 0;
@@ -771,6 +784,60 @@ sel_match(const struct r2dp_addr *sel, uint8_t pref, const uint8_t *ip)
 			return 0;
 	}
 	return 1;
+}
+
+/* D8 (RFC 4301 s5.2): verify a decrypted inner packet against the IN policy
+ * for the tunnel it arrived under.  Find the IN-PROTECT SP whose tunnel dest
+ * is `dip`; its sel_src/sel_dst say which inner addresses the peer may claim.
+ * If no IN policy is installed for this tunnel the packet is accepted (a peer
+ * we accepted an SA from is at least past the ESP ICV); if one exists, the
+ * inner src/dst must match its selector or we drop (a peer with a valid SA
+ * must not be able to inject arbitrary inner addresses).  Also trims the
+ * inner packet to IP total_length (no Ethernet padding smuggled into ESP). */
+static int
+in_inner_ok(struct dpdk_priv *d, uint32_t dip, struct rte_mbuf *mb)
+{
+	struct rte_ipv4_hdr *ip;
+	uint8_t ihl;
+	uint16_t iplen, cur;
+
+	if (rte_pktmbuf_pkt_len(mb) < sizeof(struct rte_ipv4_hdr))
+		return 0;
+	ip = rte_pktmbuf_mtod(mb, struct rte_ipv4_hdr *);
+	if ((ip->version_ihl >> 4) != 4)
+		return 0;
+	ihl = (ip->version_ihl & 0x0f) * 4;
+	if (ihl < (uint8_t)sizeof(struct rte_ipv4_hdr) ||
+	    ihl > rte_pktmbuf_data_len(mb))
+		return 0;
+	/* trim any trailing bytes beyond the inner IP length (padding/NAT-T) */
+	iplen = rte_be_to_cpu_16(ip->total_length);
+	cur = rte_pktmbuf_pkt_len(mb);
+	if (iplen < cur)
+		rte_pktmbuf_trim(mb, cur - iplen);
+
+	for (int i = 0; i < MAX_SA; i++) {
+		const struct dp_sp_ent *e = &d->sp_tab[i];
+		const struct r2dp_sp *sp;
+		uint32_t td;
+		if (!e->used)
+			continue;
+		sp = &e->sp;
+		if (sp->dir != R2DP_DIR_IN || sp->action != R2DP_ACT_PROTECT)
+			continue;
+		memcpy(&td, &sp->tun_dst.addr[0], 4);
+		if (td != dip)
+			continue;   /* not the tunnel this packet came in on */
+		/* this tunnel's IN policy: inner src/dst must match its selector */
+		if (!sel_match(&sp->sel_src, sp->pref_src,
+		    (const uint8_t *)(&ip->src_addr)))
+			return 0;
+		if (!sel_match(&sp->sel_dst, sp->pref_dst,
+		    (const uint8_t *)(&ip->dst_addr)))
+			return 0;
+		return 1;
+	}
+	return 1;   /* no IN policy installed for this tunnel: accept */
 }
 
 /* Find the EGRESS SA for this OUT policy.  racoon2 sends reqid=0 for every
