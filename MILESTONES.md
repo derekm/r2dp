@@ -41,12 +41,23 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   (→IKE exception path, counted). **Verified**: bridge `r2dp-tap`→veth→netns,
   ping through; worker shows `rx=73 tx=73 drop=0 ike=18` — traffic flows
   through the DPDK datapath, zero drops.
-- **Builds (control plane + SAD + packet loop)**: meson + tests 4/4
-  (`test_proto`, `test_mock`, `shim_contract`, `smoke_fwd`); DPDK build links
-  and runs.
-- **Remaining (packet path crypto + interop)**: the `librte_ipsec` crypto
-  session (AES-GCM) on the ESP classification path, then iked-over-veth
-  kernel-XFRM↔forwarder ESP interop — the M1 exit gate.
+- **Done (ESP crypto path)**: full security stack per SA — OpenSSL cryptodev
+  config/start + session + op mempools, `rte_cryptodev_sym_session_create`,
+  `rte_ipsec_session` bound via `rte_ipsec_session_prepare` (CPU_CRYPTO,
+  24.11 pattern), SAD value = the session. Worker splits ESP vs non-ESP; ESP →
+  SAD lookup (SPI+DIP) → `pkt_crypto_prepare` → enqueue → dequeue →
+  `pkt_process`. **Verified**: SA_ADD builds the AES-GCM session on
+  crypto_openssl0 (status 0, no crypto errors); worker regression clean
+  (zero drops).  *Remaining: the end-to-end "a real ESP packet decrypts"
+  proof + the iked-over-veth interop exit gate (below).*
+- **Builds (control plane + SAD + packet loop + crypto path)**: meson + tests
+  4/4 (`test_proto`, `test_mock`, `shim_contract`, `smoke_fwd`); DPDK build
+  links and runs.
+- **Remaining (M1 exit gate)**: drive a real encrypted ESP flow through the
+  forwarder (iked over a veth/VTAP against the patched racoon2 backend =
+  kernel-XFRM↔forwarder ESP interop), proving traffic round-trips and the SAD
+  is the source of truth. Candidate DEFER: rte_acl SPD → M3 (M1 = linear
+  lookup in ctl.c).
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
 
