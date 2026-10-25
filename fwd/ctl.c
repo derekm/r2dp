@@ -213,11 +213,12 @@ do_sa(int fd, const struct r2dp_msg *m)
 	struct fwd_sa_ent *e = sa_find(C, rq);
 	uint8_t blob[R2DP_MAX_KEY];
 	size_t blen = 0;
+	int rc = 0;
 
 	if (!(m->h.flags & R2DP_HF_NOKEYS)) {
 		/* reconstruct the AEAD/enc key blob for the dataplane */
 		size_t el = rq->enckeylen, al = rq->authkeylen;
-		if (el + al > sizeof(blob)) { reply_sa(fd, m, EINVAL, NULL); return; }
+		if (el + al > sizeof(blob)) { rc = EINVAL; goto out; }
 		memcpy(blob, r2dp_msg_enckey(m), el);
 		if (al)
 			memcpy(blob + el, r2dp_msg_authkey(m), al);
@@ -226,10 +227,10 @@ do_sa(int fd, const struct r2dp_msg *m)
 
 	switch (m->h.type) {
 	case R2DP_SA_ADD:
-		if (e && !e->larval) { reply_sa(fd, m, EEXIST, NULL); return; }
+		if (e && !e->larval) { rc = EEXIST; goto out; }
 		if (!e) {
 			int i = sa_alloc_idx(C);
-			if (i < 0) { reply_sa(fd, m, ENOBUFS, NULL); return; }
+			if (i < 0) { rc = ENOBUFS; goto out; }
 			e = &C->sad[i];
 			memset(e, 0, sizeof(*e));
 			e->used = 1;
@@ -246,8 +247,8 @@ do_sa(int fd, const struct r2dp_msg *m)
 				 * free the slot. */
 				if (!e->larval)
 					e->used = 0;
-				reply_sa(fd, m, dperr, NULL);
-				return;
+				rc = dperr;
+				goto out;
 			}
 		}
 		/* commit: promotes a larval reservation to a live SA */
@@ -255,11 +256,9 @@ do_sa(int fd, const struct r2dp_msg *m)
 			e->inbound = 1;
 		e->larval = 0;
 		e->sa = *rq;
-		explicit_bzero(blob, sizeof(blob));   /* scrub key material (L5) */
-		reply_sa(fd, m, 0, e);
-		return;
+		goto out_ok;
 	case R2DP_SA_UPDATE:
-		if (!e) { reply_sa(fd, m, ENOENT, NULL); return; }
+		if (!e) { rc = ENOENT; goto out; }
 		/* M1: an in-place UPDATE that carries key material on a LIVE
 		 * (non-larval) SA would rebuild the rte_ipsec_sa with sqn=0,
 		 * repeating sequence numbers / GCM nonces under a reused key --
@@ -267,8 +266,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 		 * (new slot), so refuse instead of corrupting replay/nonce state.
 		 * A larval UPDATE (the GETSPI completion path) is fine: it installs
 		 * the key for the first time.  Lifetime-only updates carry no blob. */
-		if (!e->larval && blen)
-			{ reply_sa(fd, m, EINVAL, NULL); return; }
+		if (!e->larval && blen) { rc = EINVAL; goto out; }
 		{
 			/* Apply to the dataplane FIRST.  The dataplane's update is
 			 * del-then-add, so on failure the SAD holds nothing while the
@@ -284,34 +282,45 @@ do_sa(int fd, const struct r2dp_msg *m)
 				/* e->sa was not touched: the ctl entry still reflects the
 				 * last-known-good SA, consistent with the dataplane which
 				 * either kept the old entry or rolled back its del-then-add. */
-				reply_sa(fd, m, dperr, NULL);
-				return;
+				rc = dperr;
+				goto out;
 			}
 		}
 		if (e->larval)
 			e->inbound = 1;
 		e->larval = 0; e->sa = *rq;
-		explicit_bzero(blob, sizeof(blob));   /* scrub key material (L5) */
-		reply_sa(fd, m, 0, e);
-		return;
+		goto out_ok;
 	case R2DP_SA_DEL:
-		if (!e) { reply_sa(fd, m, ENOENT, NULL); return; }
+		if (!e) { rc = ENOENT; goto out; }
 		{
 			int dperr = sa_apply_dp(C, 0, rq, NULL, 0);
 			if (dperr) {
 				/* dataplane still owns the SA; keep the ctl entry live */
-				reply_sa(fd, m, dperr, NULL);
-				return;
+				rc = dperr;
+				goto out;
 			}
 		}
 		reply_sa(fd, m, 0, e);
 		e->used = 0;
-		return;
+		goto scrub;
 	case R2DP_SA_GET:
-		if (!e || e->larval) { reply_sa(fd, m, ENOENT, NULL); return; }
+		if (!e || e->larval) { rc = ENOENT; goto out; }
 		reply_sa(fd, m, 0, e);
-		return;
+		goto scrub;
+	default:
+		rc = ENOSYS;
+		goto out;
 	}
+
+out_ok:
+	reply_sa(fd, m, 0, e);
+	goto scrub;
+out:
+	reply_sa(fd, m, rc, NULL);
+scrub:
+	/* M7: scrub the reconstructed key blob on EVERY exit, success or error,
+	 * so key material never lingers on the stack. */
+	explicit_bzero(blob, sizeof(blob));
 }
 
 static void
