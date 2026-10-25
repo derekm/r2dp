@@ -33,19 +33,34 @@ int
 main(int argc, char **argv)
 {
 	const char *sockpath = getenv("R2DP_SOCK");
-	int verbose = 0, c;
+	int verbose = 0;
+	/* DPDK EAL args (everything not one of our own) go to rte_eal_init */
+	char **eal_argv, **eal_base;
+	int eal_argc = 1, i;
 
 	if (!sockpath || !*sockpath)
 		sockpath = R2DP_DEFAULT_SOCK;
 
-	while ((c = getopt(argc, argv, "s:vn:")) != -1) {
-		switch (c) {
-		case 's': sockpath = optarg; break;
-		case 'v': verbose = 1; break;
-		case 'n': break;   /* processing lcores; the DPDK probe claims it */
-		default:
-			fprintf(stderr, "usage: %s [-s sock] [-v] [-n ncores]\n", argv[0]);
-			return 2;
+	eal_argv = calloc((size_t)argc + 1, sizeof(char *));
+	if (!eal_argv)
+		return 1;
+	eal_base = eal_argv;      /* rte_eal_init advances *argv; free the base */
+	eal_argv[0] = argv[0];    /* EAL expects argv[0] = program name; rest at 1 */
+
+	/* Manual parse: keep -s/-v/-n for the control server, pass everything
+	 * else (DPDK EAL opts like --vdev/--no-pci/--huge-dir, and their
+	 * operands) to rte_eal_init.  Stops at the first bare operand. */
+	for (i = 1; i < argc; i++) {
+		const char *a = argv[i];
+
+		if (strcmp(a, "-s") == 0 && i + 1 < argc) {
+			sockpath = argv[++i];
+		} else if (strcmp(a, "-v") == 0) {
+			verbose = 1;
+		} else if (strcmp(a, "-n") == 0 && i + 1 < argc) {
+			i++;               /* processing lcores; probe claims it */
+		} else {
+			eal_argv[eal_argc++] = argv[i];
 		}
 	}
 
@@ -53,19 +68,17 @@ main(int argc, char **argv)
 
 	fwd_ctl_init(&ctl, sockpath, verbose);
 
-	/* Optional DPDK dataplane probe.  Probe owns the EAL init and registers
-	 * the dp vtable.  Failure to load DPDK is non-fatal: we still serve the
-	 * control socket (useful for racoon2 bring-up and the M0 tests). */
+	/* Optional DPDK dataplane probe.  Failure is non-fatal: we still serve
+	 * the control socket (racoon2 bring-up + M0 tests). */
 	{
-		int probe_argc = argc - optind;
-		char **probe_argv = argv + optind;
-		int r = fwd_dp_dpdk_probe(&ctl.dp, &probe_argc, &probe_argv,
+		int r = fwd_dp_dpdk_probe(&ctl.dp, &eal_argc, &eal_argv,
 		    sockpath, verbose);
 		if (r < 0)
 			fprintf(stderr, "r2dp-fwd: DPDK dataplane unavailable (%s); "
 			    "serving control-only\n", r == -2 ? "no DPDK build" : strerror(-r));
 		(void)g_stop;
 	}
+	free(eal_base);   /* rte_eal_init advanced eal_argv; free the calloc base */
 
 	fwd_ctl_run(&ctl, sockpath);
 	return 0;
