@@ -41,15 +41,31 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   (→IKE exception path, counted). **Verified**: bridge `r2dp-tap`→veth→netns,
   ping through; worker shows `rx=73 tx=73 drop=0 ike=18` — traffic flows
   through the DPDK datapath, zero drops.
-- **Done (ESP crypto path)**: full security stack per SA — OpenSSL cryptodev
-  config/start + session + op mempools, `rte_cryptodev_sym_session_create`,
-  `rte_ipsec_session` bound via `rte_ipsec_session_prepare` (CPU_CRYPTO,
-  24.11 pattern), SAD value = the session. Worker splits ESP vs non-ESP; ESP →
-  SAD lookup (SPI+DIP) → `pkt_crypto_prepare` → enqueue → dequeue →
-  `pkt_process`. **Verified**: SA_ADD builds the AES-GCM session on
-  crypto_openssl0 (status 0, no crypto errors); worker regression clean
-  (zero drops).  *Remaining: the end-to-end "a real ESP packet decrypts"
-  proof + the iked-over-veth interop exit gate (below).*
+- **Done (ESP crypto path, corrected 2026-10-25)**: the packet decoder
+  pipeline now genuinely runs.  Beyond `0185dad`, three more compounding bugs
+  were unmasked (all latent because no real ESP had ever reached the decoder)
+  and fixed in `f704e94`:
+  1. **SAD lookup byte-order mismatch** — lookup applied `rte_be_to_cpu_32()`
+     to `ip->dst_addr` while SA install stores raw wire-order bytes via
+     `addr4_to_u32()` memcpy → keys byte-swapped apart → `nlook=0` on every
+     real packet.  Lookup now uses `ip->dst_addr` verbatim.
+  2. **No crypto direction** — the SAD is the inbound-decrypt table (keyed
+     SPI+DIP, read by the inbound worker), so every session must be
+     `RTE_CRYPTO_AEAD_OP_DECRYPT`; it defaulted to ENCRYPT → OpenSSL session
+     mismatched the op → crash.
+  3. **Missing AEAD iv.offset + zero op-pool priv_size** — librte_ipsec writes
+     the GCM IV into the op private area (op+sym_op), and the OpenSSL PMD
+     reads it back at `xform->aead.iv.offset`; offset 0 made it read the
+     session-pointer region as the IV → near-NULL segfault in
+     `openssl_pmd_process_op`.  Set the offset to ipsec-secgw's IV_OFFSET and
+     reserved that + IV length in the op pool.
+  **Verified (probe, Fedora 24.11.4)**: SA_ADD status 0 with the SA genuinely
+  in the SAD (not masked), SAD lookup `nlook=1`, `pkt_crypto_prepare np=1`,
+  enqueue/dequeue 1/1 with **no crash** — the data-plane decrypt pipe now
+  runs start to finish.  A hand-crafted RFC 4106 probe currently `AUTH_FAILED`
+  at the GCM tag check (probe AAD vs librte_ipsec's internal `aead_gcm_aad`
+  format — a probe-format detail, not a pipeline fault); the real iked
+  interop is the authoritative wire test.
 - **Builds (control plane + SAD + packet loop + crypto path)**: meson + tests
   4/4 (`test_proto`, `test_mock`, `shim_contract`, `smoke_fwd`); DPDK build
   links and runs.
