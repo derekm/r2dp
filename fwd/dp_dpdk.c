@@ -159,6 +159,15 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	(void)keylen;
 	if (!d->have_cdev)
 		return -ENODEV;
+	/* D10: refuse what the data plane cannot honour, instead of accepting
+	 * and silently misbehaving.  M1 is IPv4 AES-GCM tunnel only. */
+	if (rsa->natt_type != R2DP_NATT_NONE)
+		return -EOPNOTSUPP;              /* NAT-T (UDP 4500 ESP) not wired */
+	if (rsa->src.family != R2DP_AF_INET4 ||
+	    rsa->dst.family != R2DP_AF_INET4)
+		return -EAFNOSUPPORT;           /* IPv4 only */
+	if (rsa->mode != R2DP_MODE_TUNNEL)
+		return -EOPNOTSUPP;             /* tunnel mode only */
 	ret = r2dp_gcm_sa_prm(rsa, key, inbound, &prm, &aead, &eh);
 	if (ret < 0)
 		return ret;
