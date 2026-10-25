@@ -21,6 +21,8 @@ struct fwd_sa_ent {
 	int used, larval;
 	int inbound;                  /* our GETSPI reservation: ingress SA */
 	time_t larva_at;              /* when a larval reservation was made */
+	time_t installed_at;          /* when the SA was (re)installed; 0 = never */
+	char  soft_notified, hard_notified; /* lifetime EXPIRE thresholds reached */
 	struct r2dp_sa sa;
 };
 struct fwd_sp_ent { int used; struct r2dp_sp sp; };

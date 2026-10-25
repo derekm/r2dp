@@ -129,10 +129,11 @@ do_hello(int fd, const struct r2dp_msg *m)
 	memset(&a, 0, sizeof(a));
 	a.epoch = C->epoch;
 	a.max_msg = R2DP_MAX_MSG;
-	/* Advertise only what the dataplane actually implements.  ESN and NAT-T
-	 * (ESP-in-UDP 4500) are wired; IPv6 and EXPIRE are not, so they must not
-	 * be advertised or racoon2 would negotiate them and fail. */
-	a.features = R2DP_FEAT_ESN | R2DP_FEAT_NATT;
+	/* Advertise only what the dataplane actually implements.  ESN, NAT-T and
+	 * EXPIRE (soft/hard TIME-lifetime rekey driver, fwd/ctl.c) are wired;
+	 * IPv6 is not, so it must not be advertised or racoon2 would negotiate
+	 * it and fail. */
+	a.features = R2DP_FEAT_ESN | R2DP_FEAT_NATT | R2DP_FEAT_EXPIRE;
 	if (C->dp.ops && C->dp.ops->caps) {
 		C->dp.ops->caps(&C->dp);
 		memcpy(a.enc_caps, C->dp.caps_bits_enc, sizeof(a.enc_caps));
@@ -192,6 +193,49 @@ do_getspi(int fd, const struct r2dp_msg *m)
 		}
 	}
 	reply_sa(fd, m, ENOSPC, NULL);
+}
+
+/* soft/hard TIME lifetime expiry -> unsolicited EXPIRE to every client
+	 * (racoon2's cb_expire hunts the SAD by SPI and rekeys).  The forwarder
+	 * is the SAD source of truth; the threshold resets on each reinstantiation.
+	 * BYTE lifetimes need per-SA counters in the dataplane and are skipped
+	 * here (0 is "infinite"), matching the mock and the M1 contract. */
+static void
+check_lifetimes(const int *cli, int ncli)
+{
+	time_t now = time(NULL);
+	for (int i = 0; i < FWD_MAXSA; i++) {
+		struct fwd_sa_ent *e = &C->sad[i];
+		uint64_t el, soft, hard;
+		struct r2dp_sa sp;
+		char stale;
+
+		if (!e->used || e->larval || !e->installed_at)
+			continue;
+		el = (uint64_t)(now - e->installed_at);
+		soft = e->sa.lft_soft_time;
+		hard = e->sa.lft_hard_time;
+		stale = 0;
+		/* hard expiry just fires (once); racoon2 dislikes a second one for
+		 * an SA already teared down.  We tear it out of the SAD here too.*/
+		if (hard && el >= hard && !e->hard_notified) {
+			e->hard_notified = 1; e->soft_notified = 1;
+			sp = e->sa; sp.expired = 2; stale = 1;
+		} else if (soft && el >= soft && !e->soft_notified) {
+			e->soft_notified = 1;
+			sp = e->sa; sp.expired = 1;
+		} else {
+			continue;
+		}
+		for (int c = 0; c < ncli; c++)
+			r2dp_send(cli[c], R2DP_EXPIRE, 0, 0, R2DP_HF_NOKEYS,
+			    &sp, sizeof(sp), NULL, 0);
+		if (stale) {
+			/* hard expiry: withdraw the SA from the dataplane too */
+			(void)sa_apply_dp(C, 0, &e->sa, NULL, 0);
+			e->used = 0; e->installed_at = 0;
+		}
+	}
 }
 
 /* Reap larval (GETSPI-reserved, never confirmed) SAs past their TTL. */
@@ -256,6 +300,9 @@ do_sa(int fd, const struct r2dp_msg *m)
 			e->inbound = 1;
 		e->larval = 0;
 		e->sa = *rq;
+		/* restart the lifetime clock on (re)install */
+		e->installed_at = time(NULL);
+		e->soft_notified = e->hard_notified = 0;
 		goto out_ok;
 	case R2DP_SA_UPDATE:
 		if (!e) { rc = ENOENT; goto out; }
@@ -289,6 +336,8 @@ do_sa(int fd, const struct r2dp_msg *m)
 		if (e->larval)
 			e->inbound = 1;
 		e->larval = 0; e->sa = *rq;
+		e->installed_at = time(NULL);
+		e->soft_notified = e->hard_notified = 0;
 		goto out_ok;
 	case R2DP_SA_DEL:
 		if (!e) { rc = ENOENT; goto out; }
@@ -466,6 +515,7 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 		if (g_stop)
 			break;
 		reap_larv();          /* expire stale GETSPI reservations */
+		check_lifetimes(cli, ncli);  /* soft/hard TIME expiry -> EXPIRE */
 		pf[n].fd = lfd; pf[n++].events = POLLIN;
 		for (int i = 0; i < ncli; i++) { pf[n].fd = cli[i]; pf[n++].events = POLLIN; }
 		if (poll(pf, n, 500) < 0) { if (errno == EINTR) continue; break; }
