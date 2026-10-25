@@ -35,12 +35,18 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   lowered from the r2dp control socket into the SAD. EAL args passthrough.
   **Verified on Fedora 24.11.4**: EAL + crypto + tap come up; a raw client
   drives HELLO→GETSPI→SA_ADD→SA_DEL all status 0 into the SAD, keys withheld.
-- **Builds (control plane + SAD)**: meson + tests 4/4 (`test_proto`,
-  `test_mock`, `shim_contract`, `smoke_fwd`); DPDK build links and runs.
-- **Remaining (packet path)**: the run-to-completion worker loop over
-  `net_tap0` with `librte_ipsec` crypto sessions (ESP in/out, IPv4 tunnel
-  AES-GCM, static routes/neighbors), the tap exception path for IKE/ARP, and
-  the kernel XFRM <-> forwarder ESP interop exit gate over veth with iked.
+- **Done (DPDK packet path, v1)**: run-to-completion worker on a slave lcore;
+  `net_tap0` bring-up (configure/rx/tx/start/promisc); rx→classify→tx loop
+  with per-second counters; IPv4 ESP (→crypto path, counted) + IPv4 UDP
+  (→IKE exception path, counted). **Verified**: bridge `r2dp-tap`→veth→netns,
+  ping through; worker shows `rx=73 tx=73 drop=0 ike=18` — traffic flows
+  through the DPDK datapath, zero drops.
+- **Builds (control plane + SAD + packet loop)**: meson + tests 4/4
+  (`test_proto`, `test_mock`, `shim_contract`, `smoke_fwd`); DPDK build links
+  and runs.
+- **Remaining (packet path crypto + interop)**: the `librte_ipsec` crypto
+  session (AES-GCM) on the ESP classification path, then iked-over-veth
+  kernel-XFRM↔forwarder ESP interop — the M1 exit gate.
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
 
