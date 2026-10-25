@@ -151,11 +151,18 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
 - **M5 parse/trim — FIXED (4572fde)**: trim tap eth padding before
   encrypt (M5a); IHL bounds check (M5c).
 - **L7 getspi span overflow — FIXED (5280fee)** (64-bit span/modulus).
-- **OPEN (deferred)**: D5 SPD priority-order + port
-  selectors + IPv6 refusal at SP_ADD; M4 inner-selector check after decrypt;
-  M7 key scrub on error paths; M9 egress/EVP/replay tests + gcm_kat SKIP=fail;
-  M10 DPDK CI lane (no libdpdk-dev in ci.yml); L1/L2/L3 doc+license+handles;
-  L4 wsize=0->64; L6 per-packet IKE counter; L5/formatting.
+- **NAT-T (RFC 3948) — IMPLEMENTED, bidirectional (da440de, 1ebff27 + backend
+  e832409)**: forwarder detects ESP-in-UDP/4500 on the outer tap via a SAD-probe
+  (disambiguating ESP from IKE-over-NAT-T per RFC 3948 s2.2), strips the encap
+  to decrypt inbound, inserts UDP(4500)+marker on the encrypted egress leg, and
+  advertises R2DP_FEAT_NATT so racoon2 negotiates it; the r2dp backend packs
+  NAT-T SAs.  Verified inbound (UDP-encapped ESP decrypts st=0, pkt=44) and
+  outbound (wire shows 4500/4500 + marker + our SPI).  IPv6 stays refused --
+  it broadens SAD keys/selectors/framing and is a separate milestone item.
+- **OPEN (deferred)**: D5 SPD priority-order + port selectors +
+  IPv6; M9 egress/EVP/replay tests (gcm_kat SKIP=fail and the DPDK CI lane are
+  done under b29b5bc); L1/L2/L3 doc+license+handles; L4 wsize=0->64; L6
+  per-packet IKE counter; L5/formatting.
 
 - **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
 - **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
