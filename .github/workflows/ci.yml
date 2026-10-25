@@ -46,3 +46,30 @@ jobs:
           meson compile -C build-asan
       - name: Test under sanitizers
         run: meson test -C build-asan --print-errorlogs
+
+  # D11: the data plane (fwd/dp_dpdk.c, dp_gcm.c) and its known-answer test are
+  # only compiled when DPDK is enabled, so the control-only builds above leave
+  # the whole forwarding path CI-invisible.  This lane builds with libdpdk-dev
+  # and runs gcm_kat with R2DP_REQUIRE_DPDK=1 so a broken data plane is a hard
+  # failure, never a pass-as-SKIP.
+  dpdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install DPDK deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build meson pkg-config libdpdk-dev libssl-dev
+      - name: Build data plane (DPDK enabled)
+        run: |
+          meson setup build-dpdk --buildtype=debugoptimized -Denable_dpdk=enabled
+          meson compile -C build-dpdk
+      - name: Test (gcm_kat must not skip)
+        run: |
+          R2DP_REQUIRE_DPDK=1 meson test -C build-dpdk --print-errorlogs
+      - name: ASan+UBSan data plane
+        run: |
+          meson setup build-dpkasan --buildtype=debug -Denable_dpdk=enabled \
+            -Db_sanitize=address,undefined -Db_lundef=false -Db_staticpic=false
+          meson compile -C build-dpkasan
+          R2DP_REQUIRE_DPDK=1 meson test -C build-dpkasan --print-errorlogs

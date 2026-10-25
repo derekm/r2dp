@@ -39,6 +39,9 @@ static uint8_t keymat[20] = {
 #define SPI 0x1234u
 static int cdev;
 static struct rte_mempool *mp, *sess_mp, *cop_mp;
+#define MAXSESS 8
+static struct rte_ipsec_session *sess_tab[MAXSESS];
+static size_t nsess;
 static int fails = 0;
 #define CHECK(c, m) do { if (c) { printf("ok   %s\n", m); } else { printf("FAIL %s\n", m); fails++; } } while (0)
 #define IV_OFFSET (sizeof(struct rte_crypto_op) + sizeof(struct rte_crypto_sym_op))
@@ -97,7 +100,31 @@ mk_sess(unsigned aad_tweak)
 	ss->crypto.ses = rte_cryptodev_sym_session_create(cdev, &aead, sess_mp);
 	if (!ss->crypto.ses) { puts("cses"); exit(2); }
 	if (rte_ipsec_session_prepare(ss) < 0) { puts("sess"); exit(2); }
+	if (nsess < MAXSESS)           /* track for teardown (D11/LeakSanitizer) */
+		sess_tab[nsess++] = ss;
 	return ss;
+}
+
+/* Teardown every session/pool the test created so gcm_kat is clean under
+ * LeakSanitizer (the DPDK ASan CI lane fails on any leak). */
+static void
+teardown(void)
+{
+	for (size_t i = 0; i < nsess; i++) {
+		struct rte_ipsec_session *ss = sess_tab[i];
+		if (!ss) continue;
+		if (ss->crypto.ses)
+			rte_cryptodev_sym_session_free(cdev, ss->crypto.ses);
+		if (ss->sa) { rte_ipsec_sa_fini(ss->sa); rte_free(ss->sa); }
+		rte_free(ss);
+	}
+	nsess = 0;
+	if (cop_mp) rte_mempool_free(cop_mp);
+	if (sess_mp) rte_mempool_free(sess_mp);
+	if (mp) rte_mempool_free(mp);
+	if (cdev >= 0)
+		rte_cryptodev_stop((uint8_t)cdev);
+	rte_eal_cleanup();
 }
 
 /* Seal an ESP packet with OpenSSL EVP (real-peer crypto): takes the IP+ESP
@@ -173,8 +200,16 @@ main(void)
 	uint8_t body[200]; uint8_t inner[84]; size_t n;
 	int st;
 
-	if (rte_eal_init(7, ea) < 0) { puts("SKIP: EAL"); return 77; }
-	if (setup() < 0) { puts("SKIP: no crypto_openssl"); return 77; }
+	if (rte_eal_init(7, ea) < 0) {
+		/* D11: on a lane that requested DPDK, EAL failure must be a hard
+		 * failure, not a pass-as-SKIP that hides a broken data plane. */
+		if (getenv("R2DP_REQUIRE_DPDK")) { puts("EAL init FAILED"); return 1; }
+		puts("SKIP: EAL"); return 77;
+	}
+	if (setup() < 0) {
+		if (getenv("R2DP_REQUIRE_DPDK")) { puts("crypto_openssl FAILED"); return 1; }
+		puts("SKIP: no crypto_openssl"); return 77;
+	}
 
 	/* build: outer IPv4 (20) + SPI(4)+SEQ(4) + IV(8) + ct + ICV(16) */
 	memset(body, 0, sizeof(body));
@@ -223,5 +258,6 @@ main(void)
 	  rte_pktmbuf_free(m); }
 
 	printf("%s\n", fails ? "FAIL" : "PASS");
+	teardown();
 	return fails ? 1 : 0;
 }
