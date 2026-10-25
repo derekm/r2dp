@@ -70,6 +70,16 @@ int r2dp_send(int fd, uint16_t type, uint32_t seq, int status, uint32_t flags,
  */
 int r2dp_recv(int fd, struct r2dp_msg *m);
 
+/* Validate a received message body against its header and type.
+ * `m` carries the header already parsed; `n` is the total number of bytes
+ * read (header + body + tail).  Checks, for the message type: the body is at
+ * least the required struct, the key tail length exactly matches
+ * enckeylen+authkeylen unless HF_NOKEYS (in which case it must be zero), and
+ * each key is capped at R2DP_MAX_KEY.  Returns 0 or -EBADMSG.  This is what
+ * keeps a short or hostile datagram from being unpacked as a full SA/SP.
+ */
+int r2dp_msg_validate(const struct r2dp_msg *m, size_t n);
+
 /* Size a receiver buffer for r2dp_recv. */
 #define R2DP_MSG_INIT() ((struct r2dp_msg){ 0 })
 

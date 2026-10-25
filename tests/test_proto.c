@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -133,6 +134,82 @@ caps(void)
 	CHECK(r2dp_cap(caps, 8 * 32 + 1) == 0, "out of range clean");
 }
 
+static void
+validate(void)
+{
+	struct r2dp_msg m;
+	struct r2dp_sa *sa;
+	size_t n;
+
+	/* Truncated SA_ADD body (header only, no SA struct). */
+	memset(&m, 0, sizeof(m));
+	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
+	m.h.type = R2DP_SA_ADD; m.h.len = sizeof(m.h) + 10;
+	n = sizeof(m.h) + 10;
+	CHECK(r2dp_msg_validate(&m, n) == -EBADMSG, "truncated SA body rejected");
+
+	/* No body for a HELLO_ACK. */
+	m.h.type = R2DP_HELLO_ACK; m.h.len = sizeof(m.h);
+	CHECK(r2dp_msg_validate(&m, sizeof(m.h)) == -EBADMSG, "short HELLO_ACK rejected");
+
+	/* SA_ADD with enckeylen larger than the received tail -> OOB-cap guard. */
+	memset(&m, 0, sizeof(m));
+	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
+	m.h.type = R2DP_SA_ADD; m.h.len = sizeof(m.h) + sizeof(*sa) + 4;
+	sa = r2dp_msg_sa(&m);
+	sa->enckeylen = 100; sa->authkeylen = 0;   /* only 4 tail bytes present */
+	n = m.h.len;
+	CHECK(r2dp_msg_validate(&m, n) == -EBADMSG,
+	    "keylen > tail rejected");
+
+	/* SA_ADD NOKEYS with a non-empty tail. */
+	m.h.flags = R2DP_HF_NOKEYS; m.h.len = sizeof(m.h) + sizeof(*sa) + 4;
+	CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG, "NOKEYS with tail rejected");
+
+	/* SA_ADD NOKEYS with exact no-tail body: ok. */
+	m.h.len = sizeof(m.h) + sizeof(*sa);
+	CHECK(r2dp_msg_validate(&m, m.h.len) == 0, "NOKEYS no-tail ok");
+
+	/* SA_ADD with complete matching key tail: ok. */
+	memset(&m, 0, sizeof(m));
+	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
+	m.h.type = R2DP_SA_ADD; m.h.len = sizeof(m.h) + sizeof(*sa) + 20;
+	sa = r2dp_msg_sa(&m);
+	sa->enckeylen = 16; sa->authkeylen = 4;   /* AES-GCM 16+4 = 20 */
+	CHECK(r2dp_msg_validate(&m, m.h.len) == 0, "full SA_ADD key tail ok");
+
+	/* SA_ADD with key tail ordering mismatch. */
+	m.h.len = sizeof(m.h) + sizeof(*sa) + 21;
+	CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG, "tail length mismatch rejected");
+
+	/* SA_DEL: key = full SA struct, no tail required. */
+	memset(&m, 0, sizeof(m));
+	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
+	m.h.type = R2DP_SA_DEL; m.h.len = sizeof(m.h) + sizeof(*sa);
+	CHECK(r2dp_msg_validate(&m, m.h.len) == 0, "SA_DEL full key ok");
+	m.h.len = sizeof(m.h) + sizeof(*sa) + 8;
+	CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG, "SA_DEL with stray tail rejected");
+
+	/* Truncated SP_ADD body. */
+	memset(&m, 0, sizeof(m));
+	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
+	m.h.type = R2DP_SP_ADD; m.h.len = sizeof(m.h) + 40;
+	const struct r2dp_sp *csp = r2dp_msg_sp(&m);
+	(void)csp;
+	CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG, "truncated SP body rejected");
+
+	/* Unknown flag bits rejected. */
+	memset(&m, 0, sizeof(m));
+	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
+	m.h.type = R2DP_HELLO; m.h.len = sizeof(m.h) + sizeof(struct r2dp_hello);
+	m.h.flags = 0x80000000;
+	CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG, "unknown flag bits rejected");
+
+	/* Unknown type: r2dp_recv converts to -ENOSYS, validate itself -EBADMSG. */
+	m.h.flags = 0; m.h.type = R2DP_MSG_MAX;
+	CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG, "unknown type rejected");
+}
+
 int
 main(void)
 {
@@ -141,6 +218,7 @@ main(void)
 	addr_v6();
 	addr_unsupported();
 	caps();
+	validate();
 
 	if (failures) {
 		fprintf(stderr, "test_proto: %d failure(s)\n", failures);

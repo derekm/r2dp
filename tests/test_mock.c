@@ -60,15 +60,33 @@ spawn_fwd(const char *bin)
 	return 0;
 }
 
+/* As roundtrip(), but with explicit header flags.  Key-only queries
+ * (GETSPI/GET/DEL) must carry R2DP_HF_NOKEYS, matching the racoon2 shim
+ * (if_r2dp.c send_sa(..., with_keys=0) -> R2DP_HF_NOKEYS). */
+static int
+roundtrip_flags(int fd, uint16_t type, uint32_t flags, const void *body,
+    size_t blen, const void *tail, size_t tlen, uint32_t *seqp,
+    struct r2dp_msg *reply);
+
 /* Send one request and consume until the reply matching `seq` arrives. */
 static int
 roundtrip(int fd, uint16_t type, const void *body, size_t blen,
     const void *tail, size_t tlen, uint32_t *seqp, struct r2dp_msg *reply)
 {
+	return roundtrip_flags(fd, type, 0, body, blen, tail, tlen, seqp, reply);
+}
+
+static int
+roundtrip_flags(int fd, uint16_t type, uint32_t flags, const void *body,
+    size_t blen, const void *tail, size_t tlen, uint32_t *seqp,
+    struct r2dp_msg *reply)
+{
 	uint32_t seq = 1;
 	int r;
 
-	r = r2dp_send(fd, type, seq, 0, 0, body, blen, tail, tlen);
+	r = r2dp_send(fd, type, seq, 0, flags, body, blen, tail, tlen);
+	if (r < 0)
+		fprintf(stderr, "rt SEND %s type=%d r=%d errno=%s\n", __func__, type, r, r ? strerror(-r) : "-");
 	if (r < 0)
 		return r;
 	if (seqp)
@@ -77,6 +95,8 @@ roundtrip(int fd, uint16_t type, const void *body, size_t blen,
 		struct r2dp_msg m;
 
 		r = r2dp_recv(fd, &m);
+		if (r < 0)
+			fprintf(stderr, "rt RECV type=%d r=%d errno=%s\n", type, r, r ? strerror(-r) : "-");
 		if (r < 0)
 			return r;
 		if (m.h.seq == seq && m.h.type == type) {
@@ -144,7 +164,8 @@ main(int argc, char **argv)
 	sa.spi_min = 0x1000; sa.spi_max = 0x1fff;
 	sa.dst.family = R2DP_AF_INET4;
 	inet_pton(AF_INET, "10.0.0.2", sa.dst.addr);
-	r = roundtrip(fd, R2DP_GETSPI, &sa, sizeof(sa), NULL, 0, NULL, &reply);
+	r = roundtrip_flags(fd, R2DP_GETSPI, R2DP_HF_NOKEYS,
+	    &sa, sizeof(sa), NULL, 0, NULL, &reply);
 	CHECK(r == 0, "getspi r=%d", r);
 	CHECK(r2dp_msg_sa(&reply)->spi != 0, "getspi filled spi");
 	sa.spi = r2dp_msg_sa(&reply)->spi;
@@ -167,17 +188,21 @@ main(int argc, char **argv)
 	sa.spi = r2dp_msg_sa(&reply)->spi;
 	sa.dst.family = R2DP_AF_INET4;
 	inet_pton(AF_INET, "10.0.0.2", sa.dst.addr);
+	sa.enckeylen = 20;                       /* tail must match enckeylen */
 	r = roundtrip(fd, R2DP_SA_ADD, &sa, sizeof(sa), enckey, 20, NULL, &reply);
 	CHECK(r == -EEXIST, "sa_add dupe -> EEXIST got=%d", r);
 
 	/* SA_GET by key */
-	r = roundtrip(fd, R2DP_SA_GET, &sa, sizeof(sa), NULL, 0, NULL, &reply);
+	r = roundtrip_flags(fd, R2DP_SA_GET, R2DP_HF_NOKEYS,
+	    &sa, sizeof(sa), NULL, 0, NULL, &reply);
 	CHECK(r == 0, "sa_get r=%d", r);
 
 	/* SA_DEL then re-DEL -> ENOENT */
-	r = roundtrip(fd, R2DP_SA_DEL, &sa, sizeof(sa), NULL, 0, NULL, &reply);
+	r = roundtrip_flags(fd, R2DP_SA_DEL, R2DP_HF_NOKEYS,
+	    &sa, sizeof(sa), NULL, 0, NULL, &reply);
 	CHECK(r == 0, "sa_del r=%d", r);
-	r = roundtrip(fd, R2DP_SA_DEL, &sa, sizeof(sa), NULL, 0, NULL, &reply);
+	r = roundtrip_flags(fd, R2DP_SA_DEL, R2DP_HF_NOKEYS,
+	    &sa, sizeof(sa), NULL, 0, NULL, &reply);
 	CHECK(r == -ENOENT, "sa_del again -> ENOENT got=%d", r);
 
 	/* ---- SP lifecycle ---- */

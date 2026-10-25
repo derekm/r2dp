@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 #include "r2dp/client.h"
@@ -64,12 +65,21 @@ int
 r2dp_listen(const char *path, int backlog)
 {
 	struct sockaddr_un un;
+	struct stat st;
 	const char *p = sock_path(path);
 	int fd;
 
 	if (strlen(p) >= sizeof(un.sun_path))
 		return -ENAMETOOLONG;
-	unlink(p);			/* remove a stale socket */
+	/* Only remove the stale path if it is actually a socket; never blindly
+	 * unlink an arbitrary file a caller (or attacker) points us at. */
+	if (lstat(p, &st) == 0) {
+		if (!S_ISSOCK(st.st_mode))
+			return -EEXIST;
+		if (unlink(p) < 0)
+			return -errno;
+	} else if (errno != ENOENT)
+		return -errno;
 	fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
 	if (fd < 0)
 		return -errno;
@@ -79,6 +89,15 @@ r2dp_listen(const char *path, int backlog)
 	if (bind(fd, (struct sockaddr *)&un, sizeof(un)) < 0) {
 		int e = errno;
 		close(fd);
+		return -e;
+	}
+	/* The control socket governs the dataplane: restrict it to the owner
+	 * (root by default) so no local user can reach it.  The 0600 mode also
+	 * survives the default umask. */
+	if (chmod(p, 0600) < 0) {
+		int e = errno;
+		close(fd);
+		unlink(p);
 		return -e;
 	}
 	if (listen(fd, backlog) < 0) {
@@ -137,16 +156,87 @@ r2dp_send(int fd, uint16_t type, uint32_t seq, int status, uint32_t flags,
 		memcpy(buf + sizeof(h), body, blen);
 	if (tlen)
 		memcpy(buf + sizeof(h) + blen, tail, tlen);
-	if (write(fd, buf, total) != (ssize_t)total)
-		return -errno;
+	if (write(fd, buf, total) != (ssize_t)total) {
+		/* A short/partial write on a SEQPACKET socket is an I/O error; map
+		 * the errno to something meaningful (write may leave errno==0). */
+		return (errno ? -errno : -EIO);
+	}
 	return 0;
+}
+
+int
+r2dp_msg_validate(const struct r2dp_msg *m, size_t n)
+{
+	const struct r2dp_sa *sa;
+	size_t hdr = sizeof(m->h);
+	size_t body, tail, min;
+	uint16_t el, al;
+
+	if (n < hdr)
+		return -EBADMSG;
+	body = n - hdr;
+
+	if (m->h.flags & ~(R2DP_HF_MORE | R2DP_HF_NOKEYS))
+		return -EBADMSG;   /* unknown flag bits (forward-compat guard) */
+
+	switch (m->h.type) {
+	case R2DP_HELLO:
+		min = sizeof(struct r2dp_hello);
+		break;
+	case R2DP_HELLO_ACK:
+		min = sizeof(struct r2dp_hello_ack);
+		break;
+	case R2DP_GETSPI:
+	case R2DP_SA_ADD:
+	case R2DP_SA_UPDATE:
+	case R2DP_SA_DEL:
+	case R2DP_SA_GET:
+	case R2DP_EXPIRE:
+	case R2DP_ACQUIRE:
+		min = sizeof(struct r2dp_sa);
+		break;
+	case R2DP_SP_ADD:
+	case R2DP_SP_DEL:
+	case R2DP_SP_GET:
+	case R2DP_SP_DUMP:
+		min = sizeof(struct r2dp_sp);
+		break;
+	default:
+		return -EBADMSG;   /* unknown type: caller reports -ENOSYS */
+	}
+	if (body < min)
+		return -EBADMSG;   /* body shorter than the required struct */
+
+	/* SA messages carry a key tail strictly equal to enckeylen+authkeylen
+	 * (absent when HF_NOKEYS) -- for EVERY SA type, because the consumers
+	 * (fwd/ctl.c do_sa, mockfwd) reconstruct the key blob from enckeylen/
+	 * authkeylen on any non-NOKEYS SA.  A peer-controlled enckeylen must
+	 * never be able to make them read past the received bytes.  With NOKEYS
+	 * the tail must be absent and enckeylen/authkeylen are not trusted. */
+	switch (m->h.type) {
+	case R2DP_SA_ADD:
+	case R2DP_SA_UPDATE:
+	case R2DP_SA_GET:
+	case R2DP_SA_DEL:
+		sa = (const struct r2dp_sa *)m->body;
+		tail = body - sizeof(struct r2dp_sa);
+		if (m->h.flags & R2DP_HF_NOKEYS)
+			return tail == 0 ? 0 : -EBADMSG;
+		el = sa->enckeylen;
+		al = sa->authkeylen;
+		if (el > R2DP_MAX_KEY || al > R2DP_MAX_KEY)
+			return -EBADMSG;
+		return tail == (size_t)el + al ? 0 : -EBADMSG;
+	default:
+		return 0;
+	}
 }
 
 int
 r2dp_recv(int fd, struct r2dp_msg *m)
 {
 	ssize_t n;
-	size_t needed;
+	int r;
 
 	do {
 		n = read(fd, m, sizeof(*m));
@@ -159,13 +249,16 @@ r2dp_recv(int fd, struct r2dp_msg *m)
 		return -EBADMSG;
 	if (m->h.version != R2DP_VERSION)
 		return -EPROTO;
-	needed = sizeof(m->h) + (size_t)m->h.len - sizeof(m->h);
-	if (needed != (size_t)n)
-		return -EBADMSG;	/* short/oversized datagram */
+	/* h.len is the total datagram size (header + body + tail); it is the
+	 * peer's claim about how many bytes it sent, so match it against what
+	 * we actually read.  A mismatch means a short/oversized datagram. */
+	if ((size_t)m->h.len != (size_t)n)
+		return -EBADMSG;
+	r = r2dp_msg_validate(m, (size_t)n);
 	/* Unknown type from a newer forwarder: parse the header, signal -ENOSYS. */
 	if (m->h.type >= R2DP_MSG_MAX)
 		return -ENOSYS;
-	return 0;
+	return r;
 }
 
 int
