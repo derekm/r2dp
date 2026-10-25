@@ -40,5 +40,4 @@ pkg.generate(libr2dp,
   name: 'r2dp',
   description: 'r2dp control protocol library (external dataplane for racoon2)',
   version: meson.project_version(),
-  subdirs: 'r2dp',
   libraries: libr2dp)
