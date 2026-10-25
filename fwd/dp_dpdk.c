@@ -389,8 +389,10 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		rte_spinlock_unlock(&d->lock);
 		return ret;
 	}
-	d->sa_tab[idx].inbound = 1;
-	d->sa_tab[idx].dip = dip;
+	/* .inbound/.dip were already set on sa_tab[newidx] at publish (above);
+	 * never touch sa_tab[idx] here -- idx is -1 for a fresh install, so
+	 * indexing it would write before the array (OOB).  The worker reads
+	 * these fields off newidx via the SAD-returned session. */
 	rte_spinlock_unlock(&d->lock);
 	return 0;
 }

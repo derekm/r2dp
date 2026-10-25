@@ -533,11 +533,12 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 	fprintf(stderr, "r2dp: serving %s (epoch=%llu)\n", sockpath,
 	    (unsigned long long)c->epoch);
 	for (;;) {
-		int n = 0, r;
+		int n = 0, r, npoll;   /* npoll = clients we polled this pass */
 		if (g_stop)
 			break;
 		reap_larv();          /* expire stale GETSPI reservations */
 		check_lifetimes(cli, ncli);  /* soft/hard TIME expiry -> EXPIRE */
+		npoll = ncli;
 		pf[n].fd = lfd; pf[n++].events = POLLIN;
 		for (int i = 0; i < ncli; i++) { pf[n].fd = cli[i]; pf[n++].events = POLLIN; }
 		if (poll(pf, n, 500) < 0) { if (errno == EINTR) continue; break; }
@@ -550,10 +551,15 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 				close(fd);
 			}
 		}
-		/* Process ready clients, deferring removals until after the pass so
-		 * the pf[] revents stay aligned with cli[] (M6): removing a client
-		 * mid-loop both skips other ready fds and desyncs pf[]. */
-		for (int i = 0; i < ncli; i++) {
+		/* Process the clients that were actually polled this pass (up to
+		 * npoll).  An accept above appended cli[npoll] and bumped ncli, but
+		 * pf[] was built for the OLD count -- iterating to the new ncli
+		 * would read an unbuilt/stale pf[i+1].revents (which may carry
+		 * POLLIN) and drive a BLOCKING r2dp_recv on a fresh idle fd,
+		 * freezing the control loop.  The just-accepted fd is serviced on
+		 * the next poll pass.  Defer removals until after the pass so the
+		 * pf[] revents stay aligned with cli[] (M6). */
+		for (int i = 0; i < npoll; i++) {
 			struct r2dp_msg m;
 			if (!(pf[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
 			r = r2dp_recv(cli[i], &m);
