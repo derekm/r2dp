@@ -70,9 +70,19 @@ struct dp_sa {
 	uint32_t           dip;      /* RAW wire-order addr bytes (addr4_to_u32
 	                              * memcpy, NOT byteswapped -- the SAD key
 	                              * and the lookup both use this numeric) */
+	uint32_t           reqid;    /* egress linkage: SP with same reqid uses
+	                              * this SA to encrypt (outbound) */
 	uint8_t            proto;
 	uint8_t            used;
 	uint8_t            inbound;  /* in the inbound SAD (our GETSPI) */
+};
+
+/* SPD entry mirror for the egress (outbound) worker: populated by dpd_sp_add/
+ * dpd_sp_del so worker_inner can select a policy without touching ctl.  M1:
+ * linear, exact/prefix selector match on (dir=OUT, sel_src/sel_dst, proto). */
+struct dp_sp_ent {
+	uint8_t  used;
+	struct r2dp_sp sp;
 };
 
 struct dpdk_priv {
@@ -87,6 +97,7 @@ struct dpdk_priv {
 	int                 have_cdev;
 	rte_spinlock_t      lock;
 	struct dp_sa        sa_tab[MAX_SA];
+	struct dp_sp_ent    sp_tab[MAX_SA];
 	int                 verbose;
 	char                tap_if[IFNAMSIZ];
 	volatile int        running;
@@ -295,6 +306,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		d->sa_tab[idx].inbound = 0;
 		d->sa_tab[idx].spi = ntohl(rsa->spi);
 		d->sa_tab[idx].proto = rsa->proto;
+		d->sa_tab[idx].reqid = rsa->reqid;
 		d->sa_tab[idx].dip = dip;
 		rte_spinlock_unlock(&d->lock);
 		return 0;
@@ -341,14 +353,37 @@ static int
 dpd_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 {
 	struct dpdk_priv *d = dp->priv;
-	(void)d;
-	return sp->slid ? 0 : -EINVAL;
+	int slot = -1;
+
+	if (!sp->slid)
+		return -EINVAL;
+	rte_spinlock_lock(&d->lock);
+	for (int i = 0; i < MAX_SA; i++) {
+		if (d->sp_tab[i].used) {
+			if (d->sp_tab[i].sp.slid == sp->slid) { slot = i; break; }
+		} else if (slot < 0)
+			slot = i;
+	}
+	if (slot < 0) { rte_spinlock_unlock(&d->lock); return -ENOSPC; }
+	d->sp_tab[slot].used = 1;
+	d->sp_tab[slot].sp = *sp;   /* keep a copy for egress selector lookup */
+	rte_spinlock_unlock(&d->lock);
+	return 0;
 }
 
 static int
 dpd_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 {
-	(void)dp; (void)sp;
+	struct dpdk_priv *d = dp->priv;
+
+	rte_spinlock_lock(&d->lock);
+	for (int i = 0; i < MAX_SA; i++) {
+		if (d->sp_tab[i].used && d->sp_tab[i].sp.slid == sp->slid) {
+			d->sp_tab[i].used = 0;
+			break;
+		}
+	}
+	rte_spinlock_unlock(&d->lock);
 	return 0;
 }
 
@@ -634,6 +669,153 @@ is_udp(struct rte_mbuf *mb)
 	return (ip->version_ihl >> 4) == 4 && ip->next_proto_id == IPPROTO_UDP;
 }
 
+/* Match addr bytes against a deprecated-free selector prefix (pref 0..32). */
+static int
+sel_match(const struct r2dp_addr *sel, uint8_t pref, const uint8_t *ip)
+{
+	int nbytes;
+
+	if (sel->family != R2DP_AF_INET4)
+		return 0;
+	if (sel->port)
+		return 0;   /* M1: IP-level tunnel policies carry no port */
+	nbytes = pref / 8;
+	if (pref % 8)
+		nbytes++;          /* cover the partial last byte */
+	if (nbytes > 4) nbytes = 4;
+	for (int i = 0; i + 1 < nbytes; i++)
+		if (sel->addr[i] != ip[i])
+			return 0;
+	if (nbytes > 0) {
+		if (pref % 8) {
+			uint8_t hi = (uint8_t)(pref % 8);
+			if ((sel->addr[nbytes - 1] >> (8 - hi)) !=
+			    (ip[nbytes - 1] >> (8 - hi)))
+				return 0;
+		} else if (sel->addr[nbytes - 1] != ip[nbytes - 1])
+			return 0;
+	}
+	return 1;
+}
+
+/* Find the EGRESS SA for `reqid` (outbound SA carrying the matching reqid). */
+static struct dp_sa *
+sa_by_reqid(struct dpdk_priv *d, uint32_t reqid)
+{
+	for (int i = 0; i < MAX_SA; i++)
+		if (d->sa_tab[i].used && !d->sa_tab[i].inbound &&
+		    d->sa_tab[i].reqid == reqid)
+			return &d->sa_tab[i];
+	return NULL;
+}
+
+/* Find the OUT policy that (longest-prefix) matches this inner IPv4 packet.
+ * Returns the matched sp (or NULL); sets *sa to the reqid-linked EGRESS SA. */
+static const struct r2dp_sp *
+sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip,
+    struct dp_sa **sa)
+{
+	const struct r2dp_sp *best = NULL;
+	int bestpref = -1;
+
+	for (int i = 0; i < MAX_SA; i++) {
+		const struct dp_sp_ent *e = &d->sp_tab[i];
+		const struct r2dp_sp *sp;
+		if (!e->used)
+			continue;
+		sp = &e->sp;
+		if (sp->dir != R2DP_DIR_OUT || sp->action != R2DP_ACT_PROTECT)
+			continue;
+		if (sp->ul_proto != R2DP_PROTO_ANY &&
+		    sp->ul_proto != ip->next_proto_id)
+			continue;
+		if (!sel_match(&sp->sel_src, sp->pref_src,
+		    (const uint8_t *)&ip->src_addr))
+			continue;
+		if (!sel_match(&sp->sel_dst, sp->pref_dst,
+		    (const uint8_t *)&ip->dst_addr))
+			continue;
+		/* prefer the most specific policy for this flow */
+		if ((int)(sp->pref_src + sp->pref_dst) > bestpref) {
+			bestpref = sp->pref_src + sp->pref_dst;
+			best = sp;
+		}
+	}
+	if (sa) *sa = best ? sa_by_reqid(d, best->reqid) : NULL;
+	return best;
+}
+
+/* Outbound ESP: take inner IPv4 plaintext (L2 already stripped, l2_len=0),
+ * look up the OUT policy + EGRESS SA, run rte_ipsec EGRESS encrypt, and write
+ * the resulting ESP datagram (outer IP + ESP, L2 NOT yet re-added) into `out`.
+ * Non-protected packets are left alone (returned as unchanged bypass). */
+static void
+esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
+    struct rte_mbuf *out[], uint16_t *nout, uint16_t *nbypass)
+{
+	uint16_t no = 0, nb = 0;
+
+	for (uint16_t i = 0; i < nr; i++) {
+		struct dp_sa *ds;
+		const struct r2dp_sp *sp;
+		uint8_t ihl;
+		struct rte_ipv4_hdr *ip, *lip;
+		struct rte_crypto_op *cop;
+		uint16_t np, enq, dq, proc;
+
+		/* inner tap delivers Ethernet: parse the inner IP at the L2 offset
+		 * for policy matching; only STRIP L2 below for a matched packet so
+		 * the unconsumed (bypass) mbufs keep their frame for forwarding. */
+		if (rte_pktmbuf_pkt_len(bufs[i]) <
+		    RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr)) {
+			nb++; continue;
+		}
+		ip = (struct rte_ipv4_hdr *)((uint8_t *)
+		    rte_pktmbuf_mtod(bufs[i], uint8_t *) + RTE_ETHER_HDR_LEN);
+		if ((ip->version_ihl >> 4) != 4) { nb++; continue; }
+		sp = sp_match_out(d, ip, &ds);
+		if (!sp || !ds) { nb++; continue; }   /* no OUT policy / SA: bypass */
+
+		(void)rte_pktmbuf_adj(bufs[i], RTE_ETHER_HDR_LEN);
+		bufs[i]->l2_len = 0;
+		lip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
+		ihl = (lip->version_ihl & 0x0f) * 4;
+		bufs[i]->l3_len = ihl;
+		bufs[i]->packet_type = RTE_PTYPE_L3_IPV4;
+
+		cop = rte_crypto_op_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
+		if (!cop) { nb++; continue; }
+		rte_crypto_op_attach_sym_session(cop, ds->sess.crypto.ses);
+		np = rte_ipsec_pkt_crypto_prepare(&ds->sess, &bufs[i], &cop, 1);
+		if (np == 0) { rte_crypto_op_free(cop); nb++; continue; }
+		enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, &cop, np);
+		dq = enq ? rte_cryptodev_dequeue_burst(d->cdev_id, 0, &cop, enq) : 0;
+		if (d->verbose)
+			fprintf(stderr, "r2dp-fwd: egress crypto np=%u enq=%u dq=%u st=%u\n",
+			    np, enq, dq, (dq && cop->status) ? cop->status : 0);
+		proc = (dq == 1) ? rte_ipsec_pkt_process(&ds->sess, &bufs[i], dq) : 0;
+		if (dq) rte_crypto_op_free(cop);
+		if (proc == 1 && out && no < BURST_SZ) {
+			/* bufs[i] is now the ESP datagram (outer IP + ESP) */
+			if (d->verbose) {
+				uint8_t *b = rte_pktmbuf_mtod(bufs[i], uint8_t *);
+				fprintf(stderr,
+				    "r2dp-fwd: egress-proc proc=%u pkt=%u b0=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+				    proc, (unsigned)rte_pktmbuf_pkt_len(bufs[i]),
+				    b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]);
+			}
+			d->n_esp++;
+			out[no++] = bufs[i];
+			bufs[i] = NULL;      /* consumed: mark for caller */
+		} else {
+			rte_pktmbuf_free(bufs[i]);   /* consumed, freed: mark slot */
+			bufs[i] = NULL;
+		}
+	}
+	if (nout) *nout = no;
+	if (nbypass) *nbypass = nb;
+}
+
 /* Process a burst received on the OUTER tap (ESP side): ESP -> decrypt ->
  * forward the inner (cleartext) packet out the inner tap; non-ESP (IKE, ARP)
  * is the exception path and crosses to the inner (kernel) side.
@@ -752,10 +934,10 @@ worker_outer(struct dpdk_priv *d, int port)
 	}
 }
 
-/* Process a burst received on the INNER tap (plaintext/kernel side): ESP is
- * unusual here, but non-ESP (IKE/ARP from the kernel) is the outbound
- * exception path and crosses to the outer (peer) tap.  M1 data-plane outbound
- * (encrypt inner plaintext -> ESP) is the next leg, not yet wired. */
+/* Process a burst received on the INNER tap (plaintext/kernel side):
+ * protected IPv4 gets encrypted by esp_outbound (EGRESS) and tx'd to the outer
+ * tap as ESP; non-protected (IKE/ARP, or no OUT policy -> bypass) crosses to
+ * the outer (peer) tap on the exception path.  ESP arriving here is dropped. */
 static void
 worker_inner(struct dpdk_priv *d, int port)
 {
@@ -765,24 +947,83 @@ worker_inner(struct dpdk_priv *d, int port)
 	if (nr == 0)
 		return;
 	d->n_rx += nr;
-	/* non-ESP from the kernel: exception path out to the peer */
-	struct rte_mbuf *plain[BURST_SZ];
-	uint16_t nplain = 0;
+
+	/* 1. classify: ESP here is anomalous -> drop; non-ESP may be protected
+	 *    (encrypt) or unprotected (IKE/ARP -> exception path). */
+	struct rte_mbuf *nonesp[BURST_SZ];
+	uint16_t nnon = 0;
 	for (uint16_t i = 0; i < nr; i++) {
 		if (is_esp(bufs[i]))
-			rte_pktmbuf_free(bufs[i]);   /* not handled in M1 outbound */
+			rte_pktmbuf_free(bufs[i]);
 		else
-			plain[nplain++] = bufs[i];
+			nonesp[nnon++] = bufs[i];
 	}
-	if (nplain) {
-		if (is_udp(plain[0]))
-			d->n_ike += nplain;
+	if (nnon == 0)
+		return;
+
+	/* 2. encrypt the protected subset.  esp_outbound consumes the mbufs with
+	 *    a matching OUT policy into esp_out[] (as ESP datagrams, no L2) and
+	 *    leaves the unmatched ones (nby) untouched in nonesp[]. */
+	struct rte_mbuf *esp_out[BURST_SZ];
+	uint16_t nout = 0, nby = 0;
+	esp_outbound(d, nonesp, nnon, esp_out, &nout, &nby);
+
+	/* 3. prepend L2 to the ESP datagrams and tx to the outer (peer) tap */
+	if (nout) {
+		uint16_t ntx = 0;
+		struct rte_mbuf *txq[BURST_SZ];
 		uint16_t to = (d->port_id >= 0) ? d->port_id : port;
-		uint16_t sent = rte_eth_tx_burst(to, 0, plain, nplain);
+		for (uint16_t i = 0; i < nout; i++) {
+			struct rte_ether_hdr *eh;
+			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
+			if (!h) { rte_pktmbuf_free(esp_out[i]); continue; }
+			eh = rte_pktmbuf_mtod(esp_out[i], struct rte_ether_hdr *);
+			memset(eh->dst_addr.addr_bytes, 0xff, 6);
+			memset(eh->src_addr.addr_bytes, 0x00, 6);
+			eh->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+			esp_out[i]->l2_len = RTE_ETHER_HDR_LEN;
+			esp_out[i]->l3_len = 20;
+			{   /* pad to Ethernet minimum (tap drops short frames) */
+				uint32_t cur = rte_pktmbuf_pkt_len(esp_out[i]);
+				if (cur < RTE_ETHER_MIN_LEN) {
+					void *pad = rte_pktmbuf_append(esp_out[i],
+					    RTE_ETHER_MIN_LEN - cur);
+					if (pad) memset(pad, 0, RTE_ETHER_MIN_LEN - cur);
+				}
+			}
+			txq[ntx++] = esp_out[i];
+		}
+		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
 		d->n_tx += sent;
-		d->n_drop += nplain - sent;
-		for (uint16_t i = sent; i < nplain; i++)
-			rte_pktmbuf_free(plain[i]);
+		if (d->verbose)
+			fprintf(stderr, "r2dp-fwd: egress-tx nout=%u ntx=%u sent=%u\n",
+			    nout, ntx, sent);
+		for (uint16_t i = sent; i < ntx; i++)
+			rte_pktmbuf_free(txq[i]);
+	}
+
+	/* 4. exception path: the unmatched non-ESP packets (IKE/ARP/clear bypass)
+	 *    cross to the outer (peer) tap as-is.  These are the nby mbufs still
+	 *    held in nonesp[] (esp_outbound did not consume them). */
+	if (nby) {
+		uint16_t ntx = 0;
+		struct rte_mbuf *txq[BURST_SZ];
+		uint16_t to = (d->port_id >= 0) ? d->port_id : port;
+		for (uint16_t i = 0; i < nnon; i++) {
+			int consumed = 0;
+			if (nonesp[i] == NULL) { continue; }   /* consumed by esp_outbound */
+			for (uint16_t j = 0; j < nout; j++)
+				if (nonesp[i] == esp_out[j]) { consumed = 1; break; }
+			if (!consumed)
+				txq[ntx++] = nonesp[i];
+		}
+		if (is_udp(txq[0]))
+			d->n_ike += ntx;
+		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
+		d->n_tx += sent;
+		d->n_drop += ntx - sent;
+		for (uint16_t i = sent; i < ntx; i++)
+			rte_pktmbuf_free(txq[i]);
 	}
 }
 
