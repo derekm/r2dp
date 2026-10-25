@@ -1,0 +1,9 @@
+# Keep LF in source so build.sh / shell scripts / patch files stay pristine.
+* text=auto
+*.c     text eol=lf
+*.h     text eol=lf
+*.sh    text eol=lf
+*.build text eol=lf
+*.md    text eol=lf
+*.patch text eol=lf
+*.yml   text eol=lf

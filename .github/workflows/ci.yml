@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build meson pkg-config python3-pip
+          # clang runner: ensure clang present
+          if [ "${{ matrix.compiler }}" = clang ]; then sudo apt-get install -y clang; fi
+
+      - name: Meson setup
+        run: |
+          CC=${{ matrix.compiler }} meson setup build --buildtype=debugoptimized
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build meson pkg-config
+      - name: ASan+UBSan build
+        run: |
+          meson setup build-asan --buildtype=debug \
+            -Db_sanitize=address,undefined -Db_lundef=false -Db_staticpic=false
+          meson compile -C build-asan
+      - name: Test under sanitizers
+        run: meson test -C build-asan --print-errorlogs
