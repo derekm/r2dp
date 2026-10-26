@@ -1234,28 +1234,26 @@ worker_outer(struct dpdk_priv *d, int port)
 	}
 	uint16_t nesp = 0, nex = 0;
 	for (uint16_t i = 0; i < nr; i++) {
-		if (is_esp(bufs[i]) || is_nat_esp(d, bufs[i])) {
-			d->n_esp++;
-			/* M1 interop: LEARN the L2 pair from the first inbound ESP
-			 * frame.  The eth header is still present here (L2 strip
-			 * happens inside esp_inbound).  src = the peer (A) MAC the
-			 * egress ESP must be unicast to; dst = this outer tap's own
-			 * MAC.  Both are needed because net_tap has no ARP and a
-			 * broadcast ESP frame is dropped by the peer's XFRM stack. */
-			if (!d->have_peer && rte_pktmbuf_pkt_len(bufs[i]) >=
-			    RTE_ETHER_HDR_LEN) {
-				struct rte_ether_hdr *eh = rte_pktmbuf_mtod(bufs[i],
-				    struct rte_ether_hdr *);
-				/* inbound ESP on the outer tap carries
-				 *   dst = B's outer-tap MAC  (this tap)
-				 *   src = A's MAC           (the peer)
-				 * The EGRESS ESP must go UNICAST to A, so
-				 *   peer_mac (= egress dst) = inbound src
-				 *   our_mac  (= egress src) = inbound dst  */
+		/* M1 interop: LEARN the L2 pair from the first inbound frame on
+		 * the outer tap (ESP *or* IKE -- A's IKE response reaches the
+		 * forwarder before the SA is up, so in the r2dp-initiator
+		 * direction we must not wait for inbound ESP or the egress path
+		 * stays in the broadcast fallback and A's XFRM drops it).
+		 *   dst = this outer tap's own MAC (when unicast)
+		 *   src = the peer (A) MAC the egress ESP must be unicast to. */
+		if (!d->have_peer && rte_pktmbuf_pkt_len(bufs[i]) >=
+		    RTE_ETHER_HDR_LEN) {
+			struct rte_ether_hdr *eh = rte_pktmbuf_mtod(bufs[i],
+			    struct rte_ether_hdr *);
+			/* Only learn from a UNICAST frame.  Multicast/broadcast
+			 * frames (IPv6 MLD 33:33:xx, ARP broadcast, etc.) would
+			 * poison peer_mac/our_mac with a group address and the
+			 * egress ESP would be addressed to nobody.  A's real
+			 * IKE/ESP is unicast to our outer MAC, so wait for one. */
+			if ((eh->dst_addr.addr_bytes[0] & 0x01) == 0) {
 				memcpy(d->peer_mac, eh->src_addr.addr_bytes, 6);
 				memcpy(d->our_mac, eh->dst_addr.addr_bytes, 6);
 				d->have_peer = 1;
-
 				if (d->verbose)
 					fprintf(stderr, "r2dp-fwd: learned peer MAC "
 					    "%02x:%02x:%02x:%02x:%02x:%02x via our "
@@ -1265,6 +1263,9 @@ worker_outer(struct dpdk_priv *d, int port)
 					    d->our_mac[0], d->our_mac[1], d->our_mac[2],
 					    d->our_mac[3], d->our_mac[4], d->our_mac[5]);
 			}
+		}
+		if (is_esp(bufs[i]) || is_nat_esp(d, bufs[i])) {
+			d->n_esp++;
 			esp[nesp++] = bufs[i];
 		} else {
 			exc[nex++] = bufs[i];
