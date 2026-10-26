@@ -6,3 +6,4 @@ subprojects/
 # Editor / OS junk
 *.swp
 .DS_Store
+.ci_all.log
