@@ -137,7 +137,8 @@ struct dpdk_priv {
 	 * configured tunnel peer (dp_nh.c), and our own outer-port MAC.
 	 * Worker-thread only. */
 	struct r2dp_nh_tab  nh;
-	uint8_t             our_mac[6];
+	uint8_t             our_mac[6];      /* outer (peer) tap MAC */
+	uint8_t             our_inner_mac[6]; /* inner (plaintext host) tap MAC */
 
 	char                tap_if[IFNAMSIZ];
 	volatile int        running;
@@ -1345,8 +1346,21 @@ worker_outer(struct dpdk_priv *d, int port)
 				}
 				eh = rte_pktmbuf_mtod(dec[i],
 				    struct rte_ether_hdr *);
-				memset(eh->dst_addr.addr_bytes, 0xff, 6);
-				memset(eh->src_addr.addr_bytes, 0x00, 6);
+				/* Deliver each decrypted inner packet UNICAST to the inner
+				 * (plaintext host) tap's own MAC.  A broadcast dst here
+				 * makes the host kernel classify the frame PACKET_BROADCAST,
+				 * and Linux tcp_v4_rcv drops pkt_type != PACKET_HOST
+				 * before counting InSegs -- so TCP over the tunnel would
+				 * silently never handshake while UDP/ICMP (which accept
+				 * broadcast) passed.  icmp/udp also work unicast. */
+				{
+					memset(eh->dst_addr.addr_bytes, 0,
+					    RTE_ETHER_ADDR_LEN);
+					memcpy(eh->dst_addr.addr_bytes, d->our_inner_mac, 6);
+					memset(eh->src_addr.addr_bytes, 0,
+					    RTE_ETHER_ADDR_LEN);
+					memcpy(eh->src_addr.addr_bytes, d->our_inner_mac, 6);
+				}
 				eh->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 				dec[i]->l2_len = RTE_ETHER_HDR_LEN;
 				/* bump l3_len so inner IP is at eth+ip */
@@ -1535,6 +1549,9 @@ worker_main(void *arg)
 		struct rte_ether_addr ea;
 		if (rte_eth_macaddr_get(port, &ea) == 0)
 			memcpy(d->our_mac, ea.addr_bytes, 6);
+		if (d->inner_port >= 0 &&
+		    rte_eth_macaddr_get(d->inner_port, &ea) == 0)
+			memcpy(d->our_inner_mac, ea.addr_bytes, 6);
 	}
 	if (d->rcu) {
 		rte_rcu_qsbr_thread_register(d->rcu, d->worker_lcore);
