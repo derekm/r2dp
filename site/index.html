@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R2DP — external dataplane control protocol for racoon2</title>
+<style>
+ body{font-family:system-ui,Segoe UI,Roboto,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;line-height:1.5;color:#1a1a1a;background:#fdfdfd}
+ nav a{margin-right:.75rem;color:#0366d6;text-decoration:none}
+ section{margin:2rem 0;padding:1rem 0;border-top:1px solid #e1e4e8}
+ h1,h2,h3{line-height:1.2}
+ h2{border-bottom:2px solid #0366d6;padding-bottom:.25rem}
+ .dag li{margin:.35rem 0}
+ .date{color:#888;font-size:.9em}
+ pre.doc{background:#f6f8fa;padding:1rem;border-radius:6px;overflow:auto;font-size:.85em}
+ table{border-collapse:collapse;width:100%;font-size:.9em}
+ th,td{border:1px solid #e1e4e8;padding:.35rem .5rem;text-align:left}
+ th{background:#f6f8fa}
+ footer{margin-top:3rem;color:#888;font-size:.85em;border-top:1px solid #e1e4e8;padding-top:1rem}
+</style></head>
+<body>
+<h1>R2DP — external dataplane control protocol for racoon2</h1>
+<nav><a href='#overview'>Overview</a> · <a href='#lineage'>Lineage DAG</a> · <a href='#agent'>Agent memory</a> · <a href='#usage'>Usage</a> · <a href='#milestones'>Milestones</a></nav>
+<section id="overview"><h2>Overview</h2><p># r2dp — external dataplane control protocol for racoon2</p><p>External dataplane control protocol for racoon2: drives a DPDK forwarder instead of the kernel via a PF_KEY-shaped protocol on a unix socket. Contributors own their work; contributions license its use to generate derivative output.</p><h3>Contribution policy</h3><pre class='doc'># Contributing to R2DP
+
+R2DP is a contributor-driven project. This file sets out, plainly, how
+contributions work and who owns what. It is **expectation-setting, not legal
+advice** — for enforceable terms we rely on the repo&#x27;s license plus any CLA
+we adopt; read this as the social contract, and ask before assuming more.
+
+## What we&#x27;re building
+
+R2DP lets racoon2&#x27;s IKE daemon (`iked`) and policy daemon (`spmd`) drive an
+external forwarder (e.g. a DPDK IPsec app) instead of the kernel, over a
+PF_KEY-shaped protocol on a unix socket. The current milestone map:
+
+- **M1** — DPDK forwarder dataplane (the live focus)
+- **M2** — lifecycle &amp; protocol coverage (NAT-T, ESN, time/byte EXPIRE, IPv6)
+- **M3** — multicore &amp; update safety
+- **M4** — offload, on-demand SAs, MTU/PMTU
+
+The `lineage` branch holds the whole commit DAG; every commit there is built
+and tested independently by `tests/ci_dag.sh`. The `usage` and `agent`
+branches hold spend/ledger and agent-memory context respectively.
+
+## This is a recruitment drive
+
+We are actively recruiting contributors to build R2DP out — contributors, not
+employees. There is no nationality, employer, or credential gate. If you can
+move a milestone item forward (DPDK, core C, crypto, networking, testing,
+docs), you&#x27;re welcome. Remote and asynchronous collaboration is expected.
+
+## Ownership: contributors own what they contribute
+
+This is the core rule:
+
+&gt; **Each contributor retains ownership (copyright) of their own
+&gt; contributions.** Nothing in </pre></section>
+<section id="lineage"><h2>Lineage DAG</h2><ul class='dag'><li><code>eb7d95d</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — usage: encrypt user-message bodies (Fernet) in the time-budget ledger; key kept out-of-repo</li>
+<li><code>f249fda</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — Import Mark&#x27;s clean-room M1.5 snapshot: add kernel reference backend (r2dp-kfwd)</li>
+<li><code>b7747e4</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — site: passive static site generator (lineage+agent+usage -&gt; index.html) + gh-pages workflow</li>
+<li><code>b8e89e6</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — docs: link lineage commits/branches to agent memory context (docs/memory-links.md)</li>
+<li><code>c98e51d</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — docs: CONTRIBUTING — contributor-ownership recruitment drive for building out R2DP</li>
+<li><code>3aefcac</code> <b>Mark Wilcox</b> <span class='date'>(2026-10-26)</span> — feat(ctl): r2dpctl dump-sp prints tunnel endpoints + reqid</li>
+<li><code>650b26e</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-24)</span> — r2dp M0: control protocol library + mock forwarder + tests + CI</li>
+<li><code>0020e0c</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — docs(agent): record agent memory milestones (compaction anchors, corrections)</li>
+<li><code>5361910</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-24)</span> — zip1: r2dp M0 base (upstream lineage root)</li>
+<li><code>aebb6e4</code> <b>Mark Wilcox</b> <span class='date'>(2026-10-25)</span> — docs(MILESTONES): mark M1 ☑ DONE with a concise final-state exit gate</li>
+<li><code>7be8439</code> <b>Mark Wilcox</b> <span class='date'>(2026-10-24)</span> — r2dp M0: control protocol library + mock forwarder + tests + CI</li></ul></section>
+<section id="agent"><h2>Agent memory milestones</h2><pre class='doc'># Agent Memory Milestones
+
+This file is the agent&#x27;s own memory ledger — the durable entries and
+compaction anchors I carry across sessions, recorded as milestones. Sections
+are the immutable &quot;§&quot; blocks of memory; the dated entries below are the
+milestones (learnings, corrections, and history rewritten) added over time.
+
+Content principle: these are real, applied lessons — verdict-first, no
+post-mortems, no credit. Each entry is a rule or a fact that changed how I
+work, not a narrative.
+
+---
+
+## Anchor memory (standing rules that apply to every session)
+
+- Terse, verdict-first. Decompose gross/cost/net; quote the gate stat.
+- Verify by running real code on real data, not mocks. Compare to
+  pandas/numpy ground truth, never the in-repo path — shared bugs pass
+  that test.
+- Edit in-place; fold docs into existing tables. Never kill/launch
+  multi-hour jobs without confirming. No process.wait loops: intermediate
+  commits + parallel next work; rejoin on notify_on_complete.
+- Prototypes become production — correctness/organization from day one.
+- No special-cased names. Generalize or drop — never re-introduce.
+- Telegram drops the last table column — use labeled one-liners.
+- Comments and docs are CODE — must match, not mislead (AI reads them).
+  Never allow/deny-list as a fix; fix at the source. Read whole files
+  exhaustively; never assume a file is fine.
+- No mistake post-mortems or repeated apologies: fix it, state the
+  correction in one line, move on.
+- Challenges wrong conclusions; re-measure on real data. Prefer obvious
+  next steps done without asking.
+- User-facing reports/updates in ENGLISH (the user can&#x27;t steer/correct
+  otherwise); Chinese only as a supplement.
+- gh defaults to upstream zoulasc/racoon2; mine = derekm/racoon2
+  (int/gsoc2026); workflow dispatch needs -R derekm/racoon2.
+- Prod deploy = STOCK make install /usr/local/racoon2 (enable-pcap/debug);
+  never a one-off /tmp/r2prod. Hooks live in sysconfdir hook/. Scratch .sh
+  on Windows is CRLF — LF-convert before shipping to the box.
+
+---
+
+## Milestones
+
+### 2026-10-24 — r2dp project landed (recognition)
+Recognized the reference to a second repository + CI applying a patch to
+racoon2 as an upstream dependency. Identified that this is the r2dp
+external-dataplane control protocol: iked/spmd drive an external forwarder
+(DPDK) instead of the kernel via a PF_KEY-shaped protocol over a unix
+SOCK_SEQPACKET socket. Per the brief: the repo must hold the build/CI so
+the patch can be applied to racoon2 as an upstream dependency, and the
+implementation must be generic so other dataplane backends can be added
+without being upstreamed.
+
+**Correction:** my first framing — &quot;HEAD has advanced past both zips&quot; — was
+wrong. A tree diff showed the zips and the git history are *two parallel,
+structurally divergent implementations* of the same wire contract, sharing
+zero byte-identical files. Neither is an ancestor of the other. This
+changed the plan from &quot;rebase incremental changes&quot; (impossible — no
+overlapping files) to &quot;re-express features onto the zip lineage&#x27;s cleaner
+control-plane-engine architecture.&quot;
+
+### 2026-10-24 — r2dp-interop-harness skill created (compaction anchor)
+Captured hard-won live-interop lessons as a reusable skill, so future
+sessions don&#x27;t rediscover them:
+- STALE-RESUME trap: iked resumes IKE_SA + child SAs from
+  RACOON2_RESUME_DIR on restart; a stale shared dump makes a fresh
+  responder skip re-installing into an empty forwarder SAD, so ESP=0.
+  Clear the dump and use an isolated per-side resume dir.
+- Inner tunnel subnet must be TUNNEL-ONLY; putting it on the bridged outer
+  iface makes ping a plain L2 unicast and ESP never reaches the forwarder.
+- DPDK net_tap in a Linux bridge delivers to the PMD; the earlier esp=0
+  was a /tmp-disk-full misdiagnosis. Check `df -h /tmp` before transferring
+  scripts (a starved tmpfs silently null-byte-corrupts scp&#x27;d files).
+- Read the esp COUNTER VALUE, never a grep match count — every stats line
+  literally contains &quot;esp=0&quot;.
+- ldd first when a racoon2/DPDK binary &quot;starts and dies with empty log&quot;
+  (missing libracoon/libr2dp on LD_LIBRARY_PATH).
+
+### 2026-10-25 — authorship rewrite of derekm/r2dp (history)
+Rewrote the contributor history of derekm/r2dp main: re-attributed the 65
+commits stamped &quot;Mark Wilcox&quot; (whose work was agent-produced, not by that
+account) to the agent identity &quot;Terre d&#x27;Hermès &lt;derek.p.moore@gmail.com&gt;&quot;,
+preserving original author AND committer timestamps; left Derek&#x27;s 20
+commits untouched in content. Verified byte-identity of the tip tree before
+and after, and confirmed the remote census (20 Derek / 65 Terre) and that
+the old tip was absent. Forced-pushed. Safety nets: pre-rewrite backup
+branch + tag at the old tip.
+- Rule: a history rewrite must be proven in a throwaway clone first, then
+  repeated byte-identically on the real repo; verify timestamps survive and
+  that only the targeted commits change.
+
+### 2026-10-25/26 — lineage DAG reconstruction
+Mapping the true lineage surfaced three artifacts that must be reconciled:
+- zip#1 (M0, 8 files, partial: no meson.build, no libr2dp/client.h).
+- zip#2 (M0+M1, 29 files, complete: the shared control-plane engine
+  libr2dp/cp.c + include/r2dp/cp.h with r2dp_cp_hooks — this is the
+  &quot;generic dataplane backends&quot; design; mock-fwd is a hook-less driver).
+- mark-cleanroom branch (M0 650b26e → M1 7669f9a → M1.5 f249fda + kfwd),
+  and main (85 commits) sharing the same M0 root.
+Created a local-only orphan `lineage` branch: root 5361910 (zip1 M0,
+byte-identical) → child b57d97f (zip2 M0+M1, byte-identical), verified
+per-file hashes with no .DS_Store contamination.
+
+### 2026-10-26 — lineage-DAG CI baseline
+Added `.github/workflows/ci.yml` + `tests/ci_dag.sh` committed as d9f3de7:
+- The CI builds and tests EVERY commit in the DAG, not just the tip —
+  each commit gets its own isolated detached worktree, then a per-commit
+  gate.
+- Per-commit gate is honest to the snapshot: has meson.build → full
+  meson setup/compile/test (milestone 0 needs no DPDK); no meson.build
+  (the M0 root ships no libr2dp) → the only self-contained artifact
+  (proto.h wire contract, _Static_assert layout) is compiled.
+- Windows-specific pitfall recorded: mktemp -d returns an MSYS /tmp path
+  that native git can&#x27;t populate a worktree into — the ubuntu runner
+  doesn&#x27;t share this, but local simulation must use a real Windows path.
+
+---
+
+## Corrections to my own reasoning (kept as lessons, not apologies)
+
+- Assumed tree relationships from commit-message intent instead of
+  measuring the trees. The diff is the ground truth: &quot;sibling&quot; not
+  &quot;ancestor&quot; was the real topology, and it upended the rebase plan.
+- Left a stray `meson test -C build` in ci_dag.sh that would have failed
+  the no-meson root; caught it on read-back.
+- Windows /tmp vs native-git path mismatch surfaced as a false
+  &quot;has_meson=no&quot; in local simulation — the logic was right, the path was
+  wrong. Traced to the fork&#x27;s MSYS/native-git behavior, not the CI logic.</pre></section>
+<section id="links"><h2>Lineage ↔ Agent memory links</h2><pre class='doc'># Lineage ↔ Agent Memory Context Links
+
+This document lives on the `lineage` branch and cross-references each commit
+and branch in the lineage DAG to the agent&#x27;s durable memory context — the
+entries recorded in `AGENT_MEMORY_MILESTONES.md` on the `agent` branch.
+
+Purpose: anyone (or any future agent session) walking this DAG can jump from
+a commit/branch to the memory that explains *why* it exists, what was
+learned building it, and what correction/compaction anchor it carries.
+
+The memory ledger is authoritative; these links are pointers into it.
+
+---
+
+## Commit-level links (lineage DAG, oldest → newest)
+
+| Commit | Subject | Relevant agent-memory milestone(s) |
+|---|---|---|
+| `5361910` | zip1: r2dp M0 base (upstream lineage root) | § [2026-10-24 — r2dp project landed (recognition)](/AGENT_MEMORY_MILESTONES.md#m0-recognition); the head of the &quot;HEAD advanced past both zips&quot; correction. Partial snapshot — no meson.build, no libr2dp/client.h. |
+| `b57d97f` | zip2: r2dp M0+M1 package (direct upstream lineage child) | § [2026-10-25/26 — lineage DAG reconstruction](/AGENT_MEMORY_MILESTONES.md#lineage-dag); carries the complete shared control-plane engine (`libr2dp/cp.{c,h}`, `r2dp_cp_hooks`) — the &quot;generic dataplane backends&quot; design. |
+| `d9f3de7` | ci: baseline lineage-DAG test suite (walk all DAG commits) | § [2026-10-26 — lineage-DAG CI baseline](/AGENT_MEMORY_MILESTONES.md#ci-baseline); § Windows /tmp-vs-native-git path pitfall. |
+
+---
+
+## Branch-level links
+
+| Branch | Lineage context | Agent-memory context |
+|---|---|---|
+| `lineage` | The zip package history (M0 → M0+M1 → CI). Root commit `5361910` is an orphan (no git parents) by design. | § [lineage DAG reconstruction](/AGENT_MEMORY_MILESTONES.md#lineage-dag) — why an orphan root is correct: the zips and the git history are *divergent siblings*, not ancestors, so the lineage is re-expressed as a clean two-snapshot DAG rather than rebased. |
+| `agent` | Carries the memory ledger itself (same surface as `lineage` + `AGENT_MEMORY_MILESTONES.md`). | § [2026-10-24 — r2dp-interop-harness skill (compaction anchor)](/AGENT_MEMORY_MILESTONES.md#interop-skill); § authorship-rewrite rule. |
+| `mark-cleanroom` | Alternative clean-room lineage: M0 `650b26e` → M1 `7669f9a` → M1.5 `f249fda` (+ `kfwd` kernel-reference backend). Shares the same M0 root as `main`. | § [lineage DAG reconstruction](/AGENT_MEMORY_MILESTONES.md#lineage-dag) — the three-artifacts reconciliation (zip#1, zip#2, mark-cleanroom). |
+| `main` | The divergent incremental implementation (85 commits) sharing M0 root `650b26e`. | § Corrections — &quot;sibling not ancestor&quot;; the tree diff is the ground truth, not commit-message intent. |
+
+---
+
+## How to use
+
+- Walk the DAG: `git log --graph --oneline --decorate lineage`
+- Read a commit&#x27;s memory: find it in the commit table above, then read the
+  linked milestone in `AGENT_MEMORY_MILESTONES.md` on the `agent` branch.
+- The tabulator `meson test`/CI result for a given snapshot is produced by
+  `tests/ci_dag.sh` (see its header) — each commit is built in isolation the
+  way that snapshot can actually build.</pre></section>
+<section id="usage-token"><h2>Usage — token spend</h2><table><thead><tr><tr><th>model</th><th>api_calls</th><th>input_tokens</th><th>output_tokens</th><th>cache_read_tokens</th><th>reasoning_tokens</th></tr></thead><tbody><tr><td>deepseek-ai/DeepSeek-V4-Flash-0731</td><td>57074</td><td>14345163360</td><td>51630937</td><td>0</td><td>17748731</td></tr><tr><td>nvidia/nemotron-3-ultra-550b-a55b</td><td>8258</td><td>202302287</td><td>3336187</td><td>1352114896</td><td>0</td></tr><tr><td>Qwen3.8-Flash-CIRU-STRIX-IU4</td><td>6157</td><td>97144000</td><td>10569464</td><td>230405092</td><td>0</td></tr><tr><td>grok-4.6</td><td>6898</td><td>78706496</td><td>7805970</td><td>1156293760</td><td>4161298</td></tr><tr><td>grok-4.7</td><td>6489</td><td>67654066</td><td>11431959</td><td>562069504</td><td>6357514</td></tr><tr><td>meituan/longcat-2.0:free</td><td>4953</td><td>35247553</td><td>2518904</td><td>1496416411</td><td>487072</td></tr><tr><td>deepseek/deepseek-v4-flash-0731</td><td>4889</td><td>18459730</td><td>2447457</td><td>1631232256</td><td>730592</td></tr><tr><td>tencent/hy3:free</td><td>3813</td><td>11703255</td><td>2157913</td><td>350573680</td><td>843111</td></tr><tr><td>nemotron-3.5-lightning-free</td><td>21</td><td>3129445</td><td>46018</td><td>750720</td><td>13389</td></tr><tr><td>nvidia/nemotron-3-super-120b-a12b</td><td>184</td><td>2300815</td><td>181723</td><td>21973120</td><td>0</td></tr><tr><td>muse-spark-1.2-contributor-free</td><td>131</td><td>2298828</td><td>65831</td><td>13733752</td><td>24241</td></tr><tr><td>upstage/solar-pro4:free</td><td>34</td><td>1073135</td><td>25143</td><td>265472</td><td>18482</td></tr><tr><td>Muse-Glimmer-30B-GGUF-Q4_K_M</td><td>873</td><td>773647</td><td>156883</td><td>81208403</td><td>0</td></tr><tr><td>grok-4.5</td><td>122</td><td>765755</td><td>85407</td><td>34188800</td><td>12333</td></tr><tr><td>deepseek-ai/deepseek-v4-flash-0731</td><td>4</td><td>536143</td><td>2960</td><td>184320</td><td>0</td></tr><tr><td>deepseek-ai/deepseek-v4-pro</td><td>6</td><td>428205</td><td>2471</td><td>424192</td><td>0</td></tr><tr><td>grok-build-0.1</td><td>247</td><td>401379</td><td>138003</td><td>14536128</td><td>47584</td></tr><tr><td>poolside/laguna-s-2.1:free</td><td>63</td><td>306236</td><td>18141</td><td>6334304</td><td>0</td></tr><tr><td>grok-4.20-0309-reasoning</td><td>16</td><td>285796</td><td>6319</td><td>1993792</td><td>4445</td></tr><tr><td>ibm/granite4.1:8b</td><td>97</td><td>198850</td><td>34598</td><td>0</td><td>0</td></tr><tr><td>deepseek-ai/deepseek-v4-flash</td><td>1</td><td>142553</td><td>1555</td><td>2304</td><td>0</td></tr><tr><td>ornith:9b</td><td>32</td><td>65600</td><td>10158</td><td>0</td><td>0</td></tr><tr><td>grok-4.20-multi-agent-0309</td><td>1</td><td>63001</td><td>7767</td><td>0</td><td>0</td></tr><tr><td>stepfun/step-3.7-flash:free</td><td>21</td><td>40083</td><td>133589</td><td>0</td><td>0</td></tr><tr><td>llama3.1:8b</td><td>18</td><td>36900</td><td>7771</td><td>0</td><td>0</td></tr><tr><td>qwen3.5:9b</td><td>5</td><td>10250</td><td>3803</td><td>0</td><td>0</td></tr><tr><td>ornith:9b-q8_0</td><td>4</td><td>8200</td><td>1608</td><td>0</td><td>0</td></tr></tbody></table></section>
+<section id="usage-msg"><h2>Usage — user-message budget</h2><table><thead><tr><tr><th>principal</th><th>messages</th><th>billed_usd</th><th>bpe_tokens</th><th>paragraphs</th></tr></thead><tbody><tr><td>derek</td><td>159</td><td>12680.0</td><td>154017</td><td>634</td></tr><tr><td>mark</td><td>28</td><td>820.0</td><td>1824</td><td>41</td></tr><tr><td>other</td><td>1</td><td>20.0</td><td>1</td><td>1</td></tr></tbody></table></section>
+<section id="milestones"><h2>Milestone Map</h2><h1>r2dp milestone map</h1>
+<p>Each milestone is gated by <code>-Dmilestone=N</code> (<code>./build.sh --milestone N</code>).
+Every milestone has an exit gate that must pass before the next starts.
+Deps listed are <em>added</em> at that milestone; earlier ones carry forward.</p>
+<h2>M0 — Contract, client lib, mock forwarder, racoon2 shim  ✅ DONE</h2>
+<ul>
+<li><strong>Built</strong>: <code>include/r2dp/proto.h</code> (full wire contract, layout-asserted), <code>libr2dp/</code> (transport, validation, address helpers; client + server side), <code>tools/mockfwd.c</code> (<code>r2dp-mockfwd</code>: kernel-like in-memory SAD/SPD, no DPDK), <code>shim/if_r2dp.c</code> + <code>patches/racoon2-r2dp-backend.patch</code> (new racoon2 backend <code>--with-km-backend=r2dp --with-r2dp=PREFIX</code>).</li>
+<li><strong>Deps</strong>: C compiler, meson, ninja, pkg-config. racoon2 build: autoconf/automake/libtool/bison/flex/libssl-dev/libpcap-dev. e2e: root, iproute2, iputils-ping.</li>
+<li><strong>Exit gate — met</strong> (reproduce: <code>./build.sh e2e --racoon2 &lt;racoon2 checkout&gt;</code>; ~80 s):</li>
+<li><code>test_proto</code> (validation, address round-trips), <code>test_mock</code> (full SA/SP protocol incl. EEXIST/ENOENT, keys withheld by default), <code>shim_contract</code> (the real <code>rcpfk_*</code> API incl. <code>WAITREPLY</code> scratch routing, ESN/NAT-T/selector fidelity, refusals) — also clean under ASan/UBSan.</li>
+<li>Patch applies cleanly to pristine upstream (<code>2fd758a</code>): 52 glue lines + one new 700-line file; <code>iked/</code> and <code>spmd/</code> untouched.</li>
+<li>Two real racoon2 stacks (spmd+iked) in separate netns complete IKEv2 over a veth; each stack's forwarder received HELLO, SPD installs + <code>SP_DUMP</code>, forwarder-allocated <code>GETSPI</code>, and <code>SA_ADD</code>/<code>SA_UPDATE</code> for AES-GCM-16 ESP in tunnel mode with a tunnel SP in each direction.</li>
+<li><strong>Not covered at M0</strong> (don't assume): ESN and NAT-T over a real exchange (only at contract level), rekey/lifetime expiry (the mock never emits <code>EXPIRE</code>), IPv6, transport mode, <code>ACQUIRE</code>, forwarder restart/resync.</li>
+</ul>
+<h3>Findings from the M0 run that shape M1+</h3>
+<ol>
+<li><strong><code>reqid</code> is 0 on every SA and SP</strong> in a stock racoon2 config, so the forwarder must bind an SA to its policy by tunnel endpoints/selector (and SPI+dst on inbound), never by <code>reqid</code> alone.</li>
+<li><strong><code>natt_sport/dport</code> are populated (500) even when <code>natt_type</code> = none.</strong> Ports are only meaningful with <code>natt_type != NONE</code> (now documented in <code>proto.h</code>).</li>
+<li><strong>AEAD key blob = cipher key || 4-byte salt</strong> (<code>enclen=20</code> for AES-128-GCM): confirmed against iked, matching what <code>librte_ipsec</code> wants.</li>
+<li><strong>spmd always uses <code>spdupdate</code> (upsert) and calls <code>SP_DUMP</code> at startup</strong>; SP_ADD must be idempotent and SP_DUMP must be cheap. ~16 UDP bypass SPs per stack (IKE ports) accompany 3 tunnel SPs (in/out/fwd) — the datapath must honor the IKE bypass or route IKE via the exception path.</li>
+<li><strong>racoon's <code>RCT_*</code> enum numbers are unstable across versions</strong> (upstream inserted <code>RCT_ALG_AES_GMAC</code> mid-enum while this work was underway). Translating by symbol to IANA IDs in the shim was the right call; unmapped algorithms (GMAC, DES, IPComp) are refused, not guessed.</li>
+<li><strong>XFRM-native fields</strong>: <code>mark</code>/<code>if_id</code> selectors are refused (<code>EOPNOTSUPP</code>) rather than silently widening a policy; <code>offload_*</code> hints are ignored. M4 inline crypto needs a protocol extension to carry <code>offload_ifname</code>.</li>
+<li><strong>Upstream moves fast</strong> (136 commits between my first clone and the final one). The patch is pinned to <code>2fd758a</code>; <code>./build.sh e2e</code> is the rebase check. Upstream <code>make install</code> (out-of-tree) currently fails late on a missing <code>01setkey</code> hook; unrelated to r2dp, worked around in <code>build-racoon2.sh</code>.</li>
+</ol>
+<h2>M1 — Forwarder MVP (1 port pair, 1 worker)  ✅ DONE (with the deviations below)</h2>
+<ul>
+<li><strong>Built</strong>: <code>fwd/fwd.c</code> (<code>r2dp-fwd</code>), the shared control-plane engine <code>libr2dp/cp.c</code> (the mock now runs on it with no hooks), <code>tools/r2dpctl</code>, and the tests below.</li>
+<li>SAD in an <code>rte_hash</code>, SPD in <code>rte_acl</code> (most-specific selector wins), static routes in <code>rte_lpm</code>.</li>
+<li>Run-to-completion on one lcore: IPv4 ESP tunnel mode, AES-GCM-16 (AES-128/256) through <code>rte_cryptodev</code> (<code>crypto_openssl</code>), sequence numbers and a 64-packet anti-replay window.</li>
+<li>Exception path: an optional third port (<code>net_tap</code>) is given the black port's MAC and carries ARP, IKE (UDP 500/4500) and ICMP for the gateway itself to the kernel, and the kernel's replies back out the black port.</li>
+<li>Control plane: all state arrives through the r2dp protocol; unsupported SAs/SPs (AH, transport, ESN, NAT-T, non-GCM-16) are refused with <code>EOPNOTSUPP</code> and never half-installed.</li>
+<li><strong>Deps added</strong>: DPDK ≥ 23.11 (<code>libdpdk-dev</code>), libnuma; tests: scapy + python3-cryptography, iproute2, iputils-ping.</li>
+<li><strong>Exit gates — met</strong> (<code>./build.sh e2e -m 1 --racoon2 &lt;checkout&gt;</code> runs all of them from a clean clone):</li>
+<li><code>fwd_e2e.sh</code>: <strong>independent-implementation interop</strong>. scapy+cryptography plays the remote gateway; a real kernel host sits behind the forwarder. Every ESP pad length (payloads 0–9 B), up to 1400 B, TTL handling, exact anti-replay window edges (distance 63 accepted / 64 rejected), and hostile input (bit flips, tampered sequence/AAD, unknown SPI, inner packet outside the selector, cleartext on a protected flow, truncated ESP). Counters are asserted <strong>exactly</strong> — 20 round trips, and every other drop reason must be zero.</li>
+<li><code>ike_fwd_e2e.sh</code>: <strong>iked + spmd + r2dp-fwd on both sides</strong>. IKEv2 crosses both exception paths, each forwarder receives its SAs/SPs over r2dp, and hosts behind each gateway ping each other (incl. 1200 B) through the tunnel — so the keys iked derived agree on both datapaths. 0 auth failures, 0 cleartext bypass.</li>
+<li>Regression: <code>test_proto</code>, <code>test_mock</code>, <code>shim_contract</code>, <code>r2dpctl-vs-mock</code>, and the M0 mock IKEv2 gate all still pass.</li>
+<li><strong>Deviations from the plan (deliberate; read these)</strong></li>
+<li><strong><code>rte_cryptodev</code> directly, not <code>librte_ipsec</code>.</strong> The installed package ships headers only and the IV/AAD layout <code>librte_ipsec</code> expects in the op private area is not documented there. Owning the ESP framing keeps M2 (ESN, lifetimes, per-SA counters) simple. Revisit if inline-crypto (M4) wants <code>rte_security</code> sessions.</li>
+<li><strong>SAD is <code>rte_hash</code>, not <code>rte_ipsec_sad</code></strong> (same reason; trivially swappable).</li>
+<li><strong>Kernel XFRM was not the oracle.</strong> The sandbox kernel has no ESP or GCM support, so interop was proven against scapy (an independent ESP implementation) instead. Cross-checking against <code>ip xfrm</code> on a normal Linux host is still worth doing and has not been done.</li>
+<li><strong><code>r2dpctl dump</code></strong> only covers SPs (<code>sp-dump</code>); the protocol has no SA-dump message yet, so "dump matches SAD" is verified through <code>SA_GET</code> in tests rather than a CLI command.</li>
+<li><strong>Red side has no ARP</strong>: static neighbours/routes only. Only the black side has an exception path.</li>
+<li><strong>Crypto is synchronous</strong> (software PMD, spin-until-done). Fine for M1; M3/M4 need a pipelined path for async/inline devices.</li>
+<li><strong>Behaviours worth knowing</strong></li>
+<li>No matching policy ⇒ forwarded in the clear (kernel semantics). A <em>failed</em> policy update is never allowed to look like "no policy": ACL contexts are rebuilt aside and swapped only on success, and a rejected update leaves the previous policy untouched.</li>
+<li>Non-IPv4 traffic on the red/black fast path is dropped (fails closed for IPv6 until M2).</li>
+<li>Default idle behaviour sleeps 50 µs when both rx queues are empty (<code>--idle-us 0</code> for pure polling).</li>
+<li><strong>Not covered at M1 (don't assume)</strong>: ESN, NAT-T, IPv6, AH, AES-CBC/HMAC, transport mode; SA lifetimes and <code>EXPIRE</code> (so SAs never rekey from the forwarder side); fragmentation/PMTU (oversize ⇒ dropped and counted); multi-core; hugepages and real NICs (everything ran on <code>--no-huge</code> with <code>net_af_packet</code>/<code>net_tap</code> vdevs on a 1-CPU sandbox, so <strong>no performance numbers exist</strong>); forwarder restart/resync; per-SA counters outside the SIGUSR1 stats dump.</li>
+<li><strong>Defects found by review/tests during M1</strong> (all fixed, kept here so the next person knows where the sharp edges were): ACL rebuild failure failed <em>open</em>; a rejected SP <em>update</em> removed the policy from the datapath while the control plane kept it; a test harness bug (<code>pkill -f</code> matched its own shell) and an RFC 4303 violation in my own test (ESP seq 0) that the forwarder correctly refused.</li>
+</ul>
+<h2>M2 — Lifecycle &amp; protocol coverage</h2>
+<ul>
+<li><strong>Builds</strong>: lifetime tick + EXPIRE, hard-expiry RCU swap, ESN + replay window, AES-CBC + HMAC-SHA2, IPv6, NAT-T (UDP/4500 demux, non-ESP marker), HELLO capability bitmaps driving <code>rcpfk_supported_*</code>.</li>
+<li><strong>Deps</strong>: none new (crypto_openssl / crypto_aesni_* vdevs).</li>
+<li><strong>Exit gate</strong>: soft expiry triggers iked rekey with no packet loss in a ping flood; <code>samples/linux-matrix</code> rows (incl. NAT-T, ESN) pass against the forwarder; kernel-XFRM oracle matches on all algs.</li>
+</ul>
+<h2>M3 — Multicore &amp; update safety</h2>
+<ul>
+<li><strong>Builds</strong>: RSS multi-queue workers, per-lcore counters, rte_rcu_qsbr table swaps, SA-pinned ordering notes (one SA = one core), hugepage/NUMA setup docs.</li>
+<li><strong>Deps</strong>: multi-queue-capable PMD (or net_tap multi-queue for CI), perf tools (optional).</li>
+<li><strong>Exit gate</strong>: N-tunnel scale test linear to core count; table churn (SA/SP add/del at 1k/s) under traffic with zero drops/crashes (ASan/TSan builds clean).</li>
+</ul>
+<h2>M4 — Offload, on-demand, MTU</h2>
+<ul>
+<li><strong>Builds</strong>: <code>rte_security</code> inline crypto path, ACQUIRE for on-demand SAs, fragmentation + PMTU/ICMP, resync-on-reconnect snapshot hardening.</li>
+<li><strong>Deps</strong>: inline-crypto NIC (hardware; optional, gated behind caps).</li>
+<li><strong>Exit gate</strong>: forwarder restart mid-session resyncs without iked restart; PMTU black-hole test passes; inline path matches CPU path byte-for-byte.</li>
+</ul></section>
+
+<footer>Generated passively by <code>site/gen_site.py</code> from the
+<code>lineage</code>, <code>agent</code>, and <code>usage</code> branches.
+Branches at build: lineage=b8e89e6, agent=0020e0c,
+usage=eb7d95d, contrib-doc=c98e51d.</footer>
+</body></html>

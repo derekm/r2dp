@@ -1,0 +1,39 @@
+name: site
+
+# Passive project-site generator.  Consumes the lineage/agent/usage branches
+# and renders a static index.html; on completion the artifact is committed to
+# gh-pages so it can be exposed via GitHub Pages later.
+#
+# Triggers:
+#   - push to `site` (regenerate when the generator/site content changes)
+#   - workflow_dispatch (manual refresh after lineage/agent/usage change)
+#
+# Reading the other branches requires a full fetch (fetch-depth: 0).
+on:
+  push:
+    branches: [site]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # full history so `git show <other-branch>:path` works
+
+      - name: Generate site
+        run: |
+          python3 site/gen_site.py site/index.html
+          echo "wrote site/index.html"
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: site
+          publish_branch: gh-pages
+          force_orphan: true
