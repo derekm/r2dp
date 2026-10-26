@@ -17,6 +17,7 @@
  * callbacks the DPDK dataplane implements.  ctl.c is hardware-agnostic.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -101,13 +102,58 @@ sp_find(struct fwd_ctl *c, const struct r2dp_sp *k, int by_selector)
 	return NULL;
 }
 
+/* ----------------------------------------------------------- send */
+/* Client sockets are non-blocking: a client that stops reading must never
+ * stall the single control thread (and with it every other client and the
+ * EXPIRE broadcast).  A send that would block, or fails, marks the client
+ * slow/dead; fwd_ctl_run drops marked clients at the end of the pass. */
+#define MAXBAD (MAXCLI * 2)
+static int bad_fd[MAXBAD];
+static int nbad;
+
+static void
+mark_bad(int fd)
+{
+	for (int i = 0; i < nbad; i++)
+		if (bad_fd[i] == fd)
+			return;
+	if (nbad < MAXBAD)
+		bad_fd[nbad++] = fd;
+}
+
+static int
+is_bad(int fd)
+{
+	for (int i = 0; i < nbad; i++)
+		if (bad_fd[i] == fd)
+			return 1;
+	return 0;
+}
+
+static int
+csend(int fd, uint16_t type, uint32_t seq, int status, uint32_t flags,
+    const void *body, size_t blen, const void *tail, size_t tlen)
+{
+	int r;
+
+	if (is_bad(fd))
+		return -EPIPE;     /* already being dropped: don't keep writing */
+	r = r2dp_send(fd, type, seq, status, flags, body, blen, tail, tlen);
+	if (r < 0) {
+		LOG("dropping client fd=%d: send %s: %s", fd, r2dp_msg_name(type),
+		    strerror(-r));
+		mark_bad(fd);
+	}
+	return r;
+}
+
 /* ----------------------------------------------------------- reply */
 static int
 reply_sa(int fd, const struct r2dp_msg *req, int status,
     const struct fwd_sa_ent *e)
 {
 	const struct r2dp_sa *sa = e ? &e->sa : r2dp_msg_sa(req);
-	return r2dp_send(fd, req->h.type, req->h.seq, status, R2DP_HF_NOKEYS,
+	return csend(fd, req->h.type, req->h.seq, status, R2DP_HF_NOKEYS,
 	    sa, sizeof(*sa), NULL, 0);
 }
 
@@ -115,7 +161,7 @@ static int
 reply_sp(int fd, const struct r2dp_msg *req, int status,
     const struct r2dp_sp *sp, uint32_t flags)
 {
-	return r2dp_send(fd, req->h.type, req->h.seq, status, flags,
+	return csend(fd, req->h.type, req->h.seq, status, flags,
 	    sp, sizeof(*sp), NULL, 0);
 }
 
@@ -145,7 +191,7 @@ do_hello(int fd, const struct r2dp_msg *m)
 		memset(a.integ_caps, 0, sizeof(a.integ_caps));
 	}
 	LOG("HELLO role=%u pid=%u", h->role, h->pid);
-	r2dp_send(fd, R2DP_HELLO_ACK, m->h.seq, 0, 0, &a, sizeof(a), NULL, 0);
+	csend(fd, R2DP_HELLO_ACK, m->h.seq, 0, 0, &a, sizeof(a), NULL, 0);
 }
 
 static void
@@ -252,7 +298,7 @@ check_lifetimes(const int *cli, int ncli)
 			continue;
 		}
 		for (int c = 0; c < ncli; c++)
-			r2dp_send(cli[c], R2DP_EXPIRE, 0, 0, R2DP_HF_NOKEYS,
+			csend(cli[c], R2DP_EXPIRE, 0, 0, R2DP_HF_NOKEYS,
 			    &sp, sizeof(sp), NULL, 0);
 		if (stale) {
 			/* hard expiry: withdraw the SA from the dataplane too */
@@ -544,7 +590,7 @@ dispatch(int fd, const struct r2dp_msg *m)
 	case R2DP_SP_ADD: case R2DP_SP_DEL: case R2DP_SP_GET: case R2DP_SP_DUMP:
 		do_sp(fd, m); break;
 	default:
-		r2dp_send(fd, m->h.type, m->h.seq, EPROTO, m->h.flags | R2DP_HF_NOKEYS,
+		csend(fd, m->h.type, m->h.seq, EPROTO, m->h.flags | R2DP_HF_NOKEYS,
 		    m->body, m->h.len - sizeof(m->h), NULL, 0);
 	}
 }
@@ -610,7 +656,8 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 		if (poll(pf, n, 500) < 0) { if (errno == EINTR) continue; break; }
 		if (pf[0].revents & POLLIN) {
 			int fd = r2dp_accept(lfd);
-			if (fd >= 0 && ncli < MAXCLI && peer_allowed(fd))
+			if (fd >= 0 && ncli < MAXCLI && peer_allowed(fd) &&
+			    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) == 0)
 				cli[ncli++] = fd;
 			else if (fd >= 0) {
 				fprintf(stderr, "r2dp: refused peer (uid check)\n");
@@ -637,6 +684,16 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 				continue;
 			close(cli[i]); cli[i] = -1;   /* mark for removal */
 		}
+		/* drop clients whose sends would block or failed (this pass,
+		 * including the EXPIRE broadcast before poll) */
+		for (int i = 0; i < ncli; i++)
+			if (cli[i] >= 0 && is_bad(cli[i])) {
+				fprintf(stderr, "r2dp: dropped slow/dead client fd=%d\n",
+				    cli[i]);
+				close(cli[i]);
+				cli[i] = -1;
+			}
+		nbad = 0;
 		/* compact out the -1 slots */
 		{
 			int w = 0;

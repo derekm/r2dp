@@ -251,6 +251,34 @@ t_sp_upsert(void)
 	    "wrapped slid skips 0 and in-use ids (got %u)", r2dp_msg_sp(&r)->slid);
 }
 
+/* A client that never reads is marked slow instead of blocking dispatch. */
+static void
+t_slow_client(void)
+{
+	int p[2], sz = 4096;
+	struct r2dp_msg m;
+	struct r2dp_hello h;
+	time_t t0 = time(NULL);
+	int i;
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, p) < 0) { CHECK(0, "sp"); return; }
+	setsockopt(p[0], SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+	fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
+	memset(&h, 0, sizeof(h));
+	memset(&m, 0, sizeof(m));
+	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
+	m.h.type = R2DP_HELLO; m.h.len = sizeof(m.h) + sizeof(h);
+	memcpy(m.body, &h, sizeof(h));
+	for (i = 0; i < 5000 && !is_bad(p[0]); i++)
+		dispatch(p[0], &m);           /* p[1] never reads */
+	CHECK(is_bad(p[0]), "unread client marked slow after %d replies", i);
+	CHECK(time(NULL) - t0 < 5, "dispatch never blocked on the slow client");
+	CHECK(csend(p[0], R2DP_HELLO_ACK, 0, 0, 0, NULL, 0, NULL, 0) == -EPIPE,
+	    "no further writes to a marked client");
+	nbad = 0;
+	close(p[0]); close(p[1]);
+}
+
 int
 main(void)
 {
@@ -266,6 +294,7 @@ main(void)
 	t_prefix();
 	t_lifetime_clock();
 	t_sp_upsert();
+	t_slow_client();
 
 	if (fails) { printf("ctl_unit: %d failures\n", fails); return 1; }
 	puts("ctl_unit: OK");

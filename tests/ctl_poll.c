@@ -15,6 +15,7 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -111,6 +112,39 @@ main(int argc, char **argv)
 			}
 		close(c);
 		usleep(700000);
+	}
+
+	/* M8 send side: a client that floods requests and never reads must be
+	 * dropped, not stall the loop for everyone else. */
+	if (!fails) {
+		int s = connect_retry(), dropped = 0;
+		struct r2dp_hello h;
+		memset(&h, 0, sizeof(h));
+		fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
+		for (int i = 0; i < 20000; i++)
+			if (r2dp_send(s, R2DP_HELLO, (uint32_t)i, 0, 0, &h, sizeof(h),
+			    NULL, 0) < 0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					usleep(1000);
+				else { dropped = 1; break; }
+			}
+		if (hello_timed(a, 99) != 0) {
+			fprintf(stderr, "FAIL loop stalled by a non-reading client\n");
+			fails++;
+		}
+		/* drain: the forwarder must have hung up on the flooder */
+		for (int i = 0; i < 400 && !dropped; i++) {
+			char buf[R2DP_MAX_MSG];
+			ssize_t n = recv(s, buf, sizeof(buf), 0);
+			if (n == 0) dropped = 1;
+			else if (n < 0 && errno != EAGAIN) dropped = 1;
+			else if (n < 0) usleep(10000);
+		}
+		if (!dropped) {
+			fprintf(stderr, "FAIL non-reading client was not dropped\n");
+			fails++;
+		}
+		close(s);
 	}
 
 	close(a);
