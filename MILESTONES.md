@@ -122,19 +122,22 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   separately; the netns bridged-tap delivery was reconfirmed working (the prior
   "quirk" was a /tmp-full misdiagnosis).  Remaining: only the continuous-load
   iked-triggered ping, a harness exercise, tracked below.
-- **M1 interop BOTH IKE role combinations now demonstrated (2026-10-25)**:
-  (a) kernel-XFRM initiator ↔ r2dp-backend responder (the original direction);
-  (b) **r2dp-backend initiator ↔ kernel-XFRM responder (new)** — B's `iked-r2dp`
-  launched with `-I 10.77.0.2 -S selB_out` (the `-I` peer must be paired with
-  `-S <inner-selector>` because `-I` alone looks up a selector by OUTER
-  addresses, which don't match inner-based selectors), plus a route
-  `10.77.0.0/24 dev r2dp-tap-inner` in B so its iked can source IKE to the
-  peer.  B reached `INI_IKE_SA_INIT_SENT -> ... -> ESTABLISHED`, A
-  `RES_IKE_AUTH_RCVD -> ESTABLISHED`, and the forwarder received the
-  r2dp-initiated child `SA_ADD spi=00538d9e dip=10.77.0.1` (matching A's XFRM
-  state).  This closes the previously-uncovered reverse-role combination at the
-  control plane; the full ping still awaits the same harness-level tap-RX
-  wiring as the forward direction (not a forwarder defect).
+- **M1 interop BOTH IKE role combinations now demonstrate a live PING through
+  the forwarder (2026-10-25)**: (a) kernel-XFRM initiator ↔ r2dp-backend
+  responder, ping 192.0.2.1 4/4 received 0% loss; (b) r2dp-backend initiator ↔
+  kernel-XFRM responder, ping 192.0.2.2 3/3 received 0% loss.  The forwarder
+  now LEARNS the peer L2 pair from the first UNICAST inbound outer-tap frame
+  (ESP or IKE) and emits egress ESP unicast to the peer instead of broadcast —
+  before that fix A's XFRM stack dropped the broadcast ESP and neither ping
+  round-tripped even though decrypt/encrypt both worked.  The r2dp-initiator
+  harness also needs `-I <peer> -S <inner-selector>` (the `-I` peer alone looks
+  up a selector by OUTER addresses, which don't match) plus a
+  `10.77.0.0/24 dev r2dp-tap-inner` route and a /24 inner address so B's ping
+  sources from 192.0.2.1 (a /32 makes the kernel source from 10.77.0.1 ->
+  plaintext bypass, not tunnel ESP).  This closes both interop gates for real
+  -- the earlier state had the control plane (ESTABLISHED+SA_ADD) and a
+  deterministic forwarder-only round-trip proven, but the iked-driven ping had
+  not round-tripped; that is now done, not just the data-plane precondition.
 
 ### Latest-review round (REVIEW_R2DP_LATEST_2026-10-25, base 2d9b944) — status
 - **H1 egress outer-IPv4 checksum — FIXED (42349ce), verified live**: librte
