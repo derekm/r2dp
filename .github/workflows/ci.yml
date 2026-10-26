@@ -1,0 +1,49 @@
+name: lineage-dag-ci
+
+# Continuous integration ACROSS the r2dp lineage DAG: every commit in the
+# lineage graph is built and tested independently, so a regression at any
+# snapshot fails the suite, not just the tip.
+#
+# Baseline scope: the lineage root(s) committed on this branch (zip1 M0,
+# zip2 M0+M1, plus any later lineage commits).  Simplest dependency
+# management (apt) and simplest per-commit compile+test.  The build driver
+# `tests/ci_dag.sh` walks HEAD's full ancestry by default, so adding new
+# lineage commits needs no workflow edit.
+#
+# Milestone 0 = no DPDK required.  M1+ needs libdpdk (set MILESTONE=1).
+on:
+  push:
+    branches: [lineage]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      milestone:
+        description: 'Highest milestone to build (0 = no DPDK, 1 = DPDK fwd)'
+        type: choice
+        default: '0'
+        options: ['0', '1']
+
+permissions:
+  contents: read
+
+jobs:
+  dag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Apt deps
+        env:
+          MILESTONE: ${{ github.event.inputs.milestone || '0' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config meson ninja-build \
+            $([ "$MILESTONE" = "1" ] && echo libdpdk-dev libnuma-dev python3-pyelftools)
+
+      - name: Build + test every lineage commit
+        env:
+          MILESTONE: ${{ github.event.inputs.milestone || '0' }}
+        run: |
+          bash tests/ci_dag.sh
