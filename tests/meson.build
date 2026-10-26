@@ -42,3 +42,12 @@ if dpdk.found()
       c_args: ['-DR2DP_HAVE_DPDK=1']),
     is_parallel: false, timeout: 60)
 endif
+
+# ctl_poll: regression for the accept/poll desync in fwd_ctl_run (0bb71e1):
+# an idle just-accepted client must never stall the control loop.
+test('ctl_poll',
+  executable('ctl_poll', 'ctl_poll.c',
+    include_directories: include_directories('../include'),
+    link_with: libr2dp),
+  args: r2dp_fwd.full_path(),
+  is_parallel: false, timeout: 60)
