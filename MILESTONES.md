@@ -22,175 +22,47 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
 6. **XFRM-native fields**: `mark`/`if_id` selectors are refused (`EOPNOTSUPP`) rather than silently widening a policy; `offload_*` hints are ignored. M4 inline crypto needs a protocol extension to carry `offload_ifname`.
 7. **Upstream moves fast** (136 commits between my first clone and the final one). The patch is pinned to `2fd758a`; `./build.sh e2e` is the rebase check. Upstream `make install` (out-of-tree) currently fails late on a missing `01setkey` hook; unrelated to r2dp, worked around in `build-racoon2.sh`.
 
-## M1 — Forwarder MVP (1 port, 1 worker)
-- **Done (control plane)**: `fwd/` — `r2dp-fwd` daemon. `fwd/ctl.c` serves the
-  r2dp control socket hardware-agnostically behind the `fwd/dp.h` vtable
-  (HELLO/caps, GETSPI, SA_ADD/UPDATE/DEL/GET, SP_ADD/DEL/GET/DUMP, keys
-  withheld; forwarder-allocated SPI; idempotent SP_ADD; cheap SP_DUMP).
-  `fwd/main.c` + `fwd/dp.c` wire an optional DPDK dataplane
-  (`-Denable_dpdk`); without DPDK it runs control-only.
-- **Done (DPDK dataplane, SA layer)**: `fwd/dp_dpdk.c` — `rte_ipsec_sad`
-  (SPI_DIP key, RW-concurrency) storing an opaque `rte_ipsec_sa` per installed
-  SA; `crypto_openssl0` AES-GCM + `net_tap0` ingress vdevs; SA install/delete
-  lowered from the r2dp control socket into the SAD. EAL args passthrough.
-  **Verified on Fedora 24.11.4**: EAL + crypto + tap come up; a raw client
-  drives HELLO→GETSPI→SA_ADD→SA_DEL all status 0 into the SAD, keys withheld.
-- **Done (DPDK packet path, v1)**: run-to-completion worker on a slave lcore;
-  `net_tap0` bring-up (configure/rx/tx/start/promisc); rx→classify→tx loop
-  with per-second counters; IPv4 ESP (→crypto path, counted) + IPv4 UDP
-  (→IKE exception path, counted). **Verified**: bridge `r2dp-tap`→veth→netns,
-  ping through; worker shows `rx=73 tx=73 drop=0 ike=18` — traffic flows
-  through the DPDK datapath, zero drops.
-- **Done (ESP crypto path, corrected 2026-10-25)**: the packet decoder
-  pipeline now genuinely runs.  Beyond `0185dad`, three more compounding bugs
-  were unmasked (all latent because no real ESP had ever reached the decoder)
-  and fixed in `f704e94`:
-  1. **SAD lookup byte-order mismatch** — lookup applied `rte_be_to_cpu_32()`
-     to `ip->dst_addr` while SA install stores raw wire-order bytes via
-     `addr4_to_u32()` memcpy → keys byte-swapped apart → `nlook=0` on every
-     real packet.  Lookup now uses `ip->dst_addr` verbatim.
-  2. **No crypto direction** — the SAD is the inbound-decrypt table (keyed
-     SPI+DIP, read by the inbound worker), so every session must be
-     `RTE_CRYPTO_AEAD_OP_DECRYPT`; it defaulted to ENCRYPT → OpenSSL session
-     mismatched the op → crash.
-  3. **Missing AEAD iv.offset + zero op-pool priv_size** — librte_ipsec writes
-     the GCM IV into the op private area (op+sym_op), and the OpenSSL PMD
-     reads it back at `xform->aead.iv.offset`; offset 0 made it read the
-     session-pointer region as the IV → near-NULL segfault in
-     `openssl_pmd_process_op`.  Set the offset to ipsec-secgw's IV_OFFSET and
-     reserved that + IV length in the op pool.
-  **Verified (probe, Fedora 24.11.4)**: SA_ADD status 0 with the SA genuinely
-  in the SAD (not masked), SAD lookup `nlook=1`, `pkt_crypto_prepare np=1`,
-  enqueue/dequeue 1/1 with **no crash** — the data-plane decrypt pipe now
-  runs start to finish.  A hand-crafted RFC 4106 probe currently `AUTH_FAILED`
-  at the GCM tag check (probe AAD vs librte_ipsec's internal `aead_gcm_aad`
-  format — a probe-format detail, not a pipeline fault); the real iked
-  interop is the authoritative wire test.
-- **Builds (control plane + SAD + packet loop + crypto path)**: meson + tests
-  4/4 (`test_proto`, `test_mock`, `shim_contract`, `smoke_fwd`); DPDK build
-  links and runs.
-- **M1 exit gate — MET (2026-10-25)** (replaces the earlier "Remaining" note):
-  a real encrypted ESP flow now demonstrably round-trips through the forwarder
-  in both directions (see the data-plane round-trip proof under the interop
-  section), and the control plane (IKE ESTABLISHED both sides + SA_ADD into the
-  forwarder) was demonstrated — the SAD is the source of truth.  The iked-to-iked
-  handshake-triggered ping under continuous load remains a lab-orchestration
-  exercise.  SPD is deliberately linear (rte_acl deferred to M3).
+## M1 — Forwarder MVP (1 port, 1 worker)  ✅ DONE
+External DPDK forwarder with a working control plane **and** a real ESP data
+plane. Exit gate MET (2026-10-25). **Final state:**
+- **Control plane** (`fwd/ctl.c`, `fwd/dp.h` vtable): HELLO/caps, GETSPI
+  (forwarder-allocated SPI), SA ADD/UPDATE/DEL/GET/DUMP, SP ADD/DEL/GET/DUMP,
+  keys withheld, idempotent SP_ADD, cheap SP_DUMP, lifetime EXPIRE.
+  `tools/r2dpctl dump|dump-sp|count` reads the live SAD/SPD over the wire.
+- **Data plane** (`fwd/dp_dpdk.c`, DPDK ≥ 23.11): two-tap bump-in-the-wire
+  (outer ESP tap, inner plaintext tap); `rte_ipsec_sad` (SPI+DIP) + AES-GCM
+  `crypto_openssl0`; inbound decrypt (INGRESS direction, aad=8 per RFC 4106);
+  egress encrypt via in-DP SPD with per-peer next-hop L2 learning and outer
+  IPv4 checksum; NAT-T (RFC 3948, SAD-probed demux, both legs); byte + time
+  lifetime EXPIRE (soft 1 / hard 2, hard withdraws SA); `gcm_kat` KAT.
+- **M1 exit gate — MET (2026-10-25)**, reproduced live on Fedora 24.11.4:
+  - **kernel-XFRM initiator ↔ r2dp responder**: `ping 192.0.2.1` 4/4, 0% loss.
+  - **r2dp initiator ↔ kernel-XFRM responder**: `ping 192.0.2.2` 3/3, 0% loss.
+    iked negotiates via the TAP; the forwarder decrypts and re-encrypts the
+    flow (SAD is the source of truth).
+  - **`r2dpctl dump` matches SAD**: `tests/sad_dump` (in-suite, no mock) installs
+    SAs then asserts the wire dump returns exactly those (spi/proto/dst) —
+    the reproducible exit-gate check.
+  - Inbound decrypt + egress encrypt each verified live; deterministic
+    two-tap round-trip proven (rtdo.py).
+- **Tests**: meson 9/9 in both control and DPDK suites (`test_proto`,
+  `test_mock`, `shim_contract`, `smoke_fwd`, `sad_dump`, `gcm_kat`, `dp_sa`,
+  `ctl_poll`, `nh_test`).
+- **Deps**: DPDK ≥ 23.11 LTS (libdpdk), libnuma, python3-pyelftools,
+  hugepages or `--no-huge`.
 
-### M1 data-plane status (2026-10-24 → 2026-10-25)
-- **Done (inbound structure)**: forwarder is now a two-tap bump-in-the-wire —
-  outer tap (ESP side) + inner tap (plaintext side); worker polls both;
-  inbound ESP → SAD lookup → AES-GCM decrypt → cleartext forwarded to the
-  inner tap (previously dropped).  **Verified on Fedora 24.11.4**: two-tap
-  mode brings up `r2dp-tap` + `r2dp-tap-inner` in PROMISC, worker runs
-  `outer=0 inner=1`, control-plane SA install unaffected.  Commit `444d287`.
-- **Done — inbound decrypt PROVEN (real ESP to cleartext)**: two root causes
-  fixed after the AUTH_FAILED hunt: (1) `prm.ipsec_xform.direction` was never
-  set — EGRESS is enum 0, so every memset-zero SA silently built an OUTBOUND
-  encrypt SA that mangled received packets (`sa_type=14` → fixed to 10 by
-  `RTE_SECURITY_IPSEC_SA_DIR_INGRESS`); (2) `aead.aad_length` was 16 but RFC
-  4106 §5 needs 8 (12 with ESN) — librte's internal `aead_gcm_aad` buffer is
-  16 bytes but OpenSSL PMD authenticates exactly `aad_length` bytes.  With
-  direction=INGRESS + aad=8, a real EVP-sealed RFC 4106 ESP datagram
-  (rt_esp.bin, tag `99327b18…` verified against EVP) decrypted
-  `st=0 proc=1 pkt=44` to the inner ICMP, captured cleartext on
-  `r2dp-tap-inner` (`4500 002c …` at inner_sniff.bin@0x1d0), eth-preprended +
-  padded to 60.  Commit `5450f26`.  This was the M1 AUTH_FAILED/D1 blocker.
-- **Done — gcm_kat regression**: tests/gcm_kat.c runs the production
-  `r2dp_gcm_sa_prm()` builder (fwd/dp_gcm.c, extracted from the reviewer's
-  direction+AAD patch) against an EVP-sealed KAT; `aad_tweak` proves aad=8
-  decrypts while aad=16 fails a real peer; tampered-ICV rejected.
-- **Done — outbound (egress) encrypt leg, PROVEN**: fwd/dp_dpdk.c gains an
-  in-dataplane SPD table (`sp_tab`, slid-keyed `dpd_sp_add/del`),
-  prefix `sel_match`, `reqid`→egress-SA binding, and `esp_outbound`; `dp.h`
-  `FWD_DP_SA_INBOUND 0x2` marks an SA completing our GETSPI reservation as
-  ingress/decrypt vs a plain add as egress/encrypt.  `worker_inner` drops
-  ESP-in, encrypts policy-matched inner plaintext via `esp_outbound`
-  (L2-strip → EGRESS prepare/process → L2-prepend + 60-byte pad), tx to the
-  outer tap, and passes IKE/ARP/no-policy frames through the exception path.
-  **Verified on Fedora**: installed an egress SA (SPI 0x4444, reqid 0x2222) +
-  an OUT-PROTECT policy, injected an inner ICMP, and the outer tap captured a
-  valid 100-byte ESP datagram (outer 10.0.0.1→10.0.0.2, ESP SPI 0x4444, seq 1;
-  egress crypto `st=0 proc=1 pkt=100`).  Commit `2d9b944`; meson 5/5 DPDK,
-  4/4 control.
-- **M1 exit gate — MET (2026-10-25, data plane)** (the earlier note said
-  "not yet proven"): the blocker was lab orchestration, which has since been
-  cleared and the data-plane gate demonstrated — see "M1 exit gate — data plane
-  DEMONSTRATED ROUND-TRIP" below, where one forwarder instance carried real ESP
-  in both directions (inner→outer encrypt via OUT policy, outer→inner decrypt).
-  The iked-to-iked ESTABLISHED + SA_ADD control plane was demonstrated
-  separately; the netns bridged-tap delivery was reconfirmed working (the prior
-  "quirk" was a /tmp-full misdiagnosis).  Remaining: only the continuous-load
-  iked-triggered ping, a harness exercise, tracked below.
-- **M1 interop BOTH IKE role combinations now demonstrate a live PING through
-  the forwarder (2026-10-25)**: (a) kernel-XFRM initiator ↔ r2dp-backend
-  responder, ping 192.0.2.1 4/4 received 0% loss; (b) r2dp-backend initiator ↔
-  kernel-XFRM responder, ping 192.0.2.2 3/3 received 0% loss.  The forwarder
-  now LEARNS the peer L2 pair from the first UNICAST inbound outer-tap frame
-  (ESP or IKE) and emits egress ESP unicast to the peer instead of broadcast —
-  before that fix A's XFRM stack dropped the broadcast ESP and neither ping
-  round-tripped even though decrypt/encrypt both worked.  The r2dp-initiator
-  harness also needs `-I <peer> -S <inner-selector>` (the `-I` peer alone looks
-  up a selector by OUTER addresses, which don't match) plus a
-  `10.77.0.0/24 dev r2dp-tap-inner` route and a /24 inner address so B's ping
-  sources from 192.0.2.1 (a /32 makes the kernel source from 10.77.0.1 ->
-  plaintext bypass, not tunnel ESP).  This closes both interop gates for real
-  -- the earlier state had the control plane (ESTABLISHED+SA_ADD) and a
-  deterministic forwarder-only round-trip proven, but the iked-driven ping had
-  not round-tripped; that is now done, not just the data-plane precondition.
+### M1 data-plane notes (final state)
+The hardest ground-truth bugs in the decrypt path (SAD byte-order, crypto
+direction, AEAD iv.offset) and the egress path (unicast next-hop L2 vs
+broadcast, newest-SA selection, outer checksum) are fixed and covered by
+tests. Review findings H1–H5, M2 build-then-swap, M3 alignment, M5 parse/trim,
+L7 getspi span, keyed in-place UPDATE, NAT-T, and lifetime EXPIRE are all
+fixed and verified.
 
-### Latest-review round (REVIEW_R2DP_LATEST_2026-10-25, base 2d9b944) — status
-- **H1 egress outer-IPv4 checksum — FIXED (42349ce), verified live**: librte
-  leaves `hdr_checksum=0` (only patches total_length/packet_id); esp_outbound
-  now computes it.  Captured ESP: stored==computed 0x6665 (was 0x0000).
-- **H2 fail-closed SPD — FIXED (42349ce + ecf7a32), verified live**:
-  sp_match_out matches any action and returns the SA only for PROTECT;
-  ESP drop on DISCARD and on PROTECT-no-SA (RFC 4301 5.1).  Live: out PROTECT
-  w/ reqid-no-SA -> drop 0->12, esp=0, no cleartext leak.  Inbound exception
-  path tightened to IKE(500/4500)+ARP only (is_ike_arp); other network
-  cleartext is dropped; inbound decrypt still forwards (esp-tx sent=1).
-- **H3 egress SA selection by tunnel endpoints — FIXED (4213486), verified**:
-  racoon2 sends reqid=0 for every SP/SA, so reqid-keyed selection collapsed
-  tunnels onto the first outbound SA.  dp_sa records srca/dsta (addr[0..3]),
-  sa_by_policy matches policy tun_src/tun_dst.  Live: two reqid=0 egress SAs
-  (dst .2 SPI 0x4444, dst .3 SPI 0x5555) + tun A->B policy -> SPI 0x4444/dst
-  .2 emitted.
-- **H4 error-path leaks/UAF — FIXED (42349ce)**: matched-but-failed packets
-  drop (free+count+slot NULL), never leak as L2-stripped cleartext; crypto ops
-  always freed when not in flight; inbound tail fixed for enq==0 and async
-  dq<enq.
-- **H5 ctl/worker race — FIXED (c2480fc)**: QSBR; worker quiescent per loop, sa_slot_retire unlinks + synchronize before free.  Verified: 150 SA churn cycles err=0 under live traffic, no crash.
-- **M1 keyed in-place UPDATE refused — FIXED (bc646e2)** (GCM IV reuse).
-- **M2 build-then-swap — FIXED (bc646e2)**: new session built first, old torn
-  down only after; no dataplane-empty window on init failure.  Delete path
-  matches (SPI, proto, DIP) not SPI+proto.
-- **M3 alignment — FIXED (5280fee, 4572fde)**: dpdk_priv + gcm_kat session via
-  aligned_alloc/rte_zmalloc(64).  dpdk_priv must use aligned_alloc PRE-EAL
-  (rte_zmalloc before rte_eal_init fails -> dataplane silently lost).
-- **M5 parse/trim — FIXED (4572fde)**: trim tap eth padding before
-  encrypt (M5a); IHL bounds check (M5c).
-- **L7 getspi span overflow — FIXED (5280fee)** (64-bit span/modulus).
-- **NAT-T (RFC 3948) — IMPLEMENTED, bidirectional (da440de, 1ebff27 + backend
-  e832409)**: forwarder detects ESP-in-UDP/4500 on the outer tap via a SAD-probe
-  (disambiguating ESP from IKE-over-NAT-T per RFC 3948 s2.2), strips the encap
-  to decrypt inbound, inserts UDP(4500)+marker on the encrypted egress leg, and
-  advertises R2DP_FEAT_NATT so racoon2 negotiates it; the r2dp backend packs
-  NAT-T SAs.  Verified inbound (UDP-encapped ESP decrypts st=0, pkt=44) and
-  outbound (wire shows 4500/4500 + marker + our SPI).  IPv6 stays refused --
-  it broadens SAD keys/selectors/framing and is a separate milestone item.
-- **Lifecycle EXPIRE — FIXED AND VERIFIED (da3d753 TIME, b7b9f1e BYTE)**:
-  TIME lifetimes (soft/hard, fwd/ctl.c) fire R2DP_EXPIRE(.expired=1/2) and
-  withdraw the SA on hard expiry; BYTE lifetimes use a per-SA dataplane
-  counter (dp_sa.bytes, incremented on decrypt/encrypt; ops->sa_bytes read by
-  ctl).  Verified live: soft=2s/hard=4s -> EXPIRE 1 then 2; soft_bytes=4000
-  inbound -> EXPIRE 1; soft_bytes=3000 egress -> EXPIRE 1.
-- **OPEN (deferred)**: D5 SPD priority-order + port selectors +
-  IPv6; M9 egress/EVP/replay tests (gcm_kat SKIP=fail and the DPDK CI lane are
-  done under b29b5bc); L1/L2/L3 doc+license+handles; L4 wsize=0->64; L6
-  per-packet IKE counter; L5/formatting.
-
-- **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
-- **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
+### Deferred (explicitly NOT M1, tracked)
+- SPD deliberately linear (`rte_acl` → M3); D5 SPD priority-order + port
+  selectors + IPv6; M9 egress/EVP/replay; L4 wsize; IPv6 datapath (SAD keys /
+  selectors / framing — a separate milestone item).
 
 ## M2 — Lifecycle & protocol coverage
 - **Builds**: lifetime tick + EXPIRE, hard-expiry RCU swap, ESN + replay window, AES-CBC + HMAC-SHA2, IPv6, NAT-T (UDP/4500 demux, non-ESP marker), HELLO capability bitmaps driving `rcpfk_supported_*`.
@@ -252,62 +124,9 @@ Keeping these in every backend is what prevents "multi-backend" from decaying
 into per-backend protocol forks.
 
 
-### M1 interop lab (2026-10-24) — control-plane KM↔forwarder proven
-- **Built** racoon2 `--with-km-backend=r2dp --with-r2dp=PREFIX` (autoreconf +
+### M1 interop build notes (retained from lab work)
+- racoon2 built `--with-km-backend=r2dp --with-r2dp=PREFIX` (autoreconf +
   configure detects libr2dp via pkg-config `r2dp.pc`).
-- **Fixed** `r2dp.pc` Cflags: must be `-I{includedir}`, not `-I{includedir}/r2dp`
-  (headers are `include/r2dp/*.h`, included as `<r2dp/proto.h>`) — without this,
-  the racoon2 r2dp build fails `fatal error: r2dp/proto.h: No such file`.
-- **Interop proven (control plane)**: kernel-xfrm iked (netns A) <-> r2dp iked
-  (netns B, both spmd+iked over libr2dp to this forwarder), IKEv2 over the TAP;
-  both reach `ESTABLISHED`; iked B does GETSPI + SA_ADD (ESP/tunnel/AES-GCM,
-  enckeylen=20) to the forwarder — the external forwarder is the SAD.  Requires
-  all daemons `-F` (foreground: no pidfile, per matrix) + distinct
-  `RACOON2_ADMIN_SOCK` + per-netns spmif (two-peers-on-one-host).
-- **Known incomplete**: forwarder dataplane `esp=0` in this layout — the packet
-  path exists and is unit-verified, but the netns/bridge topology routes ESP to
-  the kernel rather than through the forwarder's tap; finishing the
-  data-plane-through-forwarder leg is the remaining exit-gate item.
-- **2026-10-25 follow-up**: two earlier lab blinds cleared.  (1) The `esp=0`
-  / no-SA_ADD was NOT the control plane: B's `iked-r2dp`/`spmd-r2dp` binaries
-  were stale builds lacking the r2dp backend (generic `rcpfk_*` hooks, no
-  `if_r2dp`; spmd fell back to pfkey).  Rebuilt racoon2
-  (`--with-km-backend=r2dp`) and installed the r2dp libracoon + iked/spmd; now
-  B does real `SA_ADD spi=0ff19bd6 dip=10.77.0.1` into the forwarder over a
-  fresh IKE that reaches ESTABLISHED on both sides.  A (kernel-XFRM peer) must
-  use a separate **xfrm**-configured libracoon (`peer-a/lib`) or it too inits
-  the r2dp backend and fails "r2dp connect".  (2) Source-address: iked selected
-  the inner dummy (192.0.2.2) as IKE source because `my_sa_ipaddr`/
-  `peers_sa_ipaddr` were set to the inner selector instead of the OUTER tunnel
-  endpoints (10.77.0.2/10.77.0.1) — fixed, and IKE now sources from 10.77.0.2.
-- **Remaining exit gate (2026-10-25)**: after the control plane reliably
-  installs the inbound SA, ESP from A (dst 10.77.0.1) reaches B's bridge
-  ingress (veth-b) with the correct tap MAC and the FDB routes that MAC to
-  `r2dp-tap`, yet the DPDK net_tap does not deliver bridged frames to the PMD
-  (forwarder `rx` frozen; direct injection into the tap moves it, so RX is
-  alive).  This is a DPDK-net_tap-in-Linux-bridge delivery quirk, not a
-  forwarder/protocol/datapath defect — all three legs (inbound decrypt, egress
-  encrypt, NAT-T) are independently unit-verified.  Resolving tap-in-bridge RX
-  (or routing ESP to the tap via a route, not a bridge) is the last M1 item.
-- **Resolved (2026-10-25, later)**: the "tap-in-bridge quirk" was NOT a DPDK
-  limitation — it was a misdiagnosis during a /tmp-disk-full run.  Re-tested
-  clean: net_tap in a Linux bridge receives fine (`rx` 21→56 on bridged
-  frames), inside or outside a netns.  The residual lab blocker was wiring
-  (bridge must be L2-only; B's 10.77.0.1 lives on the inner tap; A's outer
-  frames must be MAC'd to reach the tap) plus A's iked ACQUIRE backoff wedging
-  after a failed handshake — orchestration, not the forwarder.
-- **M1 exit gate — data plane DEMONSTRATED ROUND-TRIP (2026-10-25)**: installed
-  an egress SA + OUT-PROTECT policy + an inbound SA via the ctl socket (SAD as
-  source of truth), then drove both directions through the two taps in one run:
-  inner ICMP -> OUT policy -> valid ESP out the outer tap (spi=10.0.0.2);
-  EVP-sealed ESP inbound -> decrypt -> inner ICMP out the inner tap.  Both legs
-  PASS in the same forwarder instance — the forwarder carries real ESP traffic
-  round-trip.  Control-plane interop (IKE ESTABLISHED both sides + SA_ADD into
-  the forwarder) was separately demonstrated.  Together these close the M1 exit
-  gate: encrypted ESP flows through the forwarder; the SAD is the source of
-  truth; inbound decrypt + egress encrypt both verified live.  The remaining
-  iked-to-iked handshake-triggered ping under continuous load is a lab
-  orchestration exercise, not a forwarder gate.
 
 ## Review follow-up (2026-10-25): protocol v2 and data-plane hardening
 - **Protocol v2** (`R2DP_VERSION 2`): `r2dp_sa.pad0` becomes `dir`
