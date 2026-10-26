@@ -5,10 +5,17 @@
 # both forwarders saw the negotiated ESP SAs and tunnel policies.
 #
 #   ike_e2e.sh <racoon2-prefix> <r2dp-mockfwd>      (needs root, ip, netns)
+#
+# Unprivileged: root in a user+net+mount namespace is enough, e.g.
+#   unshare -Urnm --propagation private bash -c 'mount -t tmpfs none /run &&
+#     mkdir -p /run/netns && R2DP_E2E_DIR=$HOME/e2e ./ike_e2e.sh PREFIX MOCK'
+# (set LD_LIBRARY_PATH=PREFIX/lib if another libracoon is on the ld.so path).
+# R2DP_E2E_DIR overrides the scratch dir (default /tmp/r2dp-e2e); use a fresh
+# one, since stale logs in an unwritable dir would be re-read as results.
 set -u
 PREFIX="${1:?racoon2 install prefix}"; MOCK="${2:?path to r2dp-mockfwd}"
 SBIN="$PREFIX/sbin"
-D=/tmp/r2dp-e2e; NSI=r2dpi; NSR=r2dpr
+D="${R2DP_E2E_DIR:-/tmp/r2dp-e2e}"; NSI=r2dpi; NSR=r2dpr
 HI=192.0.2.2; HR=192.0.2.1
 fail() { echo "FAIL: $*"; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "SKIP: needs root"; exit 77; }
@@ -22,7 +29,7 @@ cleanup() {
 	ip link del veth-r2dpi 2>/dev/null
 }
 trap cleanup EXIT
-cleanup; rm -rf "$D"; mkdir -p "$D/psk" "$D/resume-i" "$D/resume-r"
+cleanup; rm -rf "$D"; mkdir -p "$D/psk" "$D/resume-i" "$D/resume-r" && [ -w "$D" ] && [ -z "$(ls -A "$D/psk")" ] || fail "cannot create a fresh $D (set R2DP_E2E_DIR)"
 cp "$PREFIX/etc/racoon2/spmd.pwd" "$D/spmd.pwd"; chmod 600 "$D/spmd.pwd"
 printf 'r2dp-e2e-secret' > "$D/psk/e2e.psk"; chmod 600 "$D/psk/e2e.psk"
 
