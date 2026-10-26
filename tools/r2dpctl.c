@@ -80,9 +80,14 @@ dump_loop(int fd, uint16_t type, int print)
 					inet_ntop(AF_INET, sp->sel_src.addr, s, sizeof(s));
 				if (sp->sel_dst.family == R2DP_AF_INET4)
 					inet_ntop(AF_INET, sp->sel_dst.addr, d, sizeof(d));
-				printf("SP dir=%u action=%u slid=%u %s->%s proto=%u mode=%u\n",
+				char ts[64] = "?", td[64] = "?";
+				if (sp->tun_src.family == R2DP_AF_INET4)
+					inet_ntop(AF_INET, sp->tun_src.addr, ts, sizeof(ts));
+				if (sp->tun_dst.family == R2DP_AF_INET4)
+					inet_ntop(AF_INET, sp->tun_dst.addr, td, sizeof(td));
+				printf("SP dir=%u action=%u slid=%u %s->%s proto=%u mode=%u tun=%s->%s reqid=%u\n",
 				    sp->dir, sp->action, sp->slid, s, d,
-				    sp->ul_proto, sp->mode);
+				    sp->ul_proto, sp->mode, ts, td, sp->reqid);
 			}
 		}
 		if (!(m.h.flags & R2DP_HF_MORE))
