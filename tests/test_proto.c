@@ -317,6 +317,20 @@ send_epipe(void)
 	close(sv[0]);
 }
 
+/* EOF from the forwarder is -ENOTCONN, distinguishable from a bad datagram,
+ * so clients can reconnect (M7). */
+static void
+recv_eof(void)
+{
+	int sv[2];
+	struct r2dp_msg m;
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) { CHECK(0, "sp"); return; }
+	close(sv[1]);
+	CHECK(r2dp_recv(sv[0], &m) == -ENOTCONN, "recv on closed peer -> -ENOTCONN");
+	close(sv[0]);
+}
+
 int
 main(void)
 {
@@ -329,6 +343,7 @@ main(void)
 	hello_timeout();
 	hello_checks();
 	send_epipe();
+	recv_eof();
 
 	if (failures) {
 		fprintf(stderr, "test_proto: %d failure(s)\n", failures);

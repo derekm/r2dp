@@ -258,6 +258,8 @@ r2dp_recv(int fd, struct r2dp_msg *m)
 	} while (n < 0 && errno == EINTR);
 	if (n < 0)
 		return -errno;
+	if (n == 0)
+		return -ENOTCONN;	/* peer closed: distinct from a short datagram */
 	if (n < (ssize_t)sizeof(m->h))
 		return -EBADMSG;
 	if (m->h.magic != R2DP_MAGIC)

@@ -66,6 +66,7 @@ int r2dp_send(int fd, uint16_t type, uint32_t seq, int status, uint32_t flags,
  * Returns:
  *   0      on success
  *   -ENOSYS if the type is unknown (newer forwarder) -- body already parsed
+ *   -ENOTCONN if the forwarder closed the connection (EOF)
  *   a negative errno otherwise (EBADMSG on parse failure, etc.)
  */
 int r2dp_recv(int fd, struct r2dp_msg *m);
