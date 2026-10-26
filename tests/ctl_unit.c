@@ -195,11 +195,14 @@ t_lifetime_clock(void)
 	e->installed_at -= 50;            /* pretend 50s elapsed */
 	{
 		time_t t0 = e->installed_at;
+		int calls = fk_sa_calls;
 		mk_sa(&sa, 0x9001); sa.lft_hard_time = 200;
 		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == 0,
 		    "lifetime-only UPDATE");
 		CHECK(e->installed_at == t0, "lifetime-only UPDATE keeps the clock");
 		CHECK(e->sa.lft_hard_time == 200, "new hard lifetime applied");
+		CHECK(fk_sa_calls == calls,
+		    "lifetime-only UPDATE does not rebuild the dataplane SA");
 	}
 }
 

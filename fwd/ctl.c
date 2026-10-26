@@ -405,7 +405,12 @@ do_sa(int fd, const struct r2dp_msg *m)
 			 * racoon2 UPDATEs the larval SA it GETSPI'd: that is the inbound
 			 * SA.  An UPDATE of a live SA keeps its direction (e->inbound). */
 			int flags = 1 | (sa_is_inbound(e, rq) ? FWD_DP_SA_INBOUND : 0);
-			int dperr = sa_apply_dp(C, flags, rq, blen ? blob : NULL, blen);
+			/* A lifetime-only UPDATE of a live SA (no key tail) changes
+			 * nothing the dataplane holds -- lifetimes are enforced here
+			 * -- so it must not rebuild the dataplane SA (which needs the
+			 * key and would reset sequence/replay state). */
+			int dperr = (e->larval || blen) ?
+			    sa_apply_dp(C, flags, rq, blen ? blob : NULL, blen) : 0;
 			if (dperr) {
 				/* e->sa was not touched: the ctl entry still reflects the
 				 * last-known-good SA, consistent with the dataplane which
