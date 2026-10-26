@@ -1,42 +1,25 @@
 project('r2dp', 'c',
   version: '0.1.0',
-  license: 'MIT',
-  meson_version: '>= 0.61',
-  default_options: [
-    'c_std=gnu11',
-    'warning_level=3',
-    'buildtype=debugoptimized',
-  ])
+  meson_version: '>=0.57',
+  default_options: ['c_std=gnu11', 'warning_level=2', 'buildtype=debugoptimized'])
 
-# r2dp: external dataplane control protocol for racoon2.
-#
-# A PF_KEY-shaped wire contract over AF_UNIX SOCK_SEQPACKET that lets
-# racoon2's iked/spmd drive an external forwarder instead of the kernel.
-# This is the stand-alone library + mock forwarder + tests; the racoon2
-# backend lives in racoon2 (lib/if_r2dp.c, see patches/).
+fs  = import('fs')
+ms  = get_option('milestone')
+inc = include_directories('include')
 
-subdir('libr2dp')
+add_project_arguments('-DR2DP_MILESTONE=@0@'.format(ms), '-D_GNU_SOURCE', language: 'c')
 
-r2dp_inc = include_directories('include')
+# M0 needs nothing but libc; DPDK is only required from M1 on.
+dpdk = dependency('libdpdk', version: '>=' + get_option('dpdk_min'),
+                  required: ms >= 1)
 
-# Protocol-faithful forwarder with no dataplane (contract/dev tool).
-r2dp_mockfwd = executable('r2dp-mockfwd',
-  'tools/mockfwd.c',
-  include_directories: r2dp_inc,
-  link_with: libr2dp,
-  install: false)
+# Each component adds itself once its meson.build exists, so the tree
+# configures cleanly at every stage of the plan.
+foreach d : ['libr2dp', 'fwd', 'tools', 'tests']
+  if fs.exists(d / 'meson.build')
+    subdir(d)
+  endif
+endforeach
 
-subdir('tests')
-
-# Install headers + pkg-config so racoon2's --with-r2dp=PREFIX can find it.
-install_headers('include/r2dp/proto.h',
-  'include/r2dp/client.h',
-  subdir: 'r2dp')
-
-pkg = import('pkgconfig')
-pkg.generate(libr2dp,
-  name: 'r2dp',
-  description: 'r2dp control protocol library (external dataplane for racoon2)',
-  version: meson.project_version(),
-  subdirs: 'r2dp',
-  libraries: libr2dp)
+summary({'milestone': ms, 'DPDK': dpdk.found() ? dpdk.version() : 'not required/found'},
+        section: 'r2dp')

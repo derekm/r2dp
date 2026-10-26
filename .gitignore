@@ -1,8 +1,2 @@
-# Build dirs
 build/
-build-*/
-_build/
-subprojects/
-# Editor / OS junk
-*.swp
-.DS_Store
+build-asan/

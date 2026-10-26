@@ -28,13 +28,13 @@ vergte() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; } #
 declare -A APT=(
   [core]="build-essential meson ninja-build pkg-config"
   [dpdk]="libdpdk-dev dpdk libnuma-dev python3-pyelftools libssl-dev"
-  [tests]="iproute2 tcpdump python3-scapy"
+  [tests]="iproute2 iputils-ping tcpdump python3-scapy python3-cryptography"
   [r2]="autoconf automake libtool bison flex libssl-dev"
 )
 declare -A DNF=(
   [core]="gcc make meson ninja-build pkgconf-pkg-config"
   [dpdk]="dpdk-devel dpdk numactl-devel python3-pyelftools openssl-devel"
-  [tests]="iproute tcpdump python3-scapy"
+  [tests]="iproute iputils tcpdump python3-scapy python3-cryptography"
   [r2]="autoconf automake libtool bison flex openssl-devel"
 )
 
@@ -136,13 +136,19 @@ cmd_e2e() { # clean clone -> patch -> build racoon2 -> two-peer IKEv2 over veth 
   [ -n "$RACOON2_SRC" ] || die "e2e needs --racoon2 PATH (a racoon2 git checkout)"
   local W="${E2E_WORK:-/tmp/r2dp-e2e-work}"
   info "install libr2dp + mockfwd -> $W/prefix"
-  run meson setup --wipe "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Dmilestone=0 >/dev/null 2>&1 \
-    || run meson setup "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Dmilestone=0 >/dev/null
+  run meson setup --wipe "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Dmilestone="$MILESTONE" >/dev/null 2>&1 \
+    || run meson setup "$W/mbuild" "$ROOT" --prefix="$W/prefix" -Dmilestone="$MILESTONE" >/dev/null
   run meson install -C "$W/mbuild" >/dev/null
   info "build racoon2 with the r2dp backend"
   run "$ROOT/tests/e2e/build-racoon2.sh" "$RACOON2_SRC" "$W" "$W/prefix"
-  info "IKEv2 end-to-end (needs root + iproute2)"
+  info "IKEv2 end-to-end against the mock forwarder (needs root + iproute2)"
   run "$ROOT/tests/e2e/ike_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-mockfwd"
+  if [ "$MILESTONE" -ge 1 ]; then
+    info "M1: DPDK forwarder vs an independent ESP implementation (scapy)"
+    run "$ROOT/tests/e2e/fwd_e2e.sh" "$W/prefix/bin/r2dp-fwd" "$W/prefix/bin/r2dpctl"
+    info "M1: iked + spmd + r2dp-fwd on both sides, IKEv2 over the exception path"
+    run "$ROOT/tests/e2e/ike_fwd_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-fwd"
+  fi
 }
 
 cmd_milestones() {
@@ -164,7 +170,8 @@ Commands:
   build        setup + compile
   test         build + run tests
   sanitize     ASan/UBSan build + tests
-  e2e          (needs --racoon2 PATH, root) clean-clone racoon2 + patch + build, then IKEv2 over veth vs mock forwarders
+  e2e          (needs --racoon2 PATH, root) clean-clone racoon2 + patch + build, then IKEv2 over veth;
+               with -m 1 also the DPDK forwarder suites
   clean        remove build dir
   milestones   print the milestone map
   help         this text

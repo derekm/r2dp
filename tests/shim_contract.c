@@ -1,204 +1,218 @@
 /*
- * shim_contract: the protocol fidelity the racoon2 shim (if_r2dp.c) relies
- * on from libr2dp + mockfwd, exercised end to end.
- *
- * This is NOT the racoon2 ABI (it needs a racoon2 tree); it pins the wire
- * contract behaviours the shim depends on:
- *   - ESN flag round-trips through GETSPI/SA_ADD (R2DP_SAF_ESN)
- *   - NAT-T sport/dport + natt_type survive the round trip unchanged
- *   - AEAD key blob (cipher || salt) comes back intact under -K
- *   - XFRM-native mark/if_id refusals are driven from the client side by
- *     the shim (here: we assert the client can express them and that a
- *     forwarder falls back to NOKEYS/correct status rather than corrupting)
- *   - unknown message type from a newer forwarder => -ENOSYS (recv skips)
- *
- * Usage: shim_contract <path-to-mockfwd>
+ * Contract test: drives racoon2's real rcpfk_* API (via shim/if_r2dp.c)
+ * against r2dp-mockfwd, then inspects the mock over a raw r2dp connection
+ * to prove the forwarder saw full selectors, ESN, NAT-T, and keys.
  */
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-
+#include "vmbuf.h"
+#include "rc_type.h"
+#include "if_pfkeyv2.h"
 #include "r2dp/client.h"
 
-static int failures;
+extern uint32_t rc_spirange_min, rc_spirange_max;   /* defined by the backend; iked externs them too */
 
-#define CHECK(cond, ...) do {                                                   \
-	if (!(cond)) {                                                            \
-		fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__);                 \
-		fprintf(stderr, __VA_ARGS__);                                        \
-		fputc('\n', stderr);                                                 \
-		failures++;                                                          \
-	}                                                                        \
-} while (0)
+static int fails;
+#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 
-static pid_t child = -1;
-static char sockpath[128];
+/* callback recorder */
+static struct { int n_getspi, n_update, n_add, n_delete, n_get, n_spdadd, n_spddel2, n_spddump;
+                uint32_t spi, slid, seq_last, reqid; uint8_t satype, samode, dir, pltype;
+                struct sockaddr_storage dst; int dst_set; uint32_t seqs[8]; int nseq; } rec;
 
-static int
-spawn_fwd(const char *bin)
+static int on_getspi(struct rcpfk_msg *rc) { rec.n_getspi++; rec.spi = rc->spi; rec.seq_last = rc->seq;
+	rec.satype = rc->satype; rec.samode = rc->samode; rec.reqid = rc->reqid;
+	rec.seqs[rec.nseq++ & 7] = rc->seq;
+	if (rc->sa_dst) { memcpy(&rec.dst, rc->sa_dst, sizeof(struct sockaddr_in)); rec.dst_set = 1; }
+	return 0; }
+static int on_update(struct rcpfk_msg *rc) { (void)rc; rec.n_update++; return 0; }
+static int on_add(struct rcpfk_msg *rc) { (void)rc; rec.n_add++; return 0; }
+static int on_delete(struct rcpfk_msg *rc) { (void)rc; rec.n_delete++; return 0; }
+static int on_get(struct rcpfk_msg *rc) { (void)rc; rec.n_get++; return 0; }
+static int on_spdadd(struct rcpfk_msg *rc) { rec.n_spdadd++; rec.slid = rc->slid; rec.dir = rc->dir;
+	rec.pltype = rc->pltype; return 0; }
+static int on_spddel2(struct rcpfk_msg *rc) { (void)rc; rec.n_spddel2++; return 0; }
+static int on_spddump(struct rcpfk_msg *rc) { (void)rc; rec.n_spddump++; return 0; }
+
+static struct rcpfk_cb cbs = { .cb_getspi = on_getspi, .cb_update = on_update, .cb_add = on_add,
+	.cb_delete = on_delete, .cb_get = on_get, .cb_spdadd = on_spdadd,
+	.cb_spddelete2 = on_spddel2, .cb_spddump = on_spddump };
+
+static void sin4(struct sockaddr_in *s, const char *ip, int port)
 {
-	pid_t p;
-
-	snprintf(sockpath, sizeof(sockpath), "/tmp/r2dp-shim-%ld.sock",
-	    (long)getpid());
-	unlink(sockpath);
-	p = fork();
-	if (p < 0)
-		return -1;
-	if (p == 0) {
-		execl(bin, bin, "-s", sockpath, "-K", (char *)NULL);
-		_exit(127);
-	}
-	child = p;
-	return 0;
+	memset(s, 0, sizeof(*s)); s->sin_family = AF_INET; s->sin_port = htons(port);
+	inet_pton(AF_INET, ip, &s->sin_addr);
 }
 
-static int
-rt(int fd, uint16_t type, const void *body, size_t blen,
-    const void *tail, size_t tlen, struct r2dp_msg *reply)
+static int wait1(struct rcpfk_msg *rc) { rc->flags |= PFK_FLAG_WAITREPLY; return rcpfk_handler(rc); }
+
+int main(int argc, char **argv)
 {
-	uint32_t seq = 77;
-	int r;
+	char dir[] = "/tmp/r2dp-shim-XXXXXX", sock[128];
+	struct rcpfk_msg rc;
+	struct sockaddr_in src, dst, ssrc, sdst, natoa_s, natoa_d;
+	uint8_t key[36], akey[1];
+	pid_t mock;
+	int raw, i;
 
-	if ((r = r2dp_send(fd, type, seq, 0, 0, body, blen, tail, tlen)) < 0)
-		return r;
-	for (;;) {
-		struct r2dp_msg m;
-		r = r2dp_recv(fd, &m);
-		if (r < 0)
-			return r;
-		if (m.h.seq == seq && m.h.type == type) {
-			if (reply)
-				*reply = m;
-			return m.h.status ? -(int)m.h.status : 0;
-		}
-	}
-}
+	if (argc < 2) return 2;
+	if (!mkdtemp(dir)) return 2;
+	snprintf(sock, sizeof(sock), "%s/s", dir);
+	setenv(R2DP_ENV_SOCK, sock, 1);
+	setenv("R2DP_ROLE", "iked", 1);
+	if ((mock = fork()) == 0) { execl(argv[1], argv[1], "-s", sock, "-K", (char *)NULL); _exit(127); }
+	for (i = 0; i < 100; i++) { raw = r2dp_connect(sock); if (raw >= 0) break; usleep(20000); }
+	CHECK(raw >= 0);
 
-static void
-wait_child(void)
-{
-	if (child > 0) {
-		int st;
-		kill(child, SIGTERM);           /* mockfwd runs until signalled */
-		waitpid(child, &st, 0);
-		child = -1;
-	}
-	unlink(sockpath);
-}
+	memset(&rc, 0, sizeof(rc));
+	CHECK(rcpfk_init(&rc, &cbs) == 0 && rc.so >= 0);
 
-int
-main(int argc, char **argv)
-{
-	const char *bin = argc > 1 ? argv[1] : "r2dp-mockfwd";
-	struct r2dp_hello_ack ack;
-	struct r2dp_sa sa;
-	struct r2dp_msg reply;
-	uint8_t blob[20];
-	int fd, i, r;
+	/* capabilities drive supported_* */
+	CHECK(rcpfk_supported_enc(RCT_ALG_AES_GCM) == 1);
+	CHECK(rcpfk_supported_enc(RCT_ALG_RIJNDAEL_CBC) == 1);
+	CHECK(rcpfk_supported_enc(RCT_ALG_DES_CBC_IV64) == 0);       /* no wire mapping */
+	CHECK(rcpfk_supported_auth(RCT_ALG_HMAC_SHA2_256) == 1);
+	CHECK(rcpfk_supported_auth(RCT_ALG_KPDK_MD5) == 0);
 
-	if (spawn_fwd(bin) < 0)
-		return 2;
-	for (i = 0; i < 100; i++) {
-		fd = r2dp_connect(sockpath);
-		if (fd >= 0)
-			break;
-		usleep(10000);
-	}
-	CHECK(fd >= 0, "connect");
-	if (fd < 0) { wait_child(); return 1; }
+	sin4(&src, "192.0.2.1", 0); sin4(&dst, "192.0.2.2", 0);
+	rc.sa_src = (struct sockaddr *)&src; rc.sa_dst = (struct sockaddr *)&dst;
+	rc.satype = RCT_SATYPE_ESP; rc.samode = RCT_IPSM_TUNNEL; rc.reqid = 5; rc.seq = 7;
+	rc_spirange_min = 0x2000; rc_spirange_max = 0x2fff;
 
-	CHECK(r2dp_hello(fd, R2DP_ROLE_IKED, &ack) == 0, "hello");
+	/* GETSPI: completion fires cb_getspi with SPI in range + addresses back */
+	CHECK(rcpfk_send_getspi(&rc) == 0);
+	CHECK(wait1(&rc) == 0);
+	CHECK(rec.n_getspi == 1 && ntohl(rec.spi) >= 0x2000 && ntohl(rec.spi) <= 0x2fff);
+	CHECK(rec.seq_last == 7 && rec.satype == RCT_SATYPE_ESP && rec.samode == RCT_IPSM_TUNNEL);
+	CHECK(rec.reqid == 5 && rec.dst_set &&
+	      ((struct sockaddr_in *)&rec.dst)->sin_addr.s_addr == dst.sin_addr.s_addr);
 
-	/* --- build an ESN + NAT-T ESP tunnel SA --- */
-	memset(&sa, 0, sizeof(sa));
-	sa.proto = R2DP_PROTO_ESP;
-	sa.mode = R2DP_MODE_TUNNEL;
-	sa.enc = R2DP_ENCR_AES_GCM_16;
-	sa.integ = R2DP_INTEG_NONE;
-	sa.saflags = R2DP_SAF_ESN;
-	sa.natt_type = R2DP_NATT_ESPINUDP;
-	sa.natt_sport = htons(4500);
-	sa.natt_dport = htons(4500);
-	sa.wsize = 64;
-	sa.src.family = R2DP_AF_INET4;
-	sa.dst.family = R2DP_AF_INET4;
-	inet_pton(AF_INET, "192.0.2.1", sa.src.addr);
-	inet_pton(AF_INET, "198.51.100.2", sa.dst.addr);
-	/* NAT-OA (of the peer behind NAT) */
-	sa.natoa_dst.family = R2DP_AF_INET4;
-	inet_pton(AF_INET, "203.0.113.9", sa.natoa_dst.addr);
+	/* UPDATE: AES-GCM-16 + ESN + NAT-T + NAT-OA + lifetimes + key */
+	for (i = 0; i < (int)sizeof(key); i++) key[i] = (uint8_t)(0xc0 + i);
+	akey[0] = 0;
+	sin4(&natoa_s, "10.9.9.1", 0); sin4(&natoa_d, "10.9.9.2", 0);
+	rc.spi = rec.spi; rc.seq = 8;
+	rc.enctype = RCT_ALG_AES_GCM; rc.authtype = RCT_ALG_NON_AUTH;
+	rc.enckey = (caddr_t)key; rc.enckeylen = sizeof(key); rc.authkey = (caddr_t)akey; rc.authkeylen = 0;
+	rc.saflags = SADB_X_SAFLAGS_ESN; rc.wsize = 64;
+	rc.natt_type = 2; rc.natt_sport = htons(4500); rc.natt_dport = htons(4500);
+	rc.sa_natoa_src = (struct sockaddr *)&natoa_s; rc.sa_natoa_dst = (struct sockaddr *)&natoa_d;
+	rc.lft_hard_time = 3600; rc.lft_soft_time = 3000;
+	CHECK(rcpfk_send_update(&rc) == 0);
+	CHECK(wait1(&rc) == 0 && rec.n_update == 1);
 
-	r = rt(fd, R2DP_GETSPI, &sa, sizeof(sa), NULL, 0, &reply);
-	CHECK(r == 0, "getspi");
-	sa.spi = r2dp_msg_sa(&reply)->spi;
-
-	/* AEAD key blob = cipher key (16) || salt (4) */
-	memset(blob, 0xAB, sizeof(blob));
-	sa.enckeylen = sizeof(blob);
-	sa.authkeylen = 0;
-	r = rt(fd, R2DP_SA_ADD, &sa, sizeof(sa), blob, sizeof(blob), &reply);
-	CHECK(r == 0, "sa_add");
-
-	/* SA_GET should echo ESN + NAT-T faithful; -K echoes keys */
+	/* what did the forwarder actually receive?  (raw view of the mock) */
 	{
-		struct r2dp_sa k;
-		memset(&k, 0, sizeof(k));
-		k.proto = R2DP_PROTO_ESP;
-		k.spi = sa.spi;
-		k.dst = sa.dst;
-		r = rt(fd, R2DP_SA_GET, &k, sizeof(k), NULL, 0, &reply);
-		(void)k;
+		struct r2dp_sa q; struct r2dp_msg rep; const struct r2dp_sa *sa;
+		memset(&q, 0, sizeof(q));
+		q.spi = rec.spi; q.proto = R2DP_PROTO_ESP; q.dst.family = R2DP_AF_INET4;
+		memcpy(q.dst.addr, &dst.sin_addr, 4);
+		CHECK(r2dp_send(raw, R2DP_SA_GET, 1, 0, R2DP_HF_NOKEYS, &q, sizeof(q), NULL, 0) == 0);
+		CHECK(r2dp_recv(raw, &rep) == 0 && rep.h.status == 0);
+		sa = r2dp_msg_sa(&rep);
+		CHECK(sa->enc == R2DP_ENCR_AES_GCM_16 && sa->integ == R2DP_INTEG_NONE);
+		CHECK(sa->proto == R2DP_PROTO_ESP && sa->mode == R2DP_MODE_TUNNEL);
+		CHECK(sa->saflags & R2DP_SAF_ESN);                         /* ESN survived the shim */
+		CHECK(sa->natt_type == R2DP_NATT_ESPINUDP && sa->natt_dport == htons(4500));
+		CHECK(sa->natoa_src.family == R2DP_AF_INET4 && sa->natoa_dst.family == R2DP_AF_INET4);
+		CHECK(sa->wsize == 64 && sa->reqid == 5 && sa->lft_hard_time == 3600 && sa->lft_soft_time == 3000);
+		CHECK(sa->enckeylen == 36 && memcmp(r2dp_msg_enckey(&rep), key, 36) == 0);
 	}
-	CHECK(r == 0, "sa_get");
+
+	/* SPD: selectors, ports, tunnel endpoints, bundle */
+	sin4(&ssrc, "10.0.0.0", 0); sin4(&sdst, "10.0.1.0", 443);
+	rc.sp_src = (struct sockaddr *)&ssrc; rc.sp_dst = (struct sockaddr *)&sdst;
+	rc.pref_src = rc.pref_dst = 24; rc.ul_proto = 6; rc.dir = RCT_DIR_OUTBOUND;
+	rc.pltype = RCT_ACT_AUTO_IPSEC; rc.satype = RCT_SATYPE_ESP; rc.samode = RCT_IPSM_TUNNEL;
+	rc.ipsec_level = RCT_IPSL_REQUIRE; rc.reqid = 5; rc.seq = 9; rc.slid = 0;
+	strcpy(rc.tag_name, "");
+	CHECK(rcpfk_send_spdadd(&rc) == 0 && wait1(&rc) == 0);
+	CHECK(rec.n_spdadd == 1 && rec.slid != 0 && rec.dir == RCT_DIR_OUTBOUND && rec.pltype == RCT_ACT_AUTO_IPSEC);
 	{
-		const struct r2dp_sa *g = r2dp_msg_sa(&reply);
-		CHECK((g->saflags & R2DP_SAF_ESN) != 0, "ESN round trip");
-		CHECK(g->natt_type == R2DP_NATT_ESPINUDP, "natt_type round trip got=%u",
-		    g->natt_type);
-		CHECK(ntohs(g->natt_sport) == 4500 && ntohs(g->natt_dport) == 4500,
-		    "natt ports round trip");
-		CHECK(g->wsize == 64, "wsize round trip");
-		CHECK(memcmp(r2dp_msg_enckey(&reply), blob, 20) == 0,
-		    "AEAD key blob round trip (-K)");
-		CHECK(g->natoa_dst.family == R2DP_AF_INET4 &&
-		    memcmp(g->natoa_dst.addr, sa.natoa_dst.addr, 4) == 0,
-		    "NAT-OA round trip");
+		struct r2dp_sp q; struct r2dp_msg rep; const struct r2dp_sp *sp;
+		memset(&q, 0, sizeof(q)); q.slid = rec.slid;
+		CHECK(r2dp_send(raw, R2DP_SP_GET, 2, 0, 0, &q, sizeof(q), NULL, 0) == 0);
+		CHECK(r2dp_recv(raw, &rep) == 0 && rep.h.status == 0);
+		sp = r2dp_msg_sp(&rep);
+		CHECK(sp->dir == R2DP_DIR_OUT && sp->action == R2DP_ACT_PROTECT && sp->mode == R2DP_MODE_TUNNEL);
+		CHECK(sp->protos == R2DP_SPP_ESP && sp->ul_proto == 6 && sp->pref_src == 24 && sp->pref_dst == 24);
+		CHECK(sp->sel_dst.port == htons(443) && sp->sel_src.family == R2DP_AF_INET4);
+		CHECK(sp->tun_src.family == R2DP_AF_INET4 && sp->tun_dst.family == R2DP_AF_INET4);
+		CHECK(memcmp(sp->tun_dst.addr, &dst.sin_addr, 4) == 0 && sp->reqid == 5);
 	}
 
-	/* --- unknown type => -ENOSYS from recv (newer forwarder) --- */
+	/* same selector again => forwarder EEXIST surfaces as handler -1 / rc.eno */
+	rc.seq = 10;
+	CHECK(rcpfk_send_spdadd(&rc) == 0);
+	CHECK(wait1(&rc) == -1 && rc.eno == EEXIST);
+	rc.slid = rec.slid;
+
+	/* dump with WAITREPLY consumes the stream */
+	rc.seq = 11;
+	CHECK(rcpfk_send_spddump(&rc) == 0 && wait1(&rc) == 0 && rec.n_spddump == 1);
+
+	/* WAITREPLY picks *its* reply and routes the other through scratch */
 	{
-		uint16_t bogus = R2DP_MSG_MAX + 3;
-		struct r2dp_msg_raw {
-			struct r2dp_hdr h;
-		} raw;
-		memset(&raw, 0, sizeof(raw));
-		raw.h.magic = R2DP_MAGIC; raw.h.version = R2DP_VERSION;
-		raw.h.type = bogus; raw.h.len = sizeof(raw.h);
-		/* inject via a raw write; r2dp_send would refuse R2DP_MSG_MAX bounds */
-		CHECK(write(fd, &raw, sizeof(raw)) == (ssize_t)sizeof(raw), "raw write");
-		{
-			struct r2dp_msg m;
-			r = r2dp_recv(fd, &m);
-			CHECK(r == -ENOSYS, "unknown type -> -ENOSYS, got %d", r);
-		}
+		struct rcpfk_msg b = rc; int before = rec.n_getspi;
+		rc.satype = RCT_SATYPE_ESP; rc.samode = RCT_IPSM_TUNNEL; rc.slid = 0;
+		rc.sa_src = (struct sockaddr *)&src; rc.sa_dst = (struct sockaddr *)&dst;
+		rc.seq = 20; CHECK(rcpfk_send_getspi(&rc) == 0);
+		rc.seq = 21; CHECK(rcpfk_send_getspi(&rc) == 0);
+		(void)b;
+		CHECK(wait1(&rc) == 0);                      /* waits for seq 21 */
+		CHECK(rec.n_getspi == before + 2);           /* 20 via scratch, 21 via rc */
+		CHECK(rec.seqs[(rec.nseq - 2) & 7] == 20 && rec.seqs[(rec.nseq - 1) & 7] == 21);
 	}
 
-	close(fd);
-	wait_child();
+	/* deletes */
+	rc.slid = rec.slid; rc.seq = 30;
+	CHECK(rcpfk_send_spddelete2(&rc) == 0 && wait1(&rc) == 0 && rec.n_spddel2 == 1);
+	rc.seq = 31;
+	CHECK(rcpfk_send_spddelete2(&rc) == 0 && wait1(&rc) == -1 && rc.eno == ENOENT);
 
-	if (failures) {
-		fprintf(stderr, "shim_contract: %d failure(s)\n", failures);
-		return 1;
-	}
-	printf("shim_contract: all ok\n");
+	rc.spi = rec.spi; rc.seq = 32;
+	CHECK(rcpfk_send_delete(&rc) == 0 && wait1(&rc) == 0 && rec.n_delete == 1);  /* larval SA is deletable */
+	rc.seq = 33;
+	CHECK(rcpfk_send_delete(&rc) == 0 && wait1(&rc) == -1 && rc.eno == ENOENT);  /* already gone */
+	rc.satype = RCT_SATYPE_ESP;
+
+	/* unsupported things fail cleanly instead of sending garbage */
+	CHECK(rcpfk_send_migrate(&rc) == -1 && rc.eno == EOPNOTSUPP);
+	rc.satype = RCT_SATYPE_IPCOMP;
+	CHECK(rcpfk_send_getspi(&rc) == -1 && rc.eno == EOPNOTSUPP);
+	rc.satype = RCT_SATYPE_ESP; rc.enctype = RCT_ALG_DES_CBC_IV64;
+	CHECK(rcpfk_send_add(&rc) == -1 && rc.eno == EINVAL);
+	rc.enctype = RCT_ALG_AES_GCM; rc.enckeylen = 200;
+	CHECK(rcpfk_send_add(&rc) == -1 && rc.eno == EINVAL);        /* oversized key */
+
+#ifdef RCPFK_ABI_VERSION
+	/* flow selectors the forwarder can't honour are refused, not dropped */
+	rc.enctype = RCT_ALG_AES_GCM; rc.enckeylen = sizeof(key);
+	rc.mark = 0x10; rc.mark_mask = 0xff;
+	CHECK(rcpfk_send_add(&rc) == -1 && rc.eno == EOPNOTSUPP);
+	CHECK(rcpfk_send_spdadd(&rc) == -1 && rc.eno == EOPNOTSUPP);
+	rc.mark = rc.mark_mask = 0; rc.if_id = 7;
+	CHECK(rcpfk_send_spdadd(&rc) == -1 && rc.eno == EOPNOTSUPP);
+	rc.if_id = 0;
+	/* offload hints are not selectors: accepted */
+	strcpy(rc.offload_ifname, "eth9");
+	rc.seq = 99;
+	CHECK(rcpfk_send_get(&rc) == 0);
+	(void)wait1(&rc);		/* reply is ENOENT (SA already deleted); we only need it consumed */
+#endif
+	CHECK(rcpfk_clean(&rc) == 0 && rc.so == -1);
+	close(raw);
+	kill(mock, SIGTERM); waitpid(mock, NULL, 0);
+	unlink(sock); rmdir(dir);
+
+	if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
+	puts("shim_contract ok");
 	return 0;
 }

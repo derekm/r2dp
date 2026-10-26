@@ -22,10 +22,30 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
 6. **XFRM-native fields**: `mark`/`if_id` selectors are refused (`EOPNOTSUPP`) rather than silently widening a policy; `offload_*` hints are ignored. M4 inline crypto needs a protocol extension to carry `offload_ifname`.
 7. **Upstream moves fast** (136 commits between my first clone and the final one). The patch is pinned to `2fd758a`; `./build.sh e2e` is the rebase check. Upstream `make install` (out-of-tree) currently fails late on a missing `01setkey` hook; unrelated to r2dp, worked around in `build-racoon2.sh`.
 
-## M1 — Forwarder MVP (1 port, 1 worker)
-- **Builds**: `fwd/` ctl socket, SAD/SPD tables (rte_ipsec_sad + rte_acl), run-to-completion loop, IPv4 tunnel mode, AES-GCM (CPU crypto), static routes/neighbors, TAP exception path for IKE/ARP.
-- **Deps**: DPDK >= 23.11 LTS (libdpdk), libnuma, python3-pyelftools (DPDK build), hugepages or `--no-huge`.
-- **Exit gate (netns + net_tap/crypto_openssl vdevs)**: kernel XFRM <-> forwarder ESP interop both directions; iked negotiates via TAP and traffic flows; `r2dpctl dump` matches SAD.
+## M1 — Forwarder MVP (1 port pair, 1 worker)  ✅ DONE (with the deviations below)
+- **Built**: `fwd/fwd.c` (`r2dp-fwd`), the shared control-plane engine `libr2dp/cp.c` (the mock now runs on it with no hooks), `tools/r2dpctl`, and the tests below.
+  - SAD in an `rte_hash`, SPD in `rte_acl` (most-specific selector wins), static routes in `rte_lpm`.
+  - Run-to-completion on one lcore: IPv4 ESP tunnel mode, AES-GCM-16 (AES-128/256) through `rte_cryptodev` (`crypto_openssl`), sequence numbers and a 64-packet anti-replay window.
+  - Exception path: an optional third port (`net_tap`) is given the black port's MAC and carries ARP, IKE (UDP 500/4500) and ICMP for the gateway itself to the kernel, and the kernel's replies back out the black port.
+  - Control plane: all state arrives through the r2dp protocol; unsupported SAs/SPs (AH, transport, ESN, NAT-T, non-GCM-16) are refused with `EOPNOTSUPP` and never half-installed.
+- **Deps added**: DPDK ≥ 23.11 (`libdpdk-dev`), libnuma; tests: scapy + python3-cryptography, iproute2, iputils-ping.
+- **Exit gates — met** (`./build.sh e2e -m 1 --racoon2 <checkout>` runs all of them from a clean clone):
+  1. `fwd_e2e.sh`: **independent-implementation interop**. scapy+cryptography plays the remote gateway; a real kernel host sits behind the forwarder. Every ESP pad length (payloads 0–9 B), up to 1400 B, TTL handling, exact anti-replay window edges (distance 63 accepted / 64 rejected), and hostile input (bit flips, tampered sequence/AAD, unknown SPI, inner packet outside the selector, cleartext on a protected flow, truncated ESP). Counters are asserted **exactly** — 20 round trips, and every other drop reason must be zero.
+  2. `ike_fwd_e2e.sh`: **iked + spmd + r2dp-fwd on both sides**. IKEv2 crosses both exception paths, each forwarder receives its SAs/SPs over r2dp, and hosts behind each gateway ping each other (incl. 1200 B) through the tunnel — so the keys iked derived agree on both datapaths. 0 auth failures, 0 cleartext bypass.
+  3. Regression: `test_proto`, `test_mock`, `shim_contract`, `r2dpctl-vs-mock`, and the M0 mock IKEv2 gate all still pass.
+- **Deviations from the plan (deliberate; read these)**
+  - **`rte_cryptodev` directly, not `librte_ipsec`.** The installed package ships headers only and the IV/AAD layout `librte_ipsec` expects in the op private area is not documented there. Owning the ESP framing keeps M2 (ESN, lifetimes, per-SA counters) simple. Revisit if inline-crypto (M4) wants `rte_security` sessions.
+  - **SAD is `rte_hash`, not `rte_ipsec_sad`** (same reason; trivially swappable).
+  - **Kernel XFRM was not the oracle.** The sandbox kernel has no ESP or GCM support, so interop was proven against scapy (an independent ESP implementation) instead. Cross-checking against `ip xfrm` on a normal Linux host is still worth doing and has not been done.
+  - **`r2dpctl dump`** only covers SPs (`sp-dump`); the protocol has no SA-dump message yet, so "dump matches SAD" is verified through `SA_GET` in tests rather than a CLI command.
+  - **Red side has no ARP**: static neighbours/routes only. Only the black side has an exception path.
+  - **Crypto is synchronous** (software PMD, spin-until-done). Fine for M1; M3/M4 need a pipelined path for async/inline devices.
+- **Behaviours worth knowing**
+  - No matching policy ⇒ forwarded in the clear (kernel semantics). A *failed* policy update is never allowed to look like "no policy": ACL contexts are rebuilt aside and swapped only on success, and a rejected update leaves the previous policy untouched.
+  - Non-IPv4 traffic on the red/black fast path is dropped (fails closed for IPv6 until M2).
+  - Default idle behaviour sleeps 50 µs when both rx queues are empty (`--idle-us 0` for pure polling).
+- **Not covered at M1 (don't assume)**: ESN, NAT-T, IPv6, AH, AES-CBC/HMAC, transport mode; SA lifetimes and `EXPIRE` (so SAs never rekey from the forwarder side); fragmentation/PMTU (oversize ⇒ dropped and counted); multi-core; hugepages and real NICs (everything ran on `--no-huge` with `net_af_packet`/`net_tap` vdevs on a 1-CPU sandbox, so **no performance numbers exist**); forwarder restart/resync; per-SA counters outside the SIGUSR1 stats dump.
+- **Defects found by review/tests during M1** (all fixed, kept here so the next person knows where the sharp edges were): ACL rebuild failure failed *open*; a rejected SP *update* removed the policy from the datapath while the control plane kept it; a test harness bug (`pkill -f` matched its own shell) and an RFC 4303 violation in my own test (ESP seq 0) that the forwarder correctly refused.
 
 ## M2 — Lifecycle & protocol coverage
 - **Builds**: lifetime tick + EXPIRE, hard-expiry RCU swap, ESN + replay window, AES-CBC + HMAC-SHA2, IPv6, NAT-T (UDP/4500 demux, non-ESP marker), HELLO capability bitmaps driving `rcpfk_supported_*`.
