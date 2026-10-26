@@ -83,7 +83,7 @@ index d783361..f96f6d2 100644
  AC_CONFIG_FILES([Makefile iked.8])
  AC_OUTPUT
 diff --git a/lib/Makefile.am b/lib/Makefile.am
-index 147b892..a12797b 100644
+index 147b892..6cb577c 100644
 --- a/lib/Makefile.am
 +++ b/lib/Makefile.am
 @@ -19,11 +19,16 @@ else
@@ -99,12 +99,30 @@ index 147b892..a12797b 100644
 -EXTRA_DIST = rcpfk_nl.h if_xfrm.c if_pfkeyv2.c if_userspace.c xfrmnatt.c xfrmtmpl.c xfrmnltest.c
 -libracoon_la_LIBADD = $(LTLIBOBJS) -lpcap
 +endif
-+EXTRA_DIST = rcpfk_nl.h if_xfrm.c if_pfkeyv2.c if_userspace.c if_r2dp.c xfrmnatt.c xfrmtmpl.c xfrmnltest.c
++EXTRA_DIST = rcpfk_nl.h if_xfrm.c if_pfkeyv2.c if_userspace.c if_r2dp.c xfrmnatt.c xfrmtmpl.c xfrmnltest.c r2dptest.c
 +AM_CPPFLAGS +=$(R2DP_CFLAGS)
 +libracoon_la_LIBADD = $(LTLIBOBJS) -lpcap $(R2DP_LIBS)
  # NOTE: keep the libtool version-info at the default 0:0:0 (soname
  # libracoon.so.0). Bumping it to 1:0:0 (libracoon.so.1) IS the right ABI-drift
  # guard, but it is a coordinated deploy: every consumer (iked/spmd/kinkd) must
+@@ -69,5 +74,17 @@ xfrmnatt_LDADD = libracoon.la
+ xfrmtmpl_SOURCES = xfrmtmpl.c
+ xfrmtmpl_LDADD = libracoon.la
+ endif
++if USE_R2DP
++# Hermetic r2dp backend test: #includes if_r2dp.c and talks to a fake
++# forwarder thread on a private socket (reqid, v2 dir, reconnect/epoch).
++# Link the objects, not libracoon.la, so if_r2dp.c is not defined twice.
++TESTS += r2dptest
++check_PROGRAMS += r2dptest
++r2dptest_SOURCES = r2dptest.c
++r2dptest_LDADD = vmbuf.lo rc_type.lo rc_net.lo rc_str.lo if_spmd.lo \
++	cfsetup.lo rc_pcap.lo cftoken.lo cfparse.lo pidfile.lo sd_listenfds.lo \
++	plog.lo safefile.lo version.lo rbuf.lo addresspool.lo rcpfk_util.lo \
++	$(LTLIBOBJS) -lpcap -lpthread $(R2DP_LIBS)
++endif
+ 
+ BUILT_SOURCES = cfparse.h
 diff --git a/lib/acinclude.m4 b/lib/acinclude.m4
 index bb89924..92cf6e2 100644
 --- a/lib/acinclude.m4
@@ -184,10 +202,10 @@ index bb89924..92cf6e2 100644
  dnl
 diff --git a/lib/if_r2dp.c b/lib/if_r2dp.c
 new file mode 100644
-index 0000000..112f282
+index 0000000..5141ebd
 --- /dev/null
 +++ b/lib/if_r2dp.c
-@@ -0,0 +1,837 @@
+@@ -0,0 +1,940 @@
 +/*
 + * lib/if_r2dp.c -- racoon2 SAD/SPD backend that speaks the r2dp control
 + * protocol to an external forwarder (e.g. the DPDK dataplane).
@@ -223,11 +241,13 @@ index 0000000..112f282
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
++#include <time.h>
 +#include <unistd.h>
 +
 +#include "vmbuf.h"
 +#include "rc_type.h"
 +#include "if_pfkeyv2.h"
++#include "plog.h"
 +
 +#include <r2dp/proto.h>
 +#include <r2dp/client.h>
@@ -242,6 +262,11 @@ index 0000000..112f282
 +static struct rcpfk_cb *cb;
 +static struct r2dp_hello_ack caps;
 +static int have_caps;
++static uint32_t hello_role = R2DP_ROLE_UNSPEC;
++
++/* Overall budget for a WAITREPLY exchange (replaces a fixed message count,
++ * which a busy forwarder's unrelated traffic could exhaust). */
++#define R2DP_REPLY_DEADLINE_MS 30000
 +
 +static void
 +km_seterror(struct rcpfk_msg *rc, int eno, const char *fmt, ...)
@@ -461,6 +486,7 @@ index 0000000..112f282
 +	if (role)
 +		r = strcmp(role, "iked") == 0 ? R2DP_ROLE_IKED :
 +		    strcmp(role, "spmd") == 0 ? R2DP_ROLE_SPMD : R2DP_ROLE_UNSPEC;
++	hello_role = r;
 +	if ((fd = r2dp_connect(NULL)) < 0) {
 +		km_seterror(rc, -fd, "r2dp connect: %s", strerror(-fd));
 +		return -1;
@@ -529,6 +555,68 @@ index 0000000..112f282
 +	return 0;
 +}
 +
++/*
++ * The forwarder connection dropped (EOF/ECONNRESET/EPIPE).  Reconnect and
++ * re-HELLO.  The new fd is dup2()'d onto rc->so so the daemon's event loop,
++ * which registered that fd number, keeps working.
++ *
++ * Same epoch: the forwarder (and its SAD/SPD) survived -- only our
++ * connection was lost -- so carry on.  Different epoch, or no forwarder:
++ * the forwarder restarted with empty tables.  The shim holds no keys and
++ * cannot reinstall SAs/SPs, so exit and let the supervisor restart the
++ * daemons, which renegotiate and reinstall everything.  Never run on
++ * against a forwarder whose state silently vanished.
++ */
++static int
++km_reconnect(struct rcpfk_msg *rc)
++{
++	struct r2dp_hello_ack nc;
++	int fd, e = 0, tries;
++
++	for (tries = 0; tries < 5; tries++) {
++		if ((fd = r2dp_connect(NULL)) >= 0) {
++			if ((e = r2dp_hello(fd, hello_role, &nc)) == 0)
++				break;
++			close(fd);
++		} else
++			e = fd;
++		fd = -1;
++		usleep(200000);
++	}
++	if (fd < 0 || !have_caps || nc.epoch != caps.epoch) {
++		plog(PLOG_INTERR, PLOGLOC, NULL,
++		    "r2dp: forwarder connection lost and %s; exiting so the "
++		    "supervisor restarts and resyncs SAs/SPs\n",
++		    fd < 0 ? "reconnect failed" : "forwarder restarted (epoch changed)");
++		fprintf(stderr, "r2dp: forwarder %s (%s); exiting for resync\n",
++		    fd < 0 ? "unreachable" : "restarted",
++		    fd < 0 ? strerror(-e) : "epoch changed");
++		if (fd >= 0)
++			close(fd);
++		exit(EXIT_FAILURE);
++	}
++	if (rc->so >= 0 && fd != rc->so) {
++		if (dup2(fd, rc->so) < 0) {
++			e = errno;
++			close(fd);
++			km_seterror(rc, e, "r2dp reconnect dup2: %s", strerror(e));
++			return -1;
++		}
++		close(fd);
++	} else
++		rc->so = fd;
++	caps = nc;
++	plog(PLOG_INFO, PLOGLOC, NULL,
++	    "r2dp: reconnected to forwarder (same epoch, state intact)\n");
++	return 0;
++}
++
++static int
++conn_lost(int r)
++{
++	return r == -ENOTCONN || r == -ECONNRESET || r == -EPIPE;
++}
++
 +static int
 +km_send(struct rcpfk_msg *rc, unsigned type, uint32_t flags,
 +    const void *body, size_t blen, const void *tail, size_t tlen)
@@ -541,8 +629,11 @@ index 0000000..112f282
 +	}
 +	if (reject_xfrm_native(rc))
 +		return -1;
-+	if ((r = r2dp_send(rc->so, type, rc->seq, 0, flags, body, blen,
-+	    tail, tlen)) < 0) {
++	r = r2dp_send(rc->so, type, rc->seq, 0, flags, body, blen, tail, tlen);
++	if (conn_lost(r) && km_reconnect(rc) == 0)
++		r = r2dp_send(rc->so, type, rc->seq, 0, flags, body, blen,
++		    tail, tlen);
++	if (r < 0) {
 +		km_seterror(rc, -r, "r2dp send %s: %s", r2dp_msg_name(type),
 +		    strerror(-r));
 +		return -1;
@@ -700,6 +791,14 @@ index 0000000..112f282
 +
 +	if (pack_sa(rc, &sa, with_keys))
 +		return -1;
++	/* v2: say which direction the SA is instead of making the forwarder
++	 * guess.  GETSPI reserves, and UPDATE completes, an SPI we receive on
++	 * (inbound); ADD installs the SA we send with (outbound).  DEL/GET
++	 * are lookups by (spi, dst, proto) and leave it 0. */
++	if (type == R2DP_GETSPI || type == R2DP_SA_UPDATE)
++		sa.dir = R2DP_DIR_IN;
++	else if (type == R2DP_SA_ADD)
++		sa.dir = R2DP_DIR_OUT;
 +	if (with_keys) {
 +		if ((rc->enckeylen && !rc->enckey) || (rc->authkeylen && !rc->authkey)) {
 +			km_seterror(rc, EINVAL, "missing key material");
@@ -963,6 +1062,13 @@ index 0000000..112f282
 +
 +	if (r == -ENOSYS)
 +		return 1;	/* unknown type from a newer forwarder: skip */
++	if (conn_lost(r)) {
++		/* nothing to dispatch; a request in flight on the old
++		 * connection got no reply and its caller times out/retries */
++		if (km_reconnect(rc) == 0)
++			return 2;
++		return -1;
++	}
 +	if (r < 0) {
 +		km_seterror(rc, -r, "r2dp recv: %s", strerror(-r));
 +		return -1;
@@ -976,7 +1082,8 @@ index 0000000..112f282
 +	struct r2dp_msg m;
 +	struct rcpfk_msg scratch;
 +	struct pollfd pfd;
-+	int n, r, wait = (rc->flags & PFK_FLAG_WAITREPLY) != 0;
++	struct timespec t0, now;
++	int r, wait = (rc->flags & PFK_FLAG_WAITREPLY) != 0;
 +
 +	if (rc->so < 0) {
 +		km_seterror(rc, EBADF, "r2dp not connected");
@@ -995,12 +1102,21 @@ index 0000000..112f282
 +	 * (R2DP_HF_MORE) is consumed to its last message.
 +	 */
 +	rc->flags &= ~PFK_FLAG_WAITREPLY;
-+	for (n = 0; n < 256; n++) {
++	clock_gettime(CLOCK_MONOTONIC, &t0);
++	for (;;) {
++		long left;
++
++		clock_gettime(CLOCK_MONOTONIC, &now);
++		left = R2DP_REPLY_DEADLINE_MS -
++		    ((now.tv_sec - t0.tv_sec) * 1000L +
++		     (now.tv_nsec - t0.tv_nsec) / 1000000L);
++		if (left <= 0)
++			break;
 +		pfd.fd = rc->so;
 +		pfd.events = POLLIN;
 +		pfd.revents = 0;
 +		do {
-+			r = poll(&pfd, 1, 5000);
++			r = poll(&pfd, 1, left > 5000 ? 5000 : (int)left);
 +		} while (r < 0 && errno == EINTR);
 +		if (r <= 0) {
 +			km_seterror(rc, r == 0 ? ETIMEDOUT : errno,
@@ -1009,6 +1125,11 @@ index 0000000..112f282
 +		}
 +		if ((r = recv_one(rc, &m)) < 0)
 +			return -1;
++		if (r == 2) {
++			km_seterror(rc, ECONNRESET,
++			    "r2dp connection reset; seq %u not answered", rc->seq);
++			return -1;
++		}
 +		if (r > 0)
 +			continue;
 +		if (m.h.seq == rc->seq && m.h.type != R2DP_EXPIRE &&
@@ -1024,6 +1145,242 @@ index 0000000..112f282
 +	}
 +	km_seterror(rc, ETIMEDOUT, "no r2dp reply to seq %u", rc->seq);
 +	return -1;
++}
+diff --git a/lib/r2dptest.c b/lib/r2dptest.c
+new file mode 100644
+index 0000000..cd9cf2b
+--- /dev/null
++++ b/lib/r2dptest.c
+@@ -0,0 +1,230 @@
++/*
++ * r2dptest: hermetic test of the r2dp KM backend (#includes if_r2dp.c)
++ * against a fake forwarder on a private SOCK_SEQPACKET socket.
++ *
++ *  - reqid: SAs without an IKE-assigned reqid get a stable, non-zero,
++ *    per-tunnel reqid (same pair -> same reqid, different pair or satype ->
++ *    different); an explicit reqid passes through.
++ *  - v2 dir: GETSPI/UPDATE carry R2DP_DIR_IN, ADD carries R2DP_DIR_OUT.
++ *  - reconnect: after the forwarder drops the connection, the next request
++ *    reconnects transparently on the SAME fd number when the epoch is
++ *    unchanged; a changed epoch makes the daemon exit for a resync.
++ */
++#include "if_r2dp.c"
++
++#include <pthread.h>
++#include <semaphore.h>
++#include <signal.h>
++#include <sys/wait.h>
++#include "rbuf.h"
++
++static int fails;
++#define CHECK(c, m) do { if (c) printf("ok   %s\n", m); \
++	else { printf("FAIL %s\n", m); fails++; } } while (0)
++
++static int lfd, conn = -1;
++static uint64_t fwd_epoch = 0x1111;
++static struct r2dp_sa last;
++static unsigned last_type, nconns;
++static sem_t got;
++
++static void *
++fwd_thread(void *arg)
++{
++	struct r2dp_msg *m = malloc(sizeof(*m));
++
++	(void)arg;
++	for (;;) {
++		int c = accept(lfd, NULL, NULL);
++		if (c < 0)
++			break;
++		__atomic_store_n(&conn, c, __ATOMIC_RELEASE);
++		__atomic_add_fetch(&nconns, 1, __ATOMIC_RELEASE);
++		for (;;) {
++			int r = r2dp_recv(c, m);
++			if (r == -ENOTCONN || r == -ECONNRESET || r == -EBADF)
++				break;
++			if (r < 0)
++				continue;
++			if (m->h.type == R2DP_HELLO) {
++				struct r2dp_hello_ack a;
++				memset(&a, 0, sizeof(a));
++				a.epoch = fwd_epoch;
++				a.max_msg = R2DP_MAX_MSG;
++				a.enc_caps[0] = a.enc_caps[1] = ~0u;
++				a.integ_caps[0] = ~0u;
++				r2dp_send(c, R2DP_HELLO_ACK, m->h.seq, 0, 0,
++				    &a, sizeof(a), NULL, 0);
++				continue;
++			}
++			memcpy(&last, m->body, sizeof(last));
++			last_type = m->h.type;
++			r2dp_send(c, m->h.type, m->h.seq, 0, 0, &last,
++			    sizeof(last), NULL, 0);
++			sem_post(&got);
++		}
++		close(c);
++	}
++	free(m);
++	return NULL;
++}
++
++static struct sockaddr_in A, B, C;
++static char key[20] = "0123456789abcdefghij";
++
++static void
++fill(struct rcpfk_msg *rc, int so, struct sockaddr_in *s, struct sockaddr_in *d,
++    uint32_t reqid, uint8_t satype)
++{
++	memset(rc, 0, sizeof(*rc));
++	rc->so = so;
++	rc->seq = 7;
++	rc->sa_src = (struct sockaddr *)s;
++	rc->sa_dst = (struct sockaddr *)d;
++	rc->spi = htonl(0x1000);
++	rc->reqid = reqid;
++	rc->satype = satype;
++	rc->samode = RCT_IPSM_TUNNEL;
++	rc->enctype = satype == RCT_SATYPE_ESP ? RCT_ALG_AES_GCM : 0;
++	rc->authtype = satype == RCT_SATYPE_AH ? RCT_ALG_HMAC_SHA2_256 : 0;
++	rc->enckeylen = satype == RCT_SATYPE_ESP ? 20 : 0;
++	rc->enckey = satype == RCT_SATYPE_ESP ? key : NULL;
++	rc->authkeylen = satype == RCT_SATYPE_AH ? 16 : 0;
++	rc->authkey = satype == RCT_SATYPE_AH ? key : NULL;
++}
++
++static int
++wait_got(void)
++{
++	struct timespec ts;
++
++	clock_gettime(CLOCK_REALTIME, &ts);
++	ts.tv_sec += 5;
++	return sem_timedwait(&got, &ts) == 0;
++}
++
++/* send one SA request, return the reqid the forwarder saw (0 = none) */
++static uint32_t
++send_reqid(int (*fn)(struct rcpfk_msg *), int so, struct sockaddr_in *s,
++    struct sockaddr_in *d, uint32_t reqid, uint8_t satype, uint8_t *dir)
++{
++	struct rcpfk_msg rc;
++
++	fill(&rc, so, s, d, reqid, satype);
++	if (fn(&rc) != 0 || !wait_got())
++		return 0;
++	if (dir)
++		*dir = last.dir;
++	return last.reqid;
++}
++
++static void
++drop_conn(void)
++{
++	unsigned n = __atomic_load_n(&nconns, __ATOMIC_ACQUIRE);
++	shutdown(__atomic_load_n(&conn, __ATOMIC_ACQUIRE), SHUT_RDWR);
++	(void)n;
++	usleep(100000);
++}
++
++int
++main(void)
++{
++	char path[64];
++	struct rcpfk_msg rc0;
++	struct rcpfk_cb cbs;
++	pthread_t th;
++	uint32_t r1, r2, r3, r4;
++	uint8_t dir = 0xff;
++	int so;
++
++	setvbuf(stdout, NULL, _IONBF, 0);
++	if (rbuf_init(8, 80, 4, 160, 4))
++		return 99;
++	plog_setmode(RCT_LOGMODE_NORMAL, NULL, "r2dptest", 1, 0);
++	signal(SIGPIPE, SIG_IGN);
++	snprintf(path, sizeof(path), "/tmp/r2dptest.%d.sock", (int)getpid());
++	unlink(path);
++	setenv("R2DP_SOCK", path, 1);
++	if ((lfd = r2dp_listen(path, 4)) < 0) {
++		printf("SKIP: cannot listen on %s\n", path);
++		return 77;
++	}
++	sem_init(&got, 0, 0);
++	pthread_create(&th, NULL, fwd_thread, NULL);
++
++	memset(&A, 0, sizeof(A)); A.sin_family = AF_INET;
++	B = C = A;
++	inet_pton(AF_INET, "192.0.2.1", &A.sin_addr);
++	inet_pton(AF_INET, "192.0.2.2", &B.sin_addr);
++	inet_pton(AF_INET, "192.0.2.3", &C.sin_addr);
++
++	memset(&cbs, 0, sizeof(cbs));
++	memset(&rc0, 0, sizeof(rc0));
++	CHECK(rcpfk_init(&rc0, &cbs) == 0 && rc0.so >= 0, "init + HELLO");
++	so = rc0.so;
++
++	/* reqid */
++	r1 = send_reqid(rcpfk_send_add, so, &A, &B, 0, RCT_SATYPE_ESP, &dir);
++	r2 = send_reqid(rcpfk_send_add, so, &A, &B, 0, RCT_SATYPE_ESP, NULL);
++	r3 = send_reqid(rcpfk_send_add, so, &A, &C, 0, RCT_SATYPE_ESP, NULL);
++	r4 = send_reqid(rcpfk_send_add, so, &A, &B, 0, RCT_SATYPE_AH, NULL);
++	CHECK(r1 != 0 && r1 == r2, "derived reqid non-zero and stable per tunnel");
++	CHECK(r1 != r3, "different tunnel endpoints -> different reqid");
++	CHECK(r1 != r4, "different satype -> different reqid");
++	CHECK(r1 == tunnel_reqid((struct sockaddr *)&A, (struct sockaddr *)&B,
++	    RCT_SATYPE_ESP), "reqid matches tunnel_reqid()");
++	CHECK(send_reqid(rcpfk_send_add, so, &A, &B, 77, RCT_SATYPE_ESP, NULL) == 77,
++	    "explicit IKE reqid passes through");
++
++	/* v2 direction */
++	CHECK(dir == R2DP_DIR_OUT, "SA_ADD carries dir=OUT");
++	dir = 0xff;
++	send_reqid(rcpfk_send_getspi, so, &B, &A, 0, RCT_SATYPE_ESP, &dir);
++	CHECK(last_type == R2DP_GETSPI && dir == R2DP_DIR_IN, "GETSPI carries dir=IN");
++	dir = 0xff;
++	send_reqid(rcpfk_send_update, so, &B, &A, 0, RCT_SATYPE_ESP, &dir);
++	CHECK(last_type == R2DP_SA_UPDATE && dir == R2DP_DIR_IN, "UPDATE carries dir=IN");
++	dir = 0xff;
++	send_reqid(rcpfk_send_delete, so, &B, &A, 0, RCT_SATYPE_ESP, &dir);
++	CHECK(dir == 0, "SA_DEL leaves dir unset (lookup)");
++
++	/* reconnect, same epoch: transparent, same fd number */
++	drop_conn();
++	{
++		struct rcpfk_msg rc;
++		fill(&rc, so, &A, &B, 0, RCT_SATYPE_ESP);
++		CHECK(rcpfk_send_add(&rc) == 0 && wait_got(),
++		    "request after forwarder drop succeeds (reconnected, same epoch)");
++		CHECK(rc.so == so && __atomic_load_n(&nconns, __ATOMIC_ACQUIRE) == 2,
++		    "reconnected on the same fd number");
++	}
++
++	/* reconnect, changed epoch: the daemon exits for resync */
++	{
++		pid_t p;
++		int st = 0;
++
++		fwd_epoch = 0x2222;
++		drop_conn();
++		p = fork();
++		if (p == 0) {
++			struct rcpfk_msg rc;
++			fill(&rc, so, &A, &B, 0, RCT_SATYPE_ESP);
++			(void)rcpfk_send_add(&rc);
++			_exit(0);	/* not reached if the shim exits */
++		}
++		waitpid(p, &st, 0);
++		CHECK(WIFEXITED(st) && WEXITSTATUS(st) == EXIT_FAILURE,
++		    "forwarder restarted (epoch changed) -> exit for resync");
++	}
++
++	rcpfk_clean(&rc0);
++	unlink(path);
++	if (fails) {
++		printf("r2dptest: %d failures\n", fails);
++		return 1;
++	}
++	puts("r2dptest: OK");
++	return 0;
 +}
 diff --git a/spmd/configure.ac b/spmd/configure.ac
 index 957af58..ab8e8a4 100644
