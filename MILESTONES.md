@@ -308,3 +308,29 @@ into per-backend protocol forks.
   truth; inbound decrypt + egress encrypt both verified live.  The remaining
   iked-to-iked handshake-triggered ping under continuous load is a lab
   orchestration exercise, not a forwarder gate.
+
+## Review follow-up (2026-10-25): protocol v2 and data-plane hardening
+- **Protocol v2** (`R2DP_VERSION 2`): `r2dp_sa.pad0` becomes `dir`
+  (`R2DP_DIR_IN`/`OUT`, 0 = infer for compatibility in the forwarder); the
+  racoon2 shim sets it explicitly (GETSPI/UPDATE = IN, ADD = OUT).
+  `wsize = 0` means "forwarder default (64)", never "anti-replay off".
+- **Concurrency (M4)**: policies are published as pointers (release) and
+  retired through QSBR before free; SA slots are published with a
+  release-store of `used`; the control thread waits with
+  `RTE_QSBR_THRID_INVALID` (passing the worker id skipped the grace period —
+  a use-after-free caught by `dp_sa`'s concurrent-reader test).  Byte
+  counters are atomic.
+- **Policy semantics (M5)**: selectors match protocol and ports (first
+  fragment only); most-specific policy wins; inbound decrypted packets must
+  match an IN/FWD PROTECT policy bound to the SA's own tunnel endpoints and
+  reqid — default deny.
+- **Control server (M8 + minors)**: clients are non-blocking and a client
+  that cannot take a reply is dropped instead of stalling the loop; reserved
+  SPIs (< 256) and prefixes > 32/128 refused; lifetime clock starts at larval
+  promotion; failed SP upsert restores the old policy; lifetime-only UPDATE
+  does not touch the data plane; request buffers are scrubbed.
+- **libr2dp**: tail-length checks for every message type, `MSG_NOSIGNAL`,
+  send buffers scrubbed, HELLO validates seq/status and skips async messages.
+- **Next hops**: the 64-entry MAC table evicts least-recently-seen entries.
+- **CI**: `dp_path` runs outbound encrypt → inbound decrypt through the
+  production code in the DPDK lanes.
