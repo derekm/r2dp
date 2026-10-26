@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>r2dp Control Panel</title>
+<style>
+ :root{--bg:#0f1216;--fg:#e6e9ee;--mut:#8b93a3;--ac:#4f9cf9;--ok:#3fb27f;--err:#e5534b;--panel:#171c22;--line:#262d36}
+ *{box-sizing:border-box}
+ body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);margin:0;line-height:1.5}
+ header{padding:1rem 1.5rem;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+ header h1{font-size:1.2rem;margin:0;flex:1}
+ .badge{font-size:.75rem;color:var(--mut)}
+ .wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:1rem;padding:1.5rem}
+ .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:1rem;display:flex;flex-direction:column;gap:.6rem}
+ .card h2{margin:0;font-size:1rem}
+ .card .desc{font-size:.8rem;color:var(--mut);min-height:2.2rem}
+ button{background:var(--ac);border:none;color:#04121f;padding:.45rem .9rem;border-radius:6px;font-weight:600;cursor:pointer}
+ button.sec{background:#2b3c4e;color:var(--fg)}
+ button:disabled{opacity:.5;cursor:not-allowed}
+ input,select{background:#0f1216;border:1px solid var(--line);color:var(--fg);padding:.35rem .5rem;border-radius:6px}
+ .grid{display:grid;gap:.4rem}
+ label{font-size:.75rem;color:var(--mut)}
+ pre{background:#0b0e11;border:1px solid var(--line);border-radius:6px;padding:.6rem;overflow:auto;max-height:260px;font-size:.78rem;white-space:pre-wrap;word-break:break-word}
+ pre.ok{color:var(--ok)} pre.err{color:var(--err)} pre.mut{color:var(--mut)}
+ .row{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
+ .status{font-size:.75rem}
+ footer{padding:1rem 1.5rem;color:var(--mut);font-size:.75rem;border-top:1px solid var(--line)}
+ .tabs{display:flex;gap:.5rem;padding:.8rem 1.5rem 0;border-bottom:1px solid var(--line)}
+ .tab{background:transparent;color:var(--mut);border:1px solid var(--line);border-bottom:none;border-radius:8px 8px 0 0;padding:.45rem 1rem}
+ .tab.active{background:var(--panel);color:var(--fg)}
+</style>
+</head>
+<body>
+<header>
+  <h1>R2dp<span style="color:var(--ac)">ClickOps</span> <span class="badge">prototype</span></h1>
+  <span id="repo" class="badge"></span>
+  <button onclick="location.reload()">Refresh</button>
+</header>
+<nav class="tabs">
+  <button class="tab active" id="tab-meta" onclick="showTab('meta')">Meta ops</button>
+  <button class="tab" id="tab-main" onclick="showTab('main')">Main project</button>
+</nav>
+<div class="wrap" id="grid"></div>
+<footer>Local dev server only (127.0.0.1). State-changing actions require the confirm checkbox — prototype, not production auth.</footer>
+
+<script>
+const BASE = "";
+let mutated = false;
+
+async function api(path, opts) {
+  const r = await fetch(BASE + path, opts);
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error(j.detail || r.statusText || "request failed");
+  return j;
+}
+
+function card(id, title, desc, controls, run) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.id = id;
+  el.innerHTML = `<h2>${title}</h2><div class="desc">${desc}</div>${controls}<div class="row"><button class="run">Run</button> <button class="sec" onclick="clearOut(${id? `'${id}'`:''})">Clear</button> <span class="status"></span></div><pre class="mut" style="display:none"></pre>`;
+  el.querySelector(".run").onclick = async (e) => {
+    const b = e.target; b.disabled = true;
+    const pre = el.querySelector("pre"); const st = el.querySelector(".status");
+    pre.style.display = "block"; pre.className = "mut"; pre.textContent = "running…"; st.textContent = "";
+    try {
+      const out = await run(el);
+      pre.className = out.ok ? "ok" : "err";
+      pre.textContent = out.text || "(done)";
+      st.textContent = out.ok ? "✓" : "✗";
+      st.style.color = out.ok ? "var(--ok)" : "var(--err)";
+    } catch (err) {
+      pre.className = "err"; pre.textContent = String(err); st.textContent = "✗";
+    }
+    b.disabled = false;
+  };
+  return el;
+}
+
+function clearOut(id){ const p=document.getElementById(id)?.querySelector('pre'); if(p){p.style.display='none';} }
+
+// ---- action definitions ----
+const cards = [
+  { id:"branches", title:"1 · List branches", desc:"Show every branch with short SHA and latest subject.",
+    controls:`<div class="row"><button class="sec" onclick="api('/api/branches').then(x=>fillBranches(x))">Fetch branches</button></div><pre class="mut" style="display:none"></pre>`,
+    run: async () => { const j = await api("/api/branches");
+      return { ok:true, text: j.branches.map(b=>`${b.branch.padEnd(16)} ${b.sha.padEnd(8)} ${b.subject}`).join("\n") }; } },
+  { id:"status", title:"2 · Git status", desc:"Current branch and working-tree state (git status -sb).",
+    controls:"", run: async () => { const j=await api("/api/status"); return {ok:j.ok, text:j.out}; } },
+  { id:"tree", title:"3 · Branch file tree", desc:"Top-level files of any branch.",
+    controls:`<div class="grid"><label>Branch</label><input id="t_b" value="main"></div>`,
+    run: async el => { const j=await api(`/api/branch/${encodeURIComponent(el.querySelector('#t_b').value)}/tree`);
+      return {ok:j.ok, text:j.files.join("\n")}; } },
+  { id:"log", title:"4 · Commit log", desc:"Recent commits of any branch (default 20).",
+    controls:`<div class="grid"><label>Branch</label><input id="l_b" value="main"><label>Count</label><input id="l_n" type="number" value="20"></div>`,
+    run: async el => { const j=await api(`/api/branch/${encodeURIComponent(el.querySelector('#l_b').value)}/log?n=${el.querySelector('#l_n').value}`);
+      return {ok:j.ok, text:j.commits.map(c=>`${c.sha} ${c.date} ${c.author} — ${c.subject}`).join("\n")}; } },
+  { id:"file", title:"5 · Show branch file", desc:"Print a file from a branch path (e.g. README.md).",
+    controls:`<div class="grid"><label>Branch</label><input id="f_b" value="site"><label>Path</label><input id="f_p" value="README.md"></div>`,
+    run: async el => { const j=await api(`/api/branch/${encodeURIComponent(el.querySelector('#f_b').value)}/file?path=${encodeURIComponent(el.querySelector('#f_p').value)}`);
+      return {ok:j.ok, text:j.content.slice(0,8000)}; } },
+  { id:"gen", title:"6 · Generate site", desc:"Run site/gen_site.py → index.html.",
+    controls:`<div class="row"><label><input type="checkbox" id="g_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/generate-site?confirm="+(el.querySelector('#g_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:(j.out||j.err||"")+"\n"+ (j.ok?"":"(needs confirm)")}; } },
+  { id:"usage", title:"7 · Refresh usage ledgers", desc:"Re-run normalize + extract + user_messages on live data.",
+    controls:`<div class="row"><label><input type="checkbox" id="u_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/refresh-usage?confirm="+(el.querySelector('#u_confirm').checked?1:0), {method:"POST"});
+      let lines=[];
+      for(const [k,v] of Object.entries(j.results||{})) lines.push(`${k}: ${v&&v.ok?'ok':'ERR'} ${(v&&(v.out||v.err||'').trim().split('\\n').pop())||''}`);
+      return {ok:j.ok, text:lines.join("\\n")}; } },
+  { id:"build", title:"8 · Build all branches", desc:"Compile every commit across every branch (ci_all_branches.sh).",
+    controls:`<div class="row"><label><input type="checkbox" id="b_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/build-all?confirm="+(el.querySelector('#b_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:j.out||j.err||""}; } },
+  { id:"create", title:"9 · Create branch", desc:"Create a branch from a base (default main). Mutating.",
+    controls:`<div class="grid"><label>Name</label><input id="c_n" placeholder="feat/x"><label>Base</label><input id="c_b" value="main"></div><div class="row"><label><input type="checkbox" id="c_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/branch/create?name="+encodeURIComponent(el.querySelector('#c_n').value)+"&base="+encodeURIComponent(el.querySelector('#c_b').value)+"&confirm="+(el.querySelector('#c_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:j.out||j.err||""}; } },
+  { id:"push", title:"10 · Push branch", desc:"Push a branch to origin (optionally set upstream). Mutating.",
+    controls:`<div class="grid"><label>Branch</label><input id="p_b" value="main"></div><div class="row"><label><input type="checkbox" id="p_u"> -u upstream</label> <label><input type="checkbox" id="p_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/push?branch="+encodeURIComponent(el.querySelector('#p_b').value)+"&upstream="+(el.querySelector('#p_u').checked?1:0)+"&confirm="+(el.querySelector('#p_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:j.out||j.err||""}; } },
+];
+
+function fillBranches(branches){
+  document.querySelectorAll("#p_b,#c_b,#l_b,#f_b,#t_b").forEach(inp=>{
+    if(inp.value==="main" && branches.length) inp.value=branches[0].branch;
+  });
+}
+
+// ---- main-project ClickOps Top-10 (build/test/demo/bench/e2e) ----
+const mainCards = [
+  { id:"m-checkout", title:"1 · Checkout main", desc:"Archive main into the ClickOps workspace (fresh copy).",
+    controls:`<div class="row"><label><input type="checkbox" id="mc_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/checkout?confirm="+(el.querySelector('#mc_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:j.ok?`Workspace ${j.ws}`:(j.err||"")}; } },
+  { id:"m-setup", title:"2 · Meson setup", desc:"Configure a build dir for main in the workspace.",
+    controls:`<div class="row"><label><input type="checkbox" id="ms_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/setup?confirm="+(el.querySelector('#ms_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:(j.out||j.err||"").slice(-3000)}; } },
+  { id:"m-build", title:"3 · Build main", desc:"meson compile of the main project.",
+    controls:`<div class="row"><label><input type="checkbox" id="mb_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/build?confirm="+(el.querySelector('#mb_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:(j.out||j.err||"").slice(-3000)}; } },
+  { id:"m-test", title:"4 · Test main", desc:"meson test (proto/mock/shim/smoke/sad_dump/gcm_kat).",
+    controls:`<div class="row"><label><input type="checkbox" id="mt_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/test?confirm="+(el.querySelector('#mt_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:(j.out||j.err||"").slice(-3500)}; } },
+  { id:"m-san", title:"5 · ASan/UBSan test", desc:"Sanitizer build + test (address/undefined).",
+    controls:`<div class="row"><label><input type="checkbox" id="msan_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/sanitize?confirm="+(el.querySelector('#msan_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:(j.out||j.err||"").slice(-3500)}; } },
+  { id:"m-dpdk", title:"6 · DPDK dataplane build", desc:"Build fwd with -Denable_dpdk=enabled.",
+    controls:`<div class="row"><label><input type="checkbox" id="mdp_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/dpdk?confirm="+(el.querySelector('#mdp_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:(j.out||j.err||"").slice(-3000)}; } },
+  { id:"m-bench", title:"7 · Run forwarder bench", desc:"Bench the dataplane (build/bench/fwd_bench).",
+    controls:`<div class="row"><label><input type="checkbox" id="mbench_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/bench?confirm="+(el.querySelector('#mbench_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:(j.out||j.err||"").slice(-4000)}; } },
+  { id:"m-e2e", title:"8 · IKE e2e", desc:"Run the two-peer IKEv2 harness (needs root/tools).",
+    controls:`<div class="row"><label><input type="checkbox" id="me2e_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/e2e?confirm="+(el.querySelector('#me2e_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:(j.out||j.err||"").slice(-3500)}; } },
+  { id:"m-milestones", title:"9 · Milestone map", desc:"Show main's MILESTONES.md.",
+    controls:`<div class="row"><label><input type="checkbox" id="mm_confirm"> confirm</label></div>`,
+    run: async el => { const j=await api("/api/main/milestones?confirm="+(el.querySelector('#mm_confirm').checked?1:0), {method:"POST"});
+      return {ok:j.ok, text:j.out||j.err||""}; } },
+  { id:"m-status", title:"10 · ClickOps workspace status", desc:"Where the ClickOps workspace is + build state.",
+    controls:"",
+    run: async () => { const j=await api("/api/main/status");
+      return {ok:j.ok, text:JSON.stringify(j,null,2)}; } },
+];
+
+let allCards = { meta: cards, main: mainCards };
+
+function showTab(which){
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  document.getElementById("tab-"+which).classList.add("active");
+  renderCards(which);
+}
+function renderCards(which){
+  const grid=document.getElementById("grid");
+  grid.innerHTML="";
+  (allCards[which]||[]).forEach(c=>{ grid.appendChild(card(c.id,c.title,c.desc,c.controls,c.run)); });
+}
+
+// initial: show repo + a couple of live values
+api("/api/status").then(j=>{
+  const first = j.out.split("\n")[0]||"";
+  document.getElementById("repo").textContent = first;
+}).catch(()=>{});
+api("/api/branches").then(j=>{
+  fillBranches(j.branches.map(b=>b.branch));
+}).catch(()=>{});
+</script>
+</body>
+</html>
