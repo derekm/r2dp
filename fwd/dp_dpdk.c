@@ -82,6 +82,9 @@ struct dp_sa {
 	uint8_t            used;
 	uint8_t            inbound;  /* in the inbound SAD (our GETSPI) */
 	uint8_t            natt;     /* R2DP_NATT_*; ESP-in-UDP demux (NAT-T) */
+	uint64_t           gen;      /* install generation (monotonic): the
+	                              * newest of several SAs for one tunnel is
+	                              * the post-rekey SA egress must use */
 	uint64_t           bytes;    /* total bytes crypted on this SA (soft/hard
 	                              * byte lifetime accounting, young seq) */
 };
@@ -110,6 +113,7 @@ struct dpdk_priv {
 	struct dp_sa        sa_tab[MAX_SA];
 	struct dp_sp_ent    sp_tab[MAX_SA];
 	int                 verbose;
+	uint64_t            sa_gen;       /* last dp_sa.gen handed out */
 	/* M1 interop: the outer tap is B's NIC toward the peer (A).  The peer's
 	 * L2 and the forwarder's own outer MAC are learned so egress ESP is
 	 * emitted UNICAST to the peer (a broadcast ESP frame is dropped by the
@@ -362,6 +366,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	d->sa_tab[newidx].dip = dip;
 	d->sa_tab[newidx].inbound = inbound;
 	d->sa_tab[newidx].natt = rsa->natt_type;
+	d->sa_tab[newidx].gen = ++d->sa_gen;
 	/* publish last: the worker only proceeds past `used` == 1 */
 	d->sa_tab[newidx].used = 1;
 
@@ -985,11 +990,12 @@ in_inner_ok(struct dpdk_priv *d, uint32_t dip, struct rte_mbuf *mb)
  * SP and SA, so reqid alone would collapse all tunnels onto the first
  * outbound SA (H3).  Prefer an exact tunnel-endpoint match (policy tun_src/
  * tun_dst == SA src/dst); among endpoint matches prefer a real (nonzero)
- * reqid when the policy carries one, else the last matching slot. */
+ * reqid when the policy carries one; within each class take the newest SA
+ * (highest install gen) so a rekey overlap encrypts with the new SA. */
 static struct dp_sa *
 sa_by_policy(struct dpdk_priv *d, const struct r2dp_sp *sp)
 {
-	struct dp_sa *endpoint = NULL, *last_match = NULL;
+	struct dp_sa *by_reqid = NULL, *by_endpoint = NULL;
 	uint32_t ts, td;
 	int i;
 
@@ -1001,14 +1007,16 @@ sa_by_policy(struct dpdk_priv *d, const struct r2dp_sp *sp)
 			continue;
 		if (ds->srca != ts || ds->dsta != td)
 			continue;
-		/* exact endpoint match */
-		if (sp->reqid && ds->reqid == sp->reqid)
-			return ds;                 /* best: endpoint + real reqid */
-		last_match = ds;
-		if (!ds->reqid)
-			endpoint = ds;             /* fallback: endpoint only */
+		/* Several outbound SAs can share a tunnel during a rekey overlap;
+		 * the newest install (highest gen) is the one to encrypt with,
+		 * never whichever happens to sit in the last table slot. */
+		if (sp->reqid && ds->reqid == sp->reqid) {
+			if (!by_reqid || ds->gen > by_reqid->gen)
+				by_reqid = ds;
+		} else if (!by_endpoint || ds->gen > by_endpoint->gen)
+			by_endpoint = ds;
 	}
-	return endpoint ? endpoint : last_match;
+	return by_reqid ? by_reqid : by_endpoint;
 }
 
 /* Find the OUT policy that (longest-prefix) matches this inner IPv4 packet.
