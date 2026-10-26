@@ -113,7 +113,7 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   valid 100-byte ESP datagram (outer 10.0.0.1→10.0.0.2, ESP SPI 0x4444, seq 1;
   egress crypto `st=0 proc=1 pkt=100`).  Commit `2d9b944`; meson 5/5 DPDK,
   4/4 control.
-- **Interop exit gate — MET (2026-10-25, data plane)** (the earlier note said
+- **M1 exit gate — MET (2026-10-25, data plane)** (the earlier note said
   "not yet proven"): the blocker was lab orchestration, which has since been
   cleared and the data-plane gate demonstrated — see "M1 exit gate — data plane
   DEMONSTRATED ROUND-TRIP" below, where one forwarder instance carried real ESP
@@ -122,6 +122,19 @@ Deps listed are *added* at that milestone; earlier ones carry forward.
   separately; the netns bridged-tap delivery was reconfirmed working (the prior
   "quirk" was a /tmp-full misdiagnosis).  Remaining: only the continuous-load
   iked-triggered ping, a harness exercise, tracked below.
+- **M1 interop BOTH IKE role combinations now demonstrated (2026-10-25)**:
+  (a) kernel-XFRM initiator ↔ r2dp-backend responder (the original direction);
+  (b) **r2dp-backend initiator ↔ kernel-XFRM responder (new)** — B's `iked-r2dp`
+  launched with `-I 10.77.0.2 -S selB_out` (the `-I` peer must be paired with
+  `-S <inner-selector>` because `-I` alone looks up a selector by OUTER
+  addresses, which don't match inner-based selectors), plus a route
+  `10.77.0.0/24 dev r2dp-tap-inner` in B so its iked can source IKE to the
+  peer.  B reached `INI_IKE_SA_INIT_SENT -> ... -> ESTABLISHED`, A
+  `RES_IKE_AUTH_RCVD -> ESTABLISHED`, and the forwarder received the
+  r2dp-initiated child `SA_ADD spi=00538d9e dip=10.77.0.1` (matching A's XFRM
+  state).  This closes the previously-uncovered reverse-role combination at the
+  control plane; the full ping still awaits the same harness-level tap-RX
+  wiring as the forward direction (not a forwarder defect).
 
 ### Latest-review round (REVIEW_R2DP_LATEST_2026-10-25, base 2d9b944) — status
 - **H1 egress outer-IPv4 checksum — FIXED (42349ce), verified live**: librte
