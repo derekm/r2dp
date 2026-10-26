@@ -18,7 +18,7 @@
 #include <stdint.h>
 
 #define R2DP_MAGIC        0x50443252u        /* "R2DP" little-endian */
-#define R2DP_VERSION      1
+#define R2DP_VERSION      2                  /* v2: r2dp_sa.dir (was pad0) */
 #define R2DP_MAX_MSG      4096
 #define R2DP_MAX_KEY      64                 /* per key blob, bytes */
 #define R2DP_DEFAULT_SOCK "/run/r2dp/r2dp.sock"
@@ -175,10 +175,14 @@ struct r2dp_sa {
 	uint8_t  mode;                /* R2DP_MODE_* */
 	uint8_t  enc;                 /* R2DP_ENCR_* */
 	uint8_t  integ;               /* R2DP_INTEG_* */
-	uint8_t  wsize;               /* replay window (packets), 0 = none */
+	uint8_t  wsize;               /* replay window (packets), 0 = forwarder
+	                               * default (64); anti-replay is never off */
 	uint8_t  natt_type;           /* R2DP_NATT_* */
 	uint8_t  expired;             /* EXPIRE only: 1 soft, 2 hard */
-	uint8_t  pad0;
+	uint8_t  dir;                 /* v2: R2DP_DIR_IN (protects traffic to
+	                               * us: decrypt) / R2DP_DIR_OUT (encrypt);
+	                               * 0 = unspecified: the forwarder infers
+	                               * IN for an SA completing its GETSPI */
 	uint16_t natt_sport, natt_dport;   /* network order; meaningful only if natt_type != NONE
 	                                    * (iked sets them to 500 even for non-NAT-T SAs) */
 	uint16_t enckeylen, authkeylen;    /* bytes of tail */

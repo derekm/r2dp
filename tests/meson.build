@@ -68,3 +68,11 @@ test('nh_test',
   executable('nh_test', 'nh_test.c', '../fwd/dp_nh.c',
     include_directories: include_directories('../fwd')),
   is_parallel: false)
+
+# ctl_unit: white-box control-server tests (fwd/ctl.c + fake dataplane).
+test('ctl_unit',
+  executable('ctl_unit', 'ctl_unit.c', '../fwd/dp.c',
+    include_directories: [include_directories('../include'),
+                          include_directories('../fwd')],
+    link_with: libr2dp),
+  is_parallel: false)

@@ -272,6 +272,19 @@ reap_larv(void)
 			C->sad[i].used = 0;
 }
 
+/* SA direction: the explicit v2 r2dp_sa.dir wins; with dir unspecified
+ * fall back to the v1 inference (an SA completing our GETSPI reservation, or
+ * one already known inbound, protects traffic TO us). */
+static int
+sa_is_inbound(const struct fwd_sa_ent *e, const struct r2dp_sa *rq)
+{
+	if (rq->dir == R2DP_DIR_IN)
+		return 1;
+	if (rq->dir == R2DP_DIR_OUT)
+		return 0;
+	return e && (e->larval || e->inbound);
+}
+
 static void
 do_sa(int fd, const struct r2dp_msg *m)
 {
@@ -305,7 +318,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 			/* An SA completing our GETSPI reservation (a larval we handed out)
 			 * protects traffic TO us: seed the dataplane with the INBOUND flag.
 			 * The flag stays sticky across UPDATE (e->inbound). */
-			int flags = 1 | ((e->larval || e->inbound) ? FWD_DP_SA_INBOUND : 0);
+			int flags = 1 | (sa_is_inbound(e, rq) ? FWD_DP_SA_INBOUND : 0);
 			int dperr = sa_apply_dp(C, flags, rq, blen ? blob : NULL, blen);
 			if (dperr) {
 				/* Roll back the ctl entry on dp failure.  If this was a
@@ -318,8 +331,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 			}
 		}
 		/* commit: promotes a larval reservation to a live SA */
-		if (e->larval)
-			e->inbound = 1;
+		e->inbound = sa_is_inbound(e, rq);
 		e->larval = 0;
 		e->sa = *rq;
 		/* restart the lifetime clock on (re)install */
@@ -344,8 +356,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 			 * last known-good so GET after a failed update is consistent.
 			 * racoon2 UPDATEs the larval SA it GETSPI'd: that is the inbound
 			 * SA.  An UPDATE of a live SA keeps its direction (e->inbound). */
-			int flags = 1 | ((e->larval || e->inbound) ?
-			    FWD_DP_SA_INBOUND : 0);
+			int flags = 1 | (sa_is_inbound(e, rq) ? FWD_DP_SA_INBOUND : 0);
 			int dperr = sa_apply_dp(C, flags, rq, blen ? blob : NULL, blen);
 			if (dperr) {
 				/* e->sa was not touched: the ctl entry still reflects the
@@ -355,8 +366,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 				goto out;
 			}
 		}
-		if (e->larval)
-			e->inbound = 1;
+		e->inbound = sa_is_inbound(e, rq);
 		e->larval = 0; e->sa = *rq;
 		e->installed_at = time(NULL);
 		e->soft_notified = e->hard_notified = 0;
