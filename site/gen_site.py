@@ -64,12 +64,12 @@ def render_lineage():
     body = "<h3>Zip lineage (M0 → M0+M1)</h3>"
     # Source of the zip-based lineage DAG: prefer the origin-pushed record
     # (survives in CI), fall back to the local backup branch.
+    ziplog = ""
     for cand in ("lineage-src", "refs/remotes/origin/lineage-src", "pre-src/lineage"):
-        if git("rev-parse", "-q", "--verify", cand).returncode == 0:
+        # git() returns stdout (str); verify the ref resolves by asking rev-parse
+        if git("rev-parse", "-q", "--verify", f"{cand}^{{commit}}"):
             ziplog = git("log", "--format=%h|%ad|%an|%s", "--date=short", cand)
             break
-    else:
-        ziplog = ""
     ziprows = []
     for line in ziplog.splitlines():
         parts = line.split("|", 3)
