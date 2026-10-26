@@ -1,0 +1,8 @@
+option('milestone', type: 'integer', min: 0, max: 4, value: 0,
+       description: 'Highest milestone to build (0=proto+mock, 1=DPDK fwd MVP, 2=lifetimes/ESN/CBC/v6/NAT-T, 3=multicore, 4=inline crypto/ACQUIRE/PMTU)')
+option('racoon2_src', type: 'string', value: '',
+       description: 'Path to a racoon2 checkout; enables building/testing the shim patch against it')
+option('racoon2_prefix', type: 'string', value: '',
+       description: 'Install prefix of a racoon2 built with --with-km-backend=r2dp; enables the two-stack iked+forwarder test')
+option('dpdk_min', type: 'string', value: '23.11',
+       description: 'Minimum DPDK version (use an LTS)')
