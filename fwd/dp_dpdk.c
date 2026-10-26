@@ -110,6 +110,14 @@ struct dpdk_priv {
 	struct dp_sa        sa_tab[MAX_SA];
 	struct dp_sp_ent    sp_tab[MAX_SA];
 	int                 verbose;
+	/* M1 interop: the outer tap is B's NIC toward the peer (A).  The peer's
+	 * L2 and the forwarder's own outer MAC are learned so egress ESP is
+	 * emitted UNICAST to the peer (a broadcast ESP frame is dropped by the
+	 * peer's XFRM stack, which is what broke the interop ping). */
+	uint8_t             peer_mac[6];
+	uint8_t             our_mac[6];
+	int                 have_peer;
+
 	char                tap_if[IFNAMSIZ];
 	volatile int        running;
 	unsigned            worker_lcore;
@@ -1228,6 +1236,35 @@ worker_outer(struct dpdk_priv *d, int port)
 	for (uint16_t i = 0; i < nr; i++) {
 		if (is_esp(bufs[i]) || is_nat_esp(d, bufs[i])) {
 			d->n_esp++;
+			/* M1 interop: LEARN the L2 pair from the first inbound ESP
+			 * frame.  The eth header is still present here (L2 strip
+			 * happens inside esp_inbound).  src = the peer (A) MAC the
+			 * egress ESP must be unicast to; dst = this outer tap's own
+			 * MAC.  Both are needed because net_tap has no ARP and a
+			 * broadcast ESP frame is dropped by the peer's XFRM stack. */
+			if (!d->have_peer && rte_pktmbuf_pkt_len(bufs[i]) >=
+			    RTE_ETHER_HDR_LEN) {
+				struct rte_ether_hdr *eh = rte_pktmbuf_mtod(bufs[i],
+				    struct rte_ether_hdr *);
+				/* inbound ESP on the outer tap carries
+				 *   dst = B's outer-tap MAC  (this tap)
+				 *   src = A's MAC           (the peer)
+				 * The EGRESS ESP must go UNICAST to A, so
+				 *   peer_mac (= egress dst) = inbound src
+				 *   our_mac  (= egress src) = inbound dst  */
+				memcpy(d->peer_mac, eh->src_addr.addr_bytes, 6);
+				memcpy(d->our_mac, eh->dst_addr.addr_bytes, 6);
+				d->have_peer = 1;
+
+				if (d->verbose)
+					fprintf(stderr, "r2dp-fwd: learned peer MAC "
+					    "%02x:%02x:%02x:%02x:%02x:%02x via our "
+					    "%02x:%02x:%02x:%02x:%02x:%02x\n",
+					    d->peer_mac[0], d->peer_mac[1], d->peer_mac[2],
+					    d->peer_mac[3], d->peer_mac[4], d->peer_mac[5],
+					    d->our_mac[0], d->our_mac[1], d->our_mac[2],
+					    d->our_mac[3], d->our_mac[4], d->our_mac[5]);
+			}
 			esp[nesp++] = bufs[i];
 		} else {
 			exc[nex++] = bufs[i];
@@ -1367,8 +1404,18 @@ worker_inner(struct dpdk_priv *d, int port)
 			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
 			if (!h) { rte_pktmbuf_free(esp_out[i]); continue; }
 			eh = rte_pktmbuf_mtod(esp_out[i], struct rte_ether_hdr *);
-			memset(eh->dst_addr.addr_bytes, 0xff, 6);
-			memset(eh->src_addr.addr_bytes, 0x00, 6);
+			/* M1 interop: egress ESP must be UNICAST to the peer
+			 * (the learned MAC from inbound ESP) or the peer's
+			 * XFRM stack drops a broadcast ESP frame.  Fall back
+			 * to broadcast until the MAC is learned (first
+			 * inbound ESP rekeys a peer-less sa -> safe). */
+			if (d->have_peer) {
+				memcpy(eh->dst_addr.addr_bytes, d->peer_mac, 6);
+				memcpy(eh->src_addr.addr_bytes, d->our_mac, 6);
+			} else {
+				memset(eh->dst_addr.addr_bytes, 0xff, 6);
+				memset(eh->src_addr.addr_bytes, 0x00, 6);
+			}
 			eh->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 			esp_out[i]->l2_len = RTE_ETHER_HDR_LEN;
 			esp_out[i]->l3_len = 20;
