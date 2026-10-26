@@ -8,6 +8,9 @@
 #
 # Exit 0 only if every commit configures/compiles/tests; fails on the first
 # broken commit with its log printed.
+#
+# Memory context for this DAG and its commits: docs/memory-links.md
+# (cross-references each commit/branch here to AGENT_MEMORY_MILESTONES.md).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
