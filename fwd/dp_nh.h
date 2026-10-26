@@ -20,6 +20,7 @@ struct r2dp_nh {
 	uint32_t ip;          /* raw wire-order IPv4 */
 	uint8_t  mac[6];
 	uint8_t  used;
+	uint64_t seen;        /* caller's clock at last learn/refresh */
 };
 
 struct r2dp_nh_tab {
@@ -32,8 +33,12 @@ struct r2dp_nh_tab {
 int r2dp_nh_frame_ike_esp(const uint8_t *f, size_t len, uint32_t *sip,
     const uint8_t **smac);
 
-/* Learn/refresh ip -> mac.  Returns 1 new, 2 changed, 0 unchanged, -1 full. */
-int r2dp_nh_learn(struct r2dp_nh_tab *t, uint32_t ip, const uint8_t mac[6]);
+/* Learn/refresh ip -> mac at time `now` (any monotonic clock).  Returns 1
+ * new, 2 changed, 0 unchanged.  When the table is full the least recently
+ * seen entry is evicted (returns 3), so a stale peer never blocks a new
+ * one. */
+int r2dp_nh_learn(struct r2dp_nh_tab *t, uint32_t ip, const uint8_t mac[6],
+    uint64_t now);
 
 /* MAC for ip, or NULL if unknown. */
 const uint8_t *r2dp_nh_lookup(const struct r2dp_nh_tab *t, uint32_t ip);

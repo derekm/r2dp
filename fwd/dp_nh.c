@@ -53,9 +53,10 @@ r2dp_nh_frame_ike_esp(const uint8_t *f, size_t len, uint32_t *sip,
 }
 
 int
-r2dp_nh_learn(struct r2dp_nh_tab *t, uint32_t ip, const uint8_t mac[6])
+r2dp_nh_learn(struct r2dp_nh_tab *t, uint32_t ip, const uint8_t mac[6],
+    uint64_t now)
 {
-	int free_i = -1;
+	int free_i = -1, lru = 0, ret = 1;
 
 	for (int i = 0; i < R2DP_NH_MAX; i++) {
 		struct r2dp_nh *e = &t->e[i];
@@ -64,19 +65,25 @@ r2dp_nh_learn(struct r2dp_nh_tab *t, uint32_t ip, const uint8_t mac[6])
 				free_i = i;
 			continue;
 		}
+		if (e->seen < t->e[lru].seen || !t->e[lru].used)
+			lru = i;
 		if (e->ip != ip)
 			continue;
+		e->seen = now;
 		if (memcmp(e->mac, mac, 6) == 0)
 			return 0;
 		memcpy(e->mac, mac, 6);       /* peer moved: relearn */
 		return 2;
 	}
-	if (free_i < 0)
-		return -1;
+	if (free_i < 0) {
+		free_i = lru;                 /* full: evict least recently seen */
+		ret = 3;
+	}
 	t->e[free_i].ip = ip;
 	memcpy(t->e[free_i].mac, mac, 6);
+	t->e[free_i].seen = now;
 	t->e[free_i].used = 1;
-	return 1;
+	return ret;
 }
 
 const uint8_t *

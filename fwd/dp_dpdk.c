@@ -1303,11 +1303,12 @@ worker_outer(struct dpdk_priv *d, int port)
 			if (r2dp_nh_frame_ike_esp(rte_pktmbuf_mtod(bufs[i],
 			    const uint8_t *), rte_pktmbuf_data_len(bufs[i]),
 			    &sip, &smac) && is_tunnel_peer(d, sip)) {
-				int lr = r2dp_nh_learn(&d->nh, sip, smac);
+				int lr = r2dp_nh_learn(&d->nh, sip, smac,
+				    rte_get_tsc_cycles());
 				if (lr > 0 && d->verbose)
 					fprintf(stderr, "r2dp-fwd: %s next hop for "
 					    "peer %08x: %02x:%02x:%02x:%02x:%02x:%02x\n",
-					    lr == 1 ? "learned" : "relearned", sip,
+					    lr == 2 ? "relearned" : "learned", sip,
 					    smac[0], smac[1], smac[2], smac[3],
 					    smac[4], smac[5]);
 			}
