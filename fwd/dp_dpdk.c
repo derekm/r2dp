@@ -54,6 +54,7 @@
 #include "dp.h"
 #include "ctl.h"
 #include "dp_gcm.h"
+#include "dp_nh.h"
 
 #define MEMPOOL_CACHE 256
 #define MEMPOOL_SIZE  16384
@@ -114,13 +115,11 @@ struct dpdk_priv {
 	struct dp_sp_ent    sp_tab[MAX_SA];
 	int                 verbose;
 	uint64_t            sa_gen;       /* last dp_sa.gen handed out */
-	/* M1 interop: the outer tap is B's NIC toward the peer (A).  The peer's
-	 * L2 and the forwarder's own outer MAC are learned so egress ESP is
-	 * emitted UNICAST to the peer (a broadcast ESP frame is dropped by the
-	 * peer's XFRM stack, which is what broke the interop ping). */
-	uint8_t             peer_mac[6];
+	/* Egress ESP L2: per-peer next hop learned from IKE/ESP sent by a
+	 * configured tunnel peer (dp_nh.c), and our own outer-port MAC.
+	 * Worker-thread only. */
+	struct r2dp_nh_tab  nh;
 	uint8_t             our_mac[6];
-	int                 have_peer;
 
 	char                tap_if[IFNAMSIZ];
 	volatile int        running;
@@ -1214,6 +1213,35 @@ drop:
  * mbufs, and re-scanning bufs[] afterwards re-reads ESP mbufs that
  * esp_inbound() already stripped and freed -- a doble-handling/double-free.
  * Never touch bufs[] again after the single pass below. */
+/* Is `ip` (raw wire order) the far end of a configured tunnel?  Far end =
+ * src of an inbound SA, dst of an outbound SA, or tun_dst/tun_src of a
+ * PROTECT OUT/IN policy (policies exist before IKE completes, so the
+ * initiator can learn from the peer's IKE replies). */
+static int
+is_tunnel_peer(struct dpdk_priv *d, uint32_t ip)
+{
+	for (int i = 0; i < MAX_SA; i++) {
+		const struct dp_sa *ds = &d->sa_tab[i];
+		if (ds->used && (ds->inbound ? ds->srca : ds->dsta) == ip)
+			return 1;
+	}
+	for (int i = 0; i < MAX_SA; i++) {
+		const struct dp_sp_ent *e = &d->sp_tab[i];
+		uint32_t a;
+		if (!e->used || e->sp.action != R2DP_ACT_PROTECT)
+			continue;
+		if (e->sp.dir == R2DP_DIR_OUT)
+			memcpy(&a, &e->sp.tun_dst.addr[0], 4);
+		else if (e->sp.dir == R2DP_DIR_IN)
+			memcpy(&a, &e->sp.tun_src.addr[0], 4);
+		else
+			continue;
+		if (a == ip)
+			return 1;
+	}
+	return 0;
+}
+
 static void
 worker_outer(struct dpdk_priv *d, int port)
 {
@@ -1242,34 +1270,23 @@ worker_outer(struct dpdk_priv *d, int port)
 	}
 	uint16_t nesp = 0, nex = 0;
 	for (uint16_t i = 0; i < nr; i++) {
-		/* M1 interop: LEARN the L2 pair from the first inbound frame on
-		 * the outer tap (ESP *or* IKE -- A's IKE response reaches the
-		 * forwarder before the SA is up, so in the r2dp-initiator
-		 * direction we must not wait for inbound ESP or the egress path
-		 * stays in the broadcast fallback and A's XFRM drops it).
-		 *   dst = this outer tap's own MAC (when unicast)
-		 *   src = the peer (A) MAC the egress ESP must be unicast to. */
-		if (!d->have_peer && rte_pktmbuf_pkt_len(bufs[i]) >=
-		    RTE_ETHER_HDR_LEN) {
-			struct rte_ether_hdr *eh = rte_pktmbuf_mtod(bufs[i],
-			    struct rte_ether_hdr *);
-			/* Only learn from a UNICAST frame.  Multicast/broadcast
-			 * frames (IPv6 MLD 33:33:xx, ARP broadcast, etc.) would
-			 * poison peer_mac/our_mac with a group address and the
-			 * egress ESP would be addressed to nobody.  A's real
-			 * IKE/ESP is unicast to our outer MAC, so wait for one. */
-			if ((eh->dst_addr.addr_bytes[0] & 0x01) == 0) {
-				memcpy(d->peer_mac, eh->src_addr.addr_bytes, 6);
-				memcpy(d->our_mac, eh->dst_addr.addr_bytes, 6);
-				d->have_peer = 1;
-				if (d->verbose)
-					fprintf(stderr, "r2dp-fwd: learned peer MAC "
-					    "%02x:%02x:%02x:%02x:%02x:%02x via our "
-					    "%02x:%02x:%02x:%02x:%02x:%02x\n",
-					    d->peer_mac[0], d->peer_mac[1], d->peer_mac[2],
-					    d->peer_mac[3], d->peer_mac[4], d->peer_mac[5],
-					    d->our_mac[0], d->our_mac[1], d->our_mac[2],
-					    d->our_mac[3], d->our_mac[4], d->our_mac[5]);
+		/* Learn the peer's MAC (keyed by its IP) only from unicast
+		 * IKE/ESP whose source is a configured tunnel peer, so an
+		 * arbitrary host on the segment cannot capture egress ESP;
+		 * relearn when the peer's MAC changes (N1). */
+		{
+			uint32_t sip;
+			const uint8_t *smac;
+			if (r2dp_nh_frame_ike_esp(rte_pktmbuf_mtod(bufs[i],
+			    const uint8_t *), rte_pktmbuf_data_len(bufs[i]),
+			    &sip, &smac) && is_tunnel_peer(d, sip)) {
+				int lr = r2dp_nh_learn(&d->nh, sip, smac);
+				if (lr > 0 && d->verbose)
+					fprintf(stderr, "r2dp-fwd: %s next hop for "
+					    "peer %08x: %02x:%02x:%02x:%02x:%02x:%02x\n",
+					    lr == 1 ? "learned" : "relearned", sip,
+					    smac[0], smac[1], smac[2], smac[3],
+					    smac[4], smac[5]);
 			}
 		}
 		if (is_esp(bufs[i]) || is_nat_esp(d, bufs[i])) {
@@ -1413,17 +1430,24 @@ worker_inner(struct dpdk_priv *d, int port)
 			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
 			if (!h) { rte_pktmbuf_free(esp_out[i]); continue; }
 			eh = rte_pktmbuf_mtod(esp_out[i], struct rte_ether_hdr *);
-			/* M1 interop: egress ESP must be UNICAST to the peer
-			 * (the learned MAC from inbound ESP) or the peer's
-			 * XFRM stack drops a broadcast ESP frame.  Fall back
-			 * to broadcast until the MAC is learned (first
-			 * inbound ESP rekeys a peer-less sa -> safe). */
-			if (d->have_peer) {
-				memcpy(eh->dst_addr.addr_bytes, d->peer_mac, 6);
+			/* Egress ESP is unicast to the tunnel peer's learned
+			 * next hop (keyed by the outer destination IP).  With
+			 * no learned MAC, drop: broadcasting ESP would spray it
+			 * to every host on the segment (N2). */
+			{
+				const struct rte_ipv4_hdr *oip =
+				    (const struct rte_ipv4_hdr *)(eh + 1);
+				uint32_t odst;
+				const uint8_t *nmac;
+				memcpy(&odst, &oip->dst_addr, 4);
+				nmac = r2dp_nh_lookup(&d->nh, odst);
+				if (nmac == NULL) {
+					d->n_drop++;
+					rte_pktmbuf_free(esp_out[i]);
+					continue;
+				}
+				memcpy(eh->dst_addr.addr_bytes, nmac, 6);
 				memcpy(eh->src_addr.addr_bytes, d->our_mac, 6);
-			} else {
-				memset(eh->dst_addr.addr_bytes, 0xff, 6);
-				memset(eh->src_addr.addr_bytes, 0x00, 6);
 			}
 			eh->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 			esp_out[i]->l2_len = RTE_ETHER_HDR_LEN;
@@ -1483,6 +1507,11 @@ worker_main(void *arg)
 	    rte_lcore_id(), port, d->inner_port);
 	/* H5: register this worker as a QSBR reader so ctl can synchronize
 	 * before freeing SA/SP memory.  tid = its lcore id (< RTE_MAX_LCORE). */
+	{
+		struct rte_ether_addr ea;
+		if (rte_eth_macaddr_get(port, &ea) == 0)
+			memcpy(d->our_mac, ea.addr_bytes, 6);
+	}
 	if (d->rcu) {
 		rte_rcu_qsbr_thread_register(d->rcu, d->worker_lcore);
 		rte_rcu_qsbr_thread_online(d->rcu, d->worker_lcore);

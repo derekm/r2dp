@@ -45,7 +45,7 @@ if dpdk.found()
   # dp_sa: production dp_dpdk.c SA table under ASan/UBSan -- C1 (no
   # sa_tab[-1] write on a fresh inbound install) and newest-SA egress pick.
   test('dp_sa',
-    executable('dp_sa', 'dp_sa.c', '../fwd/dp_gcm.c',
+    executable('dp_sa', 'dp_sa.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c',
       include_directories: [include_directories('../include'),
                             include_directories('../fwd')],
       dependencies: dpdk,
@@ -62,3 +62,9 @@ test('ctl_poll',
     link_with: libr2dp),
   args: r2dp_fwd.full_path(),
   is_parallel: false, timeout: 60)
+
+# nh_test: egress next-hop table (fwd/dp_nh.c, no DPDK needed).
+test('nh_test',
+  executable('nh_test', 'nh_test.c', '../fwd/dp_nh.c',
+    include_directories: include_directories('../fwd')),
+  is_parallel: false)
