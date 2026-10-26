@@ -52,6 +52,18 @@ if dpdk.found()
       link_with: libr2dp,
       c_args: ['-DR2DP_HAVE_DPDK=1']),
     is_parallel: false, timeout: 60)
+
+  # dp_path: outbound encrypt -> inbound decrypt through the production
+  # data path, with policy dispositions (CI data-path coverage).
+  test('dp_path',
+    executable('dp_path', 'dp_path.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c',
+      '../fwd/dp_sel.c',
+      include_directories: [include_directories('../include'),
+                            include_directories('../fwd')],
+      dependencies: dpdk,
+      link_with: libr2dp,
+      c_args: ['-DR2DP_HAVE_DPDK=1']),
+    is_parallel: false, timeout: 60)
 endif
 
 # ctl_poll: regression for the accept/poll desync in fwd_ctl_run (0bb71e1):
