@@ -290,7 +290,7 @@ sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds)
 		rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
 	}
 	if (d->rcu)
-		rte_rcu_qsbr_synchronize(d->rcu, d->worker_lcore);
+		rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
 	sa_slot_free(d, ds);
 }
 
