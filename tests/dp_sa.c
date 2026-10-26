@@ -69,12 +69,97 @@ mk_sa(struct r2dp_sa *r, uint32_t spi, const char *src, const char *dst)
 	inet_pton(AF_INET, dst, r->dst.addr);
 }
 
+/* --- M4: concurrent policy replace vs. a QSBR-registered reader --- */
+static volatile int rd_stop;
+static unsigned long rd_iters, rd_torn;
+
+static void
+fill_sp(struct r2dp_sp *sp, uint32_t slid, uint8_t k)
+{
+	memset(sp, 0, sizeof(*sp));
+	sp->slid = slid;
+	sp->dir = R2DP_DIR_OUT; sp->action = R2DP_ACT_PROTECT;
+	memset(sp->tag, k, sizeof(sp->tag));
+	sp->sel_src.family = sp->sel_dst.family = R2DP_AF_INET4;
+	memset(sp->sel_src.addr, k, 4);
+	memset(sp->sel_dst.addr, k, 4);
+	sp->pref_src = sp->pref_dst = k % 33;
+}
+
+static int
+reader(void *arg)
+{
+	struct dpdk_priv *d = arg;
+
+	rte_rcu_qsbr_thread_register(d->rcu, d->worker_lcore);
+	rte_rcu_qsbr_thread_online(d->rcu, d->worker_lcore);
+	while (!rd_stop) {
+		for (int i = 0; i < 8; i++) {
+			const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
+			uint8_t k;
+			if (!sp)
+				continue;
+			k = sp->tag[0];
+			/* every byte of a published policy must be consistent */
+			for (unsigned j = 0; j < sizeof(sp->tag); j++)
+				if ((uint8_t)sp->tag[j] != k) rd_torn++;
+			if (sp->sel_src.addr[3] != k || sp->sel_dst.addr[0] != k ||
+			    sp->pref_src != k % 33)
+				rd_torn++;
+		}
+		rd_iters++;
+		rte_rcu_qsbr_quiescent(d->rcu, d->worker_lcore);
+	}
+	rte_rcu_qsbr_thread_offline(d->rcu, d->worker_lcore);
+	rte_rcu_qsbr_thread_unregister(d->rcu, d->worker_lcore);
+	return 0;
+}
+
+static void
+t_sp_concurrency(struct dpdk_priv *d)
+{
+	struct fwd_dp dp = { .priv = d };
+	struct r2dp_sp sp;
+	unsigned lc = rte_get_next_lcore(-1, 1, 0);   /* first worker lcore */
+	size_t rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
+
+	if (lc >= RTE_MAX_LCORE) { CHECK(0, "need a worker lcore (-l 0-1)"); return; }
+	d->worker_lcore = lc;      /* same tid convention as dpd_start */
+	d->rcu = rte_zmalloc("t_rcu", rsz, RTE_CACHE_LINE_SIZE);
+	if (!d->rcu) { CHECK(0, "rcu alloc"); return; }
+	rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
+	rd_stop = 0;
+	/* run the reader on a real EAL worker lcore, like worker_main */
+	rte_eal_remote_launch(reader, d, lc);
+	while (!__atomic_load_n(&rd_iters, __ATOMIC_RELAXED))
+		;                       /* reader online before churn */
+	for (unsigned n = 0; n < 5000; n++) {
+		uint32_t slid = 1 + n % 4;
+		fill_sp(&sp, slid, (uint8_t)(n & 0xff));
+		if (n % 7 == 6)
+			dpd_sp_del(&dp, &sp);
+		else
+			dpd_sp_add(&dp, &sp);
+	}
+	rd_stop = 1;
+	rte_eal_wait_lcore(lc);
+	CHECK(rd_iters > 0, "reader ran concurrently with policy churn");
+	CHECK(rd_torn == 0, "no torn policy reads under concurrent replace/delete");
+	for (int i = 0; i < MAX_SA; i++)
+		if (d->sp_tab[i].sp) {
+			free(d->sp_tab[i].sp);
+			d->sp_tab[i].sp = NULL;
+		}
+	rte_free(d->rcu);
+	d->rcu = NULL;
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	char *ea[] = { "dp_sa", "--no-huge", "--no-pci", "-m", "256",
-	    "--vdev=crypto_openssl0", "--log-level=1", NULL };
+	    "--vdev=crypto_openssl0", "--log-level=1", "-l", "0-1", NULL };
 	struct dpdk_priv *d;
 	struct r2dp_sa r;
 	struct r2dp_sp sp;
@@ -84,7 +169,7 @@ main(void)
 	const union rte_ipsec_sad_key *kp[1] = { &k };
 	void *val[1];
 
-	if (rte_eal_init(7, ea) < 0 || (d = mk_priv()) == NULL) {
+	if (rte_eal_init(9, ea) < 0 || (d = mk_priv()) == NULL) {
 		if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
 		puts("SKIP: EAL/crypto_openssl"); return 77;
 	}
@@ -151,6 +236,8 @@ main(void)
 		pick = sa_by_policy(d, &sp);
 		CHECK(pick && pick->spi == 0x2002, "egress picks newest SA (reqid 0)");
 	}
+
+	t_sp_concurrency(d);
 
 	/* teardown: free every session (no leaks under LSan) */
 	for (int i = 0; i < MAX_SA; i++)

@@ -94,9 +94,26 @@ struct dp_sa {
  * dpd_sp_del so worker_inner can select a policy without touching ctl.  M1:
  * linear, exact/prefix selector match on (dir=OUT, sel_src/sel_dst, proto). */
 struct dp_sp_ent {
-	uint8_t  used;
-	struct r2dp_sp sp;
+	/* Immutable policy copy, published with a release store and read by
+	 * the worker with an acquire load (sp_load).  Replaced/removed by
+	 * swapping the pointer, waiting a QSBR grace period, then freeing the
+	 * old copy, so the worker never sees a torn or freed policy (M4). */
+	struct r2dp_sp *sp;
 };
+
+/* Worker-side accessors: acquire pairs with the ctl-side release publish. */
+static inline const struct r2dp_sp *
+sp_load(const struct dp_sp_ent *e)
+{
+	return __atomic_load_n(&e->sp, __ATOMIC_ACQUIRE);
+}
+
+/* An SA slot is visible to the worker only after its release publish. */
+static inline int
+sa_live(const struct dp_sa *ds)
+{
+	return __atomic_load_n(&ds->used, __ATOMIC_ACQUIRE);
+}
 
 struct dpdk_priv {
 	int                 port_id;      /* outer tap (ESP side) */
@@ -138,8 +155,8 @@ sa_bytes_add(struct dpdk_priv *d, struct rte_ipsec_session *ss, uint64_t n)
 	struct dp_sa *ds = (struct dp_sa *)((uint8_t *)ss - off);
 	/* sanity: the recovered pointer must land inside sa_tab */
 	uintptr_t base = (uintptr_t)d->sa_tab, end = base + sizeof(d->sa_tab);
-	if ((uintptr_t)ds >= base && (uintptr_t)ds < end && ds->used)
-		ds->bytes += n;
+	if ((uintptr_t)ds >= base && (uintptr_t)ds < end && sa_live(ds))
+		__atomic_fetch_add(&ds->bytes, n, __ATOMIC_RELAXED);
 }
 
 /* ------------------------------------------------------------------ */
@@ -282,7 +299,7 @@ sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds)
 	union rte_ipsec_sad_key keyv;
 	int inbound = ds->inbound;
 
-	ds->used = 0;             /* unlink from worker lookups */
+	__atomic_store_n(&ds->used, 0, __ATOMIC_RELEASE); /* unlink from worker */
 	if (inbound) {
 		memset(&keyv, 0, sizeof(keyv));
 		keyv.v4.spi = ds->spi;
@@ -357,6 +374,9 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 			rte_spinlock_unlock(&d->lock);
 			return ret;
 		}
+		/* dp_sa_init marks scratch used; publish only after every
+		 * field below is written (release store), never via this copy */
+		scratch.used = 0;
 		d->sa_tab[newidx] = scratch;
 	}
 	d->sa_tab[newidx].spi = ntohl(rsa->spi);
@@ -367,7 +387,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	d->sa_tab[newidx].natt = rsa->natt_type;
 	d->sa_tab[newidx].gen = ++d->sa_gen;
 	/* publish last: the worker only proceeds past `used` == 1 */
-	d->sa_tab[newidx].used = 1;
+	__atomic_store_n(&d->sa_tab[newidx].used, 1, __ATOMIC_RELEASE);
 
 	/* tear down the old same-SPI session (now that a replacement exists) */
 	if (idx >= 0)
@@ -424,20 +444,35 @@ static int
 dpd_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 {
 	struct dpdk_priv *d = dp->priv;
+	struct r2dp_sp *nsp, *old;
 	int slot = -1;
 
 	if (!sp->slid)
 		return -EINVAL;
+	nsp = malloc(sizeof(*nsp));
+	if (!nsp)
+		return -ENOMEM;
+	*nsp = *sp;                 /* fully built before it is published */
 	rte_spinlock_lock(&d->lock);
 	for (int i = 0; i < MAX_SA; i++) {
-		if (d->sp_tab[i].used) {
-			if (d->sp_tab[i].sp.slid == sp->slid) { slot = i; break; }
+		if (d->sp_tab[i].sp) {
+			if (d->sp_tab[i].sp->slid == sp->slid) { slot = i; break; }
 		} else if (slot < 0)
 			slot = i;
 	}
-	if (slot < 0) { rte_spinlock_unlock(&d->lock); return -ENOSPC; }
-	d->sp_tab[slot].used = 1;
-	d->sp_tab[slot].sp = *sp;   /* keep a copy for egress selector lookup */
+	if (slot < 0) {
+		rte_spinlock_unlock(&d->lock);
+		free(nsp);
+		return -ENOSPC;
+	}
+	old = d->sp_tab[slot].sp;
+	__atomic_store_n(&d->sp_tab[slot].sp, nsp, __ATOMIC_RELEASE);
+	if (old) {
+		/* the worker may still hold `old` from this iteration */
+		if (d->rcu)
+			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+		free(old);
+	}
 	rte_spinlock_unlock(&d->lock);
 	return 0;
 }
@@ -446,13 +481,20 @@ static int
 dpd_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 {
 	struct dpdk_priv *d = dp->priv;
+	struct r2dp_sp *old = NULL;
 
 	rte_spinlock_lock(&d->lock);
 	for (int i = 0; i < MAX_SA; i++) {
-		if (d->sp_tab[i].used && d->sp_tab[i].sp.slid == sp->slid) {
-			d->sp_tab[i].used = 0;
+		if (d->sp_tab[i].sp && d->sp_tab[i].sp->slid == sp->slid) {
+			old = d->sp_tab[i].sp;
+			__atomic_store_n(&d->sp_tab[i].sp, NULL, __ATOMIC_RELEASE);
 			break;
 		}
+	}
+	if (old) {
+		if (d->rcu)
+			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+		free(old);
 	}
 	rte_spinlock_unlock(&d->lock);
 	return 0;
@@ -469,7 +511,8 @@ dpd_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 	for (int i = 0; i < MAX_SA; i++)
 		if (d->sa_tab[i].used && d->sa_tab[i].spi == spi &&
 		    d->sa_tab[i].dip == dip) {
-			v = (int64_t)d->sa_tab[i].bytes;
+			v = (int64_t)__atomic_load_n(&d->sa_tab[i].bytes,
+			    __ATOMIC_RELAXED);
 			break;
 		}
 	rte_spinlock_unlock(&d->lock);
@@ -842,7 +885,7 @@ is_nat_esp(struct dpdk_priv *d, struct rte_mbuf *mb)
 	/* is (SPI, outer-dst) an installed inbound SA?  Try each sa_tab entry. */
 	for (i = 0; i < MAX_SA; i++) {
 		const struct dp_sa *ds = &d->sa_tab[i];
-		if (!ds->used || !ds->inbound)
+		if (!sa_live(ds) || !ds->inbound)
 			continue;
 		if (ds->spi != ntohl(es->spi) || ds->dip != ip->dst_addr)
 			continue;
@@ -962,12 +1005,10 @@ in_inner_ok(struct dpdk_priv *d, uint32_t dip, struct rte_mbuf *mb)
 		rte_pktmbuf_trim(mb, cur - iplen);
 
 	for (int i = 0; i < MAX_SA; i++) {
-		const struct dp_sp_ent *e = &d->sp_tab[i];
-		const struct r2dp_sp *sp;
+		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
 		uint32_t td;
-		if (!e->used)
+		if (!sp)
 			continue;
-		sp = &e->sp;
 		if (sp->dir != R2DP_DIR_IN || sp->action != R2DP_ACT_PROTECT)
 			continue;
 		memcpy(&td, &sp->tun_dst.addr[0], 4);
@@ -1002,7 +1043,7 @@ sa_by_policy(struct dpdk_priv *d, const struct r2dp_sp *sp)
 	memcpy(&td, &sp->tun_dst.addr[0], 4);
 	for (i = 0; i < MAX_SA; i++) {
 		struct dp_sa *ds = &d->sa_tab[i];
-		if (!ds->used || ds->inbound)
+		if (!sa_live(ds) || ds->inbound)
 			continue;
 		if (ds->srca != ts || ds->dsta != td)
 			continue;
@@ -1028,11 +1069,9 @@ sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip,
 	int bestpref = -1;
 
 	for (int i = 0; i < MAX_SA; i++) {
-		const struct dp_sp_ent *e = &d->sp_tab[i];
-		const struct r2dp_sp *sp;
-		if (!e->used)
+		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
+		if (!sp)
 			continue;
-		sp = &e->sp;
 		if (sp->dir != R2DP_DIR_OUT)
 			continue;
 		/* match any action so DISCARD/BYPASS policies can override a
@@ -1139,7 +1178,8 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		rte_crypto_op_free(cop);
 		if (proc == 1 && out && no < BURST_SZ) {
 			/* byte-lifetime: count the crypted bytes on this egress SA */
-			ds->bytes += rte_pktmbuf_pkt_len(bufs[i]);
+			__atomic_fetch_add(&ds->bytes,
+			    rte_pktmbuf_pkt_len(bufs[i]), __ATOMIC_RELAXED);
 			struct rte_ipv4_hdr *oip =
 			    rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
 			/* NAT-T egress: insert UDP(8)+marker(4) after the outer IP
@@ -1222,18 +1262,18 @@ is_tunnel_peer(struct dpdk_priv *d, uint32_t ip)
 {
 	for (int i = 0; i < MAX_SA; i++) {
 		const struct dp_sa *ds = &d->sa_tab[i];
-		if (ds->used && (ds->inbound ? ds->srca : ds->dsta) == ip)
+		if (sa_live(ds) && (ds->inbound ? ds->srca : ds->dsta) == ip)
 			return 1;
 	}
 	for (int i = 0; i < MAX_SA; i++) {
-		const struct dp_sp_ent *e = &d->sp_tab[i];
+		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
 		uint32_t a;
-		if (!e->used || e->sp.action != R2DP_ACT_PROTECT)
+		if (!sp || sp->action != R2DP_ACT_PROTECT)
 			continue;
-		if (e->sp.dir == R2DP_DIR_OUT)
-			memcpy(&a, &e->sp.tun_dst.addr[0], 4);
-		else if (e->sp.dir == R2DP_DIR_IN)
-			memcpy(&a, &e->sp.tun_src.addr[0], 4);
+		if (sp->dir == R2DP_DIR_OUT)
+			memcpy(&a, &sp->tun_dst.addr[0], 4);
+		else if (sp->dir == R2DP_DIR_IN)
+			memcpy(&a, &sp->tun_src.addr[0], 4);
 		else
 			continue;
 		if (a == ip)
