@@ -154,6 +154,68 @@ t_sp_concurrency(struct dpdk_priv *d)
 	d->rcu = NULL;
 }
 
+/* --- M5: inbound check is tied to the SA's own policies, default deny --- */
+static size_t
+ipkt(uint8_t *p, const char *src, const char *dst)
+{
+	memset(p, 0, 40);
+	p[0] = 0x45; p[9] = 1;
+	inet_pton(AF_INET, src, p + 12);
+	inet_pton(AF_INET, dst, p + 16);
+	return 40;
+}
+
+static void
+add_in_sp(struct dpdk_priv *d, uint32_t slid, const char *peer,
+    const char *ssel, const char *dsel)
+{
+	struct fwd_dp dp = { .priv = d };
+	struct r2dp_sp sp;
+
+	memset(&sp, 0, sizeof(sp));
+	sp.slid = slid; sp.dir = R2DP_DIR_IN; sp.action = R2DP_ACT_PROTECT;
+	sp.ul_proto = R2DP_PROTO_ANY;
+	sp.sel_src.family = sp.sel_dst.family = R2DP_AF_INET4;
+	inet_pton(AF_INET, ssel, sp.sel_src.addr); sp.pref_src = 24;
+	inet_pton(AF_INET, dsel, sp.sel_dst.addr); sp.pref_dst = 24;
+	sp.tun_src.family = sp.tun_dst.family = R2DP_AF_INET4;
+	inet_pton(AF_INET, peer, sp.tun_src.addr);
+	inet_pton(AF_INET, "192.0.2.1", sp.tun_dst.addr);
+	dpd_sp_add(&dp, &sp);
+}
+
+static void
+t_inbound_policy(struct dpdk_priv *d)
+{
+	struct dp_sa a, b;
+	uint8_t p[40];
+
+	memset(&a, 0, sizeof(a)); memset(&b, 0, sizeof(b));
+	inet_pton(AF_INET, "192.0.2.2", &a.srca);    /* peer A */
+	inet_pton(AF_INET, "192.0.2.3", &b.srca);    /* peer B */
+	inet_pton(AF_INET, "192.0.2.1", &a.dsta);
+	inet_pton(AF_INET, "192.0.2.1", &b.dsta);
+
+	ipkt(p, "10.0.2.5", "10.0.1.5");
+	CHECK(!inbound_policy_ok(d, &a, p, 40),
+	    "no IN policy for the SA -> drop (default deny)");
+
+	add_in_sp(d, 101, "192.0.2.2", "10.0.2.0", "10.0.1.0");  /* A: 10.0.2/24 */
+	add_in_sp(d, 102, "192.0.2.3", "10.0.3.0", "10.0.1.0");  /* B: 10.0.3/24 */
+
+	ipkt(p, "10.0.2.5", "10.0.1.5");
+	CHECK(inbound_policy_ok(d, &a, p, 40), "A's traffic under A's SA accepted");
+	CHECK(!inbound_policy_ok(d, &b, p, 40),
+	    "A's selectors under B's SA rejected (no cross-tunnel injection)");
+	ipkt(p, "10.0.3.5", "10.0.1.5");
+	CHECK(inbound_policy_ok(d, &b, p, 40),
+	    "B's traffic under B's SA accepted (not judged by A's policy)");
+	CHECK(!inbound_policy_ok(d, &a, p, 40), "B's selectors under A's SA rejected");
+
+	for (int i = 0; i < MAX_SA; i++)
+		if (d->sp_tab[i].sp) { free(d->sp_tab[i].sp); d->sp_tab[i].sp = NULL; }
+}
+
 int
 main(void)
 {
@@ -238,6 +300,7 @@ main(void)
 	}
 
 	t_sp_concurrency(d);
+	t_inbound_policy(d);
 
 	/* teardown: free every session (no leaks under LSan) */
 	for (int i = 0; i < MAX_SA; i++)

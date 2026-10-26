@@ -45,7 +45,7 @@ if dpdk.found()
   # dp_sa: production dp_dpdk.c SA table under ASan/UBSan -- C1 (no
   # sa_tab[-1] write on a fresh inbound install) and newest-SA egress pick.
   test('dp_sa',
-    executable('dp_sa', 'dp_sa.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c',
+    executable('dp_sa', 'dp_sa.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c', '../fwd/dp_sel.c',
       include_directories: [include_directories('../include'),
                             include_directories('../fwd')],
       dependencies: dpdk,
@@ -75,4 +75,11 @@ test('ctl_unit',
     include_directories: [include_directories('../include'),
                           include_directories('../fwd')],
     link_with: libr2dp),
+  is_parallel: false)
+
+# sel_test: selector matching incl. ports (fwd/dp_sel.c, no DPDK needed).
+test('sel_test',
+  executable('sel_test', 'sel_test.c', '../fwd/dp_sel.c',
+    include_directories: [include_directories('../include'),
+                          include_directories('../fwd')]),
   is_parallel: false)

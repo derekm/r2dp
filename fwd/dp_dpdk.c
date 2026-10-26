@@ -55,6 +55,7 @@
 #include "ctl.h"
 #include "dp_gcm.h"
 #include "dp_nh.h"
+#include "dp_sel.h"
 
 #define MEMPOOL_CACHE 256
 #define MEMPOOL_SIZE  16384
@@ -564,7 +565,8 @@ port_init(struct dpdk_priv *d, uint16_t port)
  * enqueue/dequeue round per matched packet on the same lcore.  Decrypted
  * inner packets are written into `out` (up to *nout); unmatched/undecryptable
  * packets are freed.  Returns the number of mbufs consumed from `in`. */
-static int in_inner_ok(struct dpdk_priv *d, uint32_t dip, struct rte_mbuf *mb);
+static int in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
+    struct rte_mbuf *mb);
 static uint16_t
 esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout)
@@ -719,10 +721,6 @@ bad:
 
 	/* per matched packet: prepare -> enqueue -> dequeue -> process */
 	struct rte_crypto_op *cop[1];
-	/* DIP each packet was keyed/looked-up under, for the IN-selector check */
-	uint32_t p_dip[BURST_SZ];
-	for (uint32_t i = 0; i < nk; i++)
-		p_dip[i] = kkey[i].v4.dip;
 	for (uint32_t i = 0; i < nk; i++) {
 		if (sas[i] == NULL) {
 			if (d->verbose)
@@ -812,7 +810,7 @@ bad:
 			 * selector check and trim to the inner IP length; drop on
 			 * mismatch/spoof. */
 			if (proc == 1 && out && no < BURST_SZ &&
-			    in_inner_ok(d, p_dip[i], pm[i])) {
+			    in_inner_ok(d, ss, pm[i])) {
 				/* byte-lifetime: count what was crypted on this SA */
 				sa_bytes_add(d, ss,
 				    rte_pktmbuf_pkt_len(pm[i]));
@@ -945,51 +943,57 @@ is_ike_arp(struct rte_mbuf *mb)
 	return dport == 500 || dport == 4500;
 }
 
-/* Match addr bytes against a deprecated-free selector prefix (pref 0..32). */
-static int
-sel_match(const struct r2dp_addr *sel, uint8_t pref, const uint8_t *ip)
+/* Recover the dp_sa owning an ipsec session handed back by the SAD. */
+static inline struct dp_sa *
+sa_of_sess(struct dpdk_priv *d, struct rte_ipsec_session *ss)
 {
-	int nbytes;
+	struct dp_sa *ds = (struct dp_sa *)((uint8_t *)ss -
+	    offsetof(struct dp_sa, sess));
+	uintptr_t base = (uintptr_t)d->sa_tab, end = base + sizeof(d->sa_tab);
 
-	if (sel->family != R2DP_AF_INET4)
-		return 0;
-	if (sel->port)
-		return 0;   /* M1: IP-level tunnel policies carry no port */
-	nbytes = pref / 8;
-	if (pref % 8)
-		nbytes++;          /* cover the partial last byte */
-	if (nbytes > 4) nbytes = 4;
-	for (int i = 0; i + 1 < nbytes; i++)
-		if (sel->addr[i] != ip[i])
-			return 0;
-	if (nbytes > 0) {
-		if (pref % 8) {
-			uint8_t hi = (uint8_t)(pref % 8);
-			if ((sel->addr[nbytes - 1] >> (8 - hi)) !=
-			    (ip[nbytes - 1] >> (8 - hi)))
-				return 0;
-		} else if (sel->addr[nbytes - 1] != ip[nbytes - 1])
-			return 0;
-	}
-	return 1;
+	return ((uintptr_t)ds >= base && (uintptr_t)ds < end) ? ds : NULL;
 }
 
-/* D8 (RFC 4301 s5.2): verify a decrypted inner packet against the IN policy
- * for the tunnel it arrived under.  Find the IN-PROTECT SP whose tunnel dest
- * is `dip`; its sel_src/sel_dst say which inner addresses the peer may claim.
- * If no IN policy is installed for this tunnel the packet is accepted (a peer
- * we accepted an SA from is at least past the ESP ICV); if one exists, the
- * inner src/dst must match its selector or we drop (a peer with a valid SA
- * must not be able to inject arbitrary inner addresses).  Also trims the
- * inner packet to IP total_length (no Ethernet padding smuggled into ESP). */
+/* RFC 4301 s5.2 inbound check, tied to the SA the packet decrypted under.
+ * The SA's IN (or FWD) PROTECT policies are those whose tunnel endpoints
+ * are this SA's (tun_src = SA src = peer, tun_dst = SA dst = us) and, when
+ * both carry a nonzero reqid, whose reqid matches.  The inner packet must
+ * match one of them; a peer with a valid SA must not inject traffic for
+ * another tunnel's selectors.  No policy for this SA => drop (default
+ * deny).  Returns 1 to accept. */
 static int
-in_inner_ok(struct dpdk_priv *d, uint32_t dip, struct rte_mbuf *mb)
+inbound_policy_ok(struct dpdk_priv *d, const struct dp_sa *ds,
+    const uint8_t *ip, size_t avail)
+{
+	for (int i = 0; i < MAX_SA; i++) {
+		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
+		uint32_t ts, td;
+		if (!sp || sp->action != R2DP_ACT_PROTECT ||
+		    (sp->dir != R2DP_DIR_IN && sp->dir != R2DP_DIR_FWD))
+			continue;
+		memcpy(&ts, &sp->tun_src.addr[0], 4);
+		memcpy(&td, &sp->tun_dst.addr[0], 4);
+		if (ts != ds->srca || td != ds->dsta)
+			continue;
+		if (sp->reqid && ds->reqid && sp->reqid != ds->reqid)
+			continue;
+		if (r2dp_sel_match(sp, ip, avail))
+			return 1;
+	}
+	return 0;
+}
+
+/* Validate + trim a decrypted inner packet and apply inbound_policy_ok. */
+static int
+in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
+    struct rte_mbuf *mb)
 {
 	struct rte_ipv4_hdr *ip;
+	struct dp_sa *ds = sa_of_sess(d, ss);
 	uint8_t ihl;
 	uint16_t iplen, cur;
 
-	if (rte_pktmbuf_pkt_len(mb) < sizeof(struct rte_ipv4_hdr))
+	if (ds == NULL || rte_pktmbuf_pkt_len(mb) < sizeof(struct rte_ipv4_hdr))
 		return 0;
 	ip = rte_pktmbuf_mtod(mb, struct rte_ipv4_hdr *);
 	if ((ip->version_ihl >> 4) != 4)
@@ -1003,27 +1007,8 @@ in_inner_ok(struct dpdk_priv *d, uint32_t dip, struct rte_mbuf *mb)
 	cur = rte_pktmbuf_pkt_len(mb);
 	if (iplen < cur)
 		rte_pktmbuf_trim(mb, cur - iplen);
-
-	for (int i = 0; i < MAX_SA; i++) {
-		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
-		uint32_t td;
-		if (!sp)
-			continue;
-		if (sp->dir != R2DP_DIR_IN || sp->action != R2DP_ACT_PROTECT)
-			continue;
-		memcpy(&td, &sp->tun_dst.addr[0], 4);
-		if (td != dip)
-			continue;   /* not the tunnel this packet came in on */
-		/* this tunnel's IN policy: inner src/dst must match its selector */
-		if (!sel_match(&sp->sel_src, sp->pref_src,
-		    (const uint8_t *)(&ip->src_addr)))
-			return 0;
-		if (!sel_match(&sp->sel_dst, sp->pref_dst,
-		    (const uint8_t *)(&ip->dst_addr)))
-			return 0;
-		return 1;
-	}
-	return 1;   /* no IN policy installed for this tunnel: accept */
+	return inbound_policy_ok(d, ds, (const uint8_t *)ip,
+	    rte_pktmbuf_data_len(mb));
 }
 
 /* Find the EGRESS SA for this OUT policy.  racoon2 sends reqid=0 for every
@@ -1062,32 +1047,26 @@ sa_by_policy(struct dpdk_priv *d, const struct r2dp_sp *sp)
 /* Find the OUT policy that (longest-prefix) matches this inner IPv4 packet.
  * Returns the matched sp (or NULL); sets *sa to the reqid-linked EGRESS SA. */
 static const struct r2dp_sp *
-sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip,
+sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip, size_t avail,
     struct dp_sa **sa)
 {
 	const struct r2dp_sp *best = NULL;
-	int bestpref = -1;
+	int bestscore = -1;
 
 	for (int i = 0; i < MAX_SA; i++) {
 		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
-		if (!sp)
-			continue;
-		if (sp->dir != R2DP_DIR_OUT)
+		int sc;
+		if (!sp || sp->dir != R2DP_DIR_OUT)
 			continue;
 		/* match any action so DISCARD/BYPASS policies can override a
-		 * PROTECT (M6); esp_outbound then enforces the disposition */
-		if (sp->ul_proto != R2DP_PROTO_ANY &&
-		    sp->ul_proto != ip->next_proto_id)
+		 * PROTECT (M6); esp_outbound then enforces the disposition.
+		 * Port selectors are honoured (M5): a port-specific policy is
+		 * never silently skipped in favour of a broader one. */
+		if (!r2dp_sel_match(sp, (const uint8_t *)ip, avail))
 			continue;
-		if (!sel_match(&sp->sel_src, sp->pref_src,
-		    (const uint8_t *)&ip->src_addr))
-			continue;
-		if (!sel_match(&sp->sel_dst, sp->pref_dst,
-		    (const uint8_t *)&ip->dst_addr))
-			continue;
-		/* prefer the most specific policy for this flow */
-		if ((int)(sp->pref_src + sp->pref_dst) > bestpref) {
-			bestpref = sp->pref_src + sp->pref_dst;
+		sc = r2dp_sel_score(sp);
+		if (sc > bestscore) {
+			bestscore = sc;
 			best = sp;
 		}
 	}
@@ -1124,7 +1103,8 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		ip = (struct rte_ipv4_hdr *)((uint8_t *)
 		    rte_pktmbuf_mtod(bufs[i], uint8_t *) + RTE_ETHER_HDR_LEN);
 		if ((ip->version_ihl >> 4) != 4) { nb++; continue; }
-		sp = sp_match_out(d, ip, &ds);
+		sp = sp_match_out(d, ip, rte_pktmbuf_data_len(bufs[i]) -
+		    RTE_ETHER_HDR_LEN, &ds);
 		if (!sp) { nb++; continue; }   /* no matching OUT policy: bypass */
 
 		/* A matched policy decides the disposition (H2, RFC 4301 5.1):
