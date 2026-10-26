@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -156,10 +157,20 @@ r2dp_send(int fd, uint16_t type, uint32_t seq, int status, uint32_t flags,
 		memcpy(buf + sizeof(h), body, blen);
 	if (tlen)
 		memcpy(buf + sizeof(h) + blen, tail, tlen);
-	if (write(fd, buf, total) != (ssize_t)total) {
-		/* A short/partial write on a SEQPACKET socket is an I/O error; map
-		 * the errno to something meaningful (write may leave errno==0). */
-		return (errno ? -errno : -EIO);
+	/* send(MSG_NOSIGNAL): a vanished peer must surface as -EPIPE, not
+	 * SIGPIPE-kill the daemon. */
+	errno = 0;
+	{
+		ssize_t w = send(fd, buf, total, MSG_NOSIGNAL);
+		int e = errno;
+		/* The staging buffer may hold SA key material: scrub it on every
+		 * path so keys never linger on the stack. */
+		explicit_bzero(buf, total);
+		if (w != (ssize_t)total) {
+			/* A short/partial write on a SEQPACKET socket is an I/O
+			 * error; map errno (send may leave it 0 on a short write). */
+			return (e ? -e : -EIO);
+		}
 	}
 	return 0;
 }
@@ -208,16 +219,20 @@ r2dp_msg_validate(const struct r2dp_msg *m, size_t n)
 		return -EBADMSG;   /* body shorter than the required struct */
 
 	/* SA messages carry a key tail strictly equal to enckeylen+authkeylen
-	 * (absent when HF_NOKEYS) -- for EVERY SA type, because the consumers
-	 * (fwd/ctl.c do_sa, mockfwd) reconstruct the key blob from enckeylen/
-	 * authkeylen on any non-NOKEYS SA.  A peer-controlled enckeylen must
-	 * never be able to make them read past the received bytes.  With NOKEYS
-	 * the tail must be absent and enckeylen/authkeylen are not trusted. */
+	 * (absent when HF_NOKEYS) -- for EVERY SA type (GETSPI, EXPIRE and
+	 * ACQUIRE included), because consumers reconstruct the key blob from
+	 * enckeylen/authkeylen on any non-NOKEYS SA.  A peer-controlled
+	 * enckeylen must never be able to make them read past the received
+	 * bytes.  With NOKEYS the tail must be absent and enckeylen/authkeylen
+	 * are not trusted. */
 	switch (m->h.type) {
+	case R2DP_GETSPI:
 	case R2DP_SA_ADD:
 	case R2DP_SA_UPDATE:
 	case R2DP_SA_GET:
 	case R2DP_SA_DEL:
+	case R2DP_EXPIRE:
+	case R2DP_ACQUIRE:
 		sa = (const struct r2dp_sa *)m->body;
 		tail = body - sizeof(struct r2dp_sa);
 		if (m->h.flags & R2DP_HF_NOKEYS)
@@ -261,40 +276,68 @@ r2dp_recv(int fd, struct r2dp_msg *m)
 	return r;
 }
 
+/* HELLO uses its own fixed seq so its ACK can be told apart from anything
+ * else already queued on the socket. */
+#define R2DP_HELLO_SEQ 0x48454c4fu   /* "HELO" */
+
+static long long
+now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 int
 r2dp_hello(int fd, uint32_t role, struct r2dp_hello_ack *ack)
 {
 	struct r2dp_hello hello;
 	struct r2dp_msg m;
+	long long deadline;
 	int r;
 
 	memset(&hello, 0, sizeof(hello));
 	hello.role = role;
 	hello.pid = (uint32_t)getpid();
-	r = r2dp_send(fd, R2DP_HELLO, 0, 0, 0, &hello, sizeof(hello), NULL, 0);
+	r = r2dp_send(fd, R2DP_HELLO, R2DP_HELLO_SEQ, 0, 0, &hello,
+	    sizeof(hello), NULL, 0);
 	if (r < 0)
 		return r;
 	/* Bound the handshake: a hung forwarder must not freeze iked/spmd at
-	 * startup forever.  Poll for the ACK with a timeout; -ETIMEDOUT on no
-	 * reply. */
-	{
+	 * startup forever.  Unsolicited EXPIRE/ACQUIRE (or an unknown type
+	 * from a newer forwarder) that races ahead of the ACK is skipped; any
+	 * other message, or an ACK for another seq, is a protocol error. */
+	deadline = now_ms() + R2DP_HELLO_TIMEOUT_MS;
+	for (;;) {
 		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		long long left = deadline - now_ms();
 		int pr;
+
+		if (left <= 0)
+			return -ETIMEDOUT;
 		do {
-			pr = poll(&pfd, 1, R2DP_HELLO_TIMEOUT_MS);
+			pr = poll(&pfd, 1, (int)left);
 		} while (pr < 0 && errno == EINTR);
 		if (pr == 0)
 			return -ETIMEDOUT;
 		if (pr < 0)
 			return -errno;
+		memset(&m, 0, sizeof(m));
+		r = r2dp_recv(fd, &m);
+		if (r == -ENOSYS)
+			continue;
+		if (r < 0)
+			return r;
+		if (m.h.type == R2DP_EXPIRE || m.h.type == R2DP_ACQUIRE)
+			continue;
+		if (m.h.type != R2DP_HELLO_ACK || m.h.seq != R2DP_HELLO_SEQ)
+			return -EPROTO;
+		break;
 	}
-	memset(&m, 0, sizeof(m));
-	if ((r = r2dp_recv(fd, &m)) < 0)
-		return r;
-	if (m.h.type != R2DP_HELLO_ACK)
-		return -EPROTO;
 	if (m.h.status != 0)
-		return -(int)m.h.status;
+		/* errno-style status; anything out of range is a bad peer */
+		return (m.h.status < 4096) ? -(int)m.h.status : -EPROTO;
 	if (ack != NULL)
 		memcpy(ack, m.body, sizeof(*ack));
 	return 0;

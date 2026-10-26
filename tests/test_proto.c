@@ -157,7 +157,7 @@ validate(void)
 	memset(&m, 0, sizeof(m));
 	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
 	m.h.type = R2DP_SA_ADD; m.h.len = sizeof(m.h) + sizeof(*sa) + 4;
-	sa = r2dp_msg_sa(&m);
+	sa = (struct r2dp_sa *)r2dp_msg_sa(&m);
 	sa->enckeylen = 100; sa->authkeylen = 0;   /* only 4 tail bytes present */
 	n = m.h.len;
 	CHECK(r2dp_msg_validate(&m, n) == -EBADMSG,
@@ -175,7 +175,7 @@ validate(void)
 	memset(&m, 0, sizeof(m));
 	m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
 	m.h.type = R2DP_SA_ADD; m.h.len = sizeof(m.h) + sizeof(*sa) + 20;
-	sa = r2dp_msg_sa(&m);
+	sa = (struct r2dp_sa *)r2dp_msg_sa(&m);
 	sa->enckeylen = 16; sa->authkeylen = 4;   /* AES-GCM 16+4 = 20 */
 	CHECK(r2dp_msg_validate(&m, m.h.len) == 0, "full SA_ADD key tail ok");
 
@@ -190,6 +190,28 @@ validate(void)
 	CHECK(r2dp_msg_validate(&m, m.h.len) == 0, "SA_DEL full key ok");
 	m.h.len = sizeof(m.h) + sizeof(*sa) + 8;
 	CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG, "SA_DEL with stray tail rejected");
+
+	/* GETSPI / EXPIRE / ACQUIRE get the same tail rules as ADD/UPDATE:
+	 * a non-NOKEYS SA whose enckeylen exceeds the tail is rejected, a
+	 * NOKEYS SA must carry no tail. */
+	{
+		static const uint16_t ts[] = { R2DP_GETSPI, R2DP_EXPIRE, R2DP_ACQUIRE };
+		for (unsigned i = 0; i < sizeof(ts) / sizeof(ts[0]); i++) {
+			memset(&m, 0, sizeof(m));
+			m.h.magic = R2DP_MAGIC; m.h.version = R2DP_VERSION;
+			m.h.type = ts[i]; m.h.len = sizeof(m.h) + sizeof(*sa);
+			sa = (struct r2dp_sa *)r2dp_msg_sa(&m);
+			sa->enckeylen = 20;
+			CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG,
+			    "%s: enckeylen without tail rejected", r2dp_msg_name(ts[i]));
+			m.h.flags = R2DP_HF_NOKEYS;
+			CHECK(r2dp_msg_validate(&m, m.h.len) == 0,
+			    "%s: NOKEYS no-tail ok", r2dp_msg_name(ts[i]));
+			m.h.len += 4;
+			CHECK(r2dp_msg_validate(&m, m.h.len) == -EBADMSG,
+			    "%s: NOKEYS with tail rejected", r2dp_msg_name(ts[i]));
+		}
+	}
 
 	/* Truncated SP_ADD body. */
 	memset(&m, 0, sizeof(m));
@@ -232,6 +254,69 @@ hello_timeout(void)
 	close(sv[1]);
 }
 
+/* HELLO tolerates unsolicited EXPIRE ahead of the ACK, rejects an ACK for
+ * a different seq, and maps an out-of-range status to -EPROTO. */
+static int
+queue_raw(int fd, uint16_t type, uint32_t seq, uint32_t status,
+    const void *body, size_t blen)
+{
+	return r2dp_send(fd, type, seq, (int)status,
+	    type == R2DP_EXPIRE ? R2DP_HF_NOKEYS : 0, body, blen, NULL, 0);
+}
+
+static void
+hello_checks(void)
+{
+	struct r2dp_hello_ack ack, got;
+	struct r2dp_sa sa;
+	int sv[2];
+
+	memset(&ack, 0, sizeof(ack));
+	ack.epoch = 42; ack.max_msg = R2DP_MAX_MSG;
+	memset(&sa, 0, sizeof(sa));
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) { CHECK(0, "sp"); return; }
+	queue_raw(sv[1], R2DP_EXPIRE, 0, 0, &sa, sizeof(sa));
+	queue_raw(sv[1], R2DP_HELLO_ACK, 0x48454c4fu, 0, &ack, sizeof(ack));
+	memset(&got, 0, sizeof(got));
+	CHECK(r2dp_hello(sv[0], R2DP_ROLE_IKED, &got) == 0 && got.epoch == 42,
+	    "hello skips unsolicited EXPIRE before ACK");
+	close(sv[0]); close(sv[1]);
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) { CHECK(0, "sp"); return; }
+	queue_raw(sv[1], R2DP_HELLO_ACK, 7, 0, &ack, sizeof(ack));
+	CHECK(r2dp_hello(sv[0], R2DP_ROLE_IKED, NULL) == -EPROTO,
+	    "hello rejects ACK with foreign seq");
+	close(sv[0]); close(sv[1]);
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) { CHECK(0, "sp"); return; }
+	queue_raw(sv[1], R2DP_HELLO_ACK, 0x48454c4fu, 0x80000001u, &ack, sizeof(ack));
+	CHECK(r2dp_hello(sv[0], R2DP_ROLE_IKED, NULL) == -EPROTO,
+	    "hello maps out-of-range status to -EPROTO");
+	close(sv[0]); close(sv[1]);
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) { CHECK(0, "sp"); return; }
+	queue_raw(sv[1], R2DP_HELLO_ACK, 0x48454c4fu, EPERM, &ack, sizeof(ack));
+	CHECK(r2dp_hello(sv[0], R2DP_ROLE_IKED, NULL) == -EPERM,
+	    "hello surfaces errno-style status");
+	close(sv[0]); close(sv[1]);
+}
+
+/* r2dp_send to a closed peer returns -EPIPE instead of raising SIGPIPE. */
+static void
+send_epipe(void)
+{
+	int sv[2];
+	struct r2dp_hello h;
+
+	memset(&h, 0, sizeof(h));
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) < 0) { CHECK(0, "sp"); return; }
+	close(sv[1]);
+	CHECK(r2dp_send(sv[0], R2DP_HELLO, 1, 0, 0, &h, sizeof(h), NULL, 0) == -EPIPE,
+	    "send to closed peer -> -EPIPE (no SIGPIPE)");
+	close(sv[0]);
+}
+
 int
 main(void)
 {
@@ -242,6 +327,8 @@ main(void)
 	caps();
 	validate();
 	hello_timeout();
+	hello_checks();
+	send_epipe();
 
 	if (failures) {
 		fprintf(stderr, "test_proto: %d failure(s)\n", failures);
