@@ -1,6 +1,6 @@
 model	runs	total_tokens	duration_s
+deepseek-ai/DeepSeek-V4-Flash-0731	34	142768970	392908
 nvidia/nemotron-3-ultra-550b-a55b	11	108469619	178613
-deepseek-ai/DeepSeek-V4-Flash-0731	29	91974373	247346
 grok-4.7	30	51882293	25272
 Qwen3.8-Flash-CIRU-STRIX-IU4	77	9874082	40236
 ibm/granite4.1:8b	1	4994542	3339
