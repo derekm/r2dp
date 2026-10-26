@@ -104,8 +104,10 @@ _Static_assert(sizeof(struct r2dp_addr) == 24, "r2dp_addr layout");
 
 /*
  * IANA IKEv2 ESP transform IDs used in .enc / .integ.
- * AEAD transforms (GCM/CCM/ChaCha20-Poly1305): .integ = 0 and the
- * enckey tail is cipher_key || 4-byte salt (RFC 4106/4309/7634).
+ * AEAD transforms: .integ = 0 and the enckey tail is cipher_key || salt, where
+ * the salt is 4 bytes for GCM (RFC 4106) and ChaCha20-Poly1305 (RFC 7634) but
+ * only 3 bytes for CCM (RFC 4309).  Only the GCM convention has been verified
+ * against iked; CCM/ChaCha are defined here for forwarders that implement them.
  */
 #define R2DP_ENCR_3DES        3
 #define R2DP_ENCR_NULL        11

@@ -290,6 +290,17 @@ void r2dp_cp_handle(struct r2dp_cp *cp, int fd, const struct r2dp_msg *m)
 	}
 }
 
+int r2dp_cp_dispatch(struct r2dp_cp *cp, int fd, const struct r2dp_msg *m, size_t n)
+{
+	int r = r2dp_validate(m, n);
+	if (r == 0) { r2dp_cp_handle(cp, fd, m); return 0; }
+	if (r == -ENOSYS) {
+		r2dp_send(fd, m->h.type, m->h.seq, ENOSYS, R2DP_HF_NOKEYS, NULL, 0, NULL, 0);
+		return 0;
+	}
+	return r;
+}
+
 int r2dp_cp_foreach_sa(struct r2dp_cp *cp,
     void (*fn)(void *, const struct r2dp_sa *, const uint8_t *, const uint8_t *), void *arg)
 {

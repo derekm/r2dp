@@ -45,6 +45,14 @@ void r2dp_cp_free(struct r2dp_cp *cp);
 /* Handle one validated request from client fd; sends the completion(s). */
 void r2dp_cp_handle(struct r2dp_cp *cp, int fd, const struct r2dp_msg *m);
 
+/*
+ * For event loops that do their own receiving (e.g. io_uring): validate the n
+ * bytes in m and run the request.  Returns 0 to keep the client, or a negative
+ * errno (-EPROTO ...) when the connection should be dropped.  Unknown-but-sane
+ * message types are answered with ENOSYS and return 0, like r2dp_srv_poll().
+ */
+int r2dp_cp_dispatch(struct r2dp_cp *cp, int fd, const struct r2dp_msg *m, size_t n);
+
 /* Read-only lookup of a committed (non-larval) SA, for dataplane resync. */
 int r2dp_cp_foreach_sa(struct r2dp_cp *cp,
                        void (*fn)(void *, const struct r2dp_sa *, const uint8_t *, const uint8_t *),

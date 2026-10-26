@@ -8,7 +8,7 @@ a separate project that speaks a PF_KEY-shaped protocol over a unix socket.
     iked / spmd ──(rcpfk_* ABI)── if_r2dp.c ──(r2dp, SOCK_SEQPACKET)── forwarder (DPDK)
 
 ## Status
-**M0 and M1 done**: protocol, client/server lib, racoon2 backend, and a working
+**M0, M1 and M1.5 done** (M1.5 = kernel reference backend, only partly verifiable where it was written — see `docs/MILESTONES.md`): protocol, client/server lib, racoon2 backend, and a working
 single-core DPDK forwarder (IPv4 ESP tunnel, AES-GCM) that real `iked`/`spmd`
 drive end to end. **M2+ not started.** No performance numbers exist yet — all
 testing ran on `--no-huge` virtual devices.
@@ -21,11 +21,12 @@ See `docs/MILESTONES.md` for the full plan, exit gates, and findings.
 | `include/r2dp/client.h`, `libr2dp/` | transport, validation, address helpers (client + server side) |
 | `libr2dp/cp.c`, `include/r2dp/cp.h` | control-plane engine shared by every forwarder (SAD/SPD semantics, hooks into the dataplane) |
 | `fwd/fwd.c` | `r2dp-fwd`: the DPDK forwarder (needs `-m 1`) |
+| `kfwd/` | `r2dp-kfwd`: reference backend that programs the **Linux kernel's XFRM** (netlink) behind the same protocol; `--io uring` is an experimental control loop (control plane only) |
 | `tools/mockfwd.c` | `r2dp-mockfwd`: the control-plane engine with no dataplane |
 | `tools/r2dpctl.c` | shell client: `hello`, `sa-add/del`, `sp-add/del/dump` |
 | `shim/if_r2dp.c` | the racoon2 backend (single source of truth) |
 | `patches/racoon2-r2dp-backend.patch` | applies to racoon2 `2fd758a`: 52 glue lines + `lib/if_r2dp.c` |
-| `tests/` | `test_proto`, `test_mock`, `shim_contract`, `ctl_test.sh` (meson); `e2e/`: `ike_e2e.sh` (M0), `fwd_e2e.sh` + `fwd_peer.py` (scapy interop), `ike_fwd_e2e.sh` (iked + DPDK, both sides) — need root + netns |
+| `tests/` | `test_proto`, `test_mock`, `shim_contract`, `ctl_test.sh`, `kfwd_test.sh` (meson); `e2e/`: `ike_e2e.sh` (M0), `fwd_e2e.sh` + `fwd_peer.py` (scapy interop), `ike_fwd_e2e.sh` (iked + DPDK, both sides) — need root + netns |
 | `build.sh` | deps / check / build / test / sanitize / e2e / milestones |
 
 ## Quick start

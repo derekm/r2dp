@@ -4,6 +4,12 @@ test_mock = executable('test_mock', 'test_mock.c', dependencies: r2dp_dep)
 test('mockfwd-roundtrip', test_mock, args: [mockfwd_exe], depends: [mockfwd_exe],
      timeout: 30)
 
+# Kernel-XFRM reference backend: translation checked against `ip xfrm` (root + netns; skips otherwise).
+if is_variable('kfwd_exe')
+  test('kfwd-xfrm', find_program('bash'), args: [files('kfwd_test.sh'), kfwd_exe, r2dpctl_exe],
+       depends: [kfwd_exe, r2dpctl_exe], timeout: 120, suite: ['e2e'])
+endif
+
 # Shim contract test: needs a racoon2 checkout for its headers (-Dracoon2_src=...).
 r2src = get_option('racoon2_src')
 if r2src != ''

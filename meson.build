@@ -6,6 +6,7 @@ project('r2dp', 'c',
 fs  = import('fs')
 ms  = get_option('milestone')
 inc = include_directories('include')
+cc  = meson.get_compiler('c')
 
 add_project_arguments('-DR2DP_MILESTONE=@0@'.format(ms), '-D_GNU_SOURCE', language: 'c')
 
@@ -15,7 +16,7 @@ dpdk = dependency('libdpdk', version: '>=' + get_option('dpdk_min'),
 
 # Each component adds itself once its meson.build exists, so the tree
 # configures cleanly at every stage of the plan.
-foreach d : ['libr2dp', 'fwd', 'tools', 'tests']
+foreach d : ['libr2dp', 'fwd', 'kfwd', 'tools', 'tests']
   if fs.exists(d / 'meson.build')
     subdir(d)
   endif

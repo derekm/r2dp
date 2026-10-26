@@ -28,13 +28,13 @@ vergte() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; } #
 declare -A APT=(
   [core]="build-essential meson ninja-build pkg-config"
   [dpdk]="libdpdk-dev dpdk libnuma-dev python3-pyelftools libssl-dev"
-  [tests]="iproute2 iputils-ping tcpdump python3-scapy python3-cryptography"
+  [tests]="iproute2 iputils-ping python3-scapy python3-cryptography liburing-dev"
   [r2]="autoconf automake libtool bison flex libssl-dev"
 )
 declare -A DNF=(
   [core]="gcc make meson ninja-build pkgconf-pkg-config"
   [dpdk]="dpdk-devel dpdk numactl-devel python3-pyelftools openssl-devel"
-  [tests]="iproute iputils tcpdump python3-scapy python3-cryptography"
+  [tests]="iproute iputils python3-scapy python3-cryptography liburing-devel"
   [r2]="autoconf automake libtool bison flex openssl-devel"
 )
 
@@ -83,6 +83,8 @@ cmd_check() {
     vergte "$(meson --version)" 0.57 && echo "  ok   meson $(meson --version) >= 0.57" \
       || { echo "  OLD  meson $(meson --version) < 0.57"; fail=1; }
   fi
+  have pkg-config && pkg-config --exists liburing && echo "  ok   liburing $(pkg-config --modversion liburing) (r2dp-kfwd --io uring)" \
+    || echo "  note liburing not found: r2dp-kfwd builds without --io uring"
   if [ "$MILESTONE" -ge 1 ]; then
     if have pkg-config && pkg-config --exists libdpdk; then
       local v; v="$(pkg-config --modversion libdpdk)"
@@ -94,7 +96,6 @@ cmd_check() {
     pkg-config --exists numa 2>/dev/null && echo "  ok   libnuma" \
       || { echo "  MISS libnuma"; fail=1; }
     need ip "package iproute2 (netns tests)"
-    need tcpdump "package tcpdump"
     if [ -r /proc/meminfo ]; then
       local hp; hp="$(awk '/HugePages_Total/{print $2}' /proc/meminfo)"
       [ "${hp:-0}" -gt 0 ] && echo "  ok   hugepages: $hp" \
@@ -143,6 +144,8 @@ cmd_e2e() { # clean clone -> patch -> build racoon2 -> two-peer IKEv2 over veth 
   run "$ROOT/tests/e2e/build-racoon2.sh" "$RACOON2_SRC" "$W" "$W/prefix"
   info "IKEv2 end-to-end against the mock forwarder (needs root + iproute2)"
   run "$ROOT/tests/e2e/ike_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-mockfwd"
+  info "kernel-XFRM reference backend (r2dp-kfwd), both control loops"
+  run "$ROOT/tests/kfwd_test.sh" "$W/prefix/bin/r2dp-kfwd" "$W/prefix/bin/r2dpctl"
   if [ "$MILESTONE" -ge 1 ]; then
     info "M1: DPDK forwarder vs an independent ESP implementation (scapy)"
     run "$ROOT/tests/e2e/fwd_e2e.sh" "$W/prefix/bin/r2dp-fwd" "$W/prefix/bin/r2dpctl"
