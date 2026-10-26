@@ -54,25 +54,39 @@ This is the core rule:
 
 &gt; **Each contributor retains ownership (copyright) of their own
 &gt; contributions.** Nothing in </pre></section>
-<section id="lineage"><h2>Lineage DAG</h2><ul class='dag'><li><code>311932b</code> <b>Derek Moore</b> <span class='date'>(2026-10-29)</span> — docs: COVERAGE.md evidence log; refresh README status</li>
-<li><code>1ae2201</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-29)</span> — Import Mark&#x27;s clean-room M2 snapshot: lifecycle &amp; protocol coverage (ESN, NAT-T, AES-CBC+HMAC, lifetimes)</li>
-<li><code>da96bb1</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-29)</span> — feat(fwd): FAIR flow-&gt;worker distribution (round-robin, no hash)</li>
-<li><code>d89f10d</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — docs: CCM 3-byte salt, kernel vs DPDK backends; credit the upstream prototype</li>
-<li><code>dee1527</code> <b>derekm</b> <span class='date'>(2026-10-27)</span> — deploy: 110dccdc43a297dd5c89af92839b8e7877a67362</li>
-<li><code>56ab4d4</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — site: parse milestone map as real markdown (lists/emphasis/code); stdlib fallback</li>
-<li><code>eb7d95d</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — usage: encrypt user-message bodies (Fernet) in the time-budget ledger; key kept out-of-repo</li>
-<li><code>b8e89e6</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — docs: link lineage commits/branches to agent memory context (docs/memory-links.md)</li>
-<li><code>7df7e7e</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — usage: refresh ledgers (cron 186, sessions 872, user-msgs 264) from live runtime</li>
-<li><code>7a7280a</code> <b>Terre d&#x27;Hermés</b> <span class='date'>(2026-10-26)</span> — usage: meta-only context branch (no project source)</li>
-<li><code>21025a3</code> <b>Terre d&#x27;Hermés</b> <span class='date'>(2026-10-26)</span> — agent: meta-only context branch (no project source)</li>
-<li><code>ca269fa</code> <b>Terre d&#x27;Hermés</b> <span class='date'>(2026-10-26)</span> — lineage: meta-only context branch (no project source)</li>
-<li><code>110dccd</code> <b>Terre d&#x27;Hermés</b> <span class='date'>(2026-10-26)</span> — site: meta-only context branch (no project source)</li>
-<li><code>c98e51d</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — docs: CONTRIBUTING — contributor-ownership recruitment drive for building out R2DP</li>
-<li><code>650b26e</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-24)</span> — r2dp M0: control protocol library + mock forwarder + tests + CI</li>
-<li><code>0020e0c</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — docs(agent): record agent memory milestones (compaction anchors, corrections)</li>
-<li><code>5361910</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-24)</span> — zip1: r2dp M0 base (upstream lineage root)</li>
-<li><code>aebb6e4</code> <b>Mark Wilcox</b> <span class='date'>(2026-10-25)</span> — docs(MILESTONES): mark M1 ☑ DONE with a concise final-state exit gate</li>
-<li><code>7be8439</code> <b>Mark Wilcox</b> <span class='date'>(2026-10-24)</span> — r2dp M0: control protocol library + mock forwarder + tests + CI</li></ul></section>
+<section id="lineage"><h2>Lineage DAG</h2><h3>Zip lineage (M0 → M0+M1)</h3><ul class='dag'><li><code>b8e89e6</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — docs: link lineage commits/branches to agent memory context (docs/memory-links.md)</li>
+<li><code>d9f3de7</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — ci: baseline lineage-DAG test suite (walk all DAG commits)</li>
+<li><code>b57d97f</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-25)</span> — zip2: r2dp M0+M1 package (direct upstream lineage child)</li>
+<li><code>5361910</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-24)</span> — zip1: r2dp M0 base (upstream lineage root)</li></ul><h3>Project DAG (source development, via main)</h3><ul class='dag'><li><code>d89f10d</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — docs: CCM 3-byte salt, kernel vs DPDK backends; credit the upstream prototype</li>
+<li><code>853ac56</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — test(bench): fwd_bench data-path regression gate in CI</li>
+<li><code>1336f42</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — feat(fwd): kernel XFRM data plane (--dp kernel) behind fwd_dp</li>
+<li><code>789ba1f</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — fix(ctl): send data-plane refusals as a positive errno</li>
+<li><code>e8543ef</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — test(e2e): scapy ESP interop harness for r2dp-fwd; ci: run it under unshare</li>
+<li><code>1f2cd00</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — fix(fwd): count ESP bursts with no inbound SA as drops{no_sa_in}</li>
+<li><code>d9d8ed9</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — fix(fwd): enforce anti-replay ourselves; librte_ipsec misses half the window</li>
+<li><code>55d595a</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — feat(r2dpctl): sa-add/sa-del/sp-add/sp-del/hello write commands</li>
+<li><code>f15bad2</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — feat(fwd): per-reason drop counters and a SIGUSR1 stats dump</li>
+<li><code>97b0100</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — perf(fwd): indexed inbound check, hashed tunnel peers, batched crypto</li>
+<li><code>869352d</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — test(fwd): ACL differential test covers the no-match path</li>
+<li><code>a1a112a</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — perf(fwd): rte_acl OUT SPD with most-specific priority</li>
+<li><code>8f2d974</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — perf(fwd): bind OUT policies to their SA at control time (QSBR snapshot)</li>
+<li><code>facacca</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — fix(fwd): drop ESP whose ICV fails; never pass a failed crypto op to rte_ipsec</li>
+<li><code>ce69d86</code> <b>Derek Moore</b> <span class='date'>(2026-10-27)</span> — fix(fwd): egress dropped inner packets whose length mod 256 &lt; 20</li>
+<li><code>cd241c7</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — chore: gitignore .ci_all.log (all-branches CI scratch log)</li>
+<li><code>5103722</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — ci: all-branches build gate — compile every commit across every branch (ci/ci_all_branches.sh + all-branches.yml)</li>
+<li><code>3aefcac</code> <b>Mark Wilcox</b> <span class='date'>(2026-10-26)</span> — feat(ctl): r2dpctl dump-sp prints tunnel endpoints + reqid</li>
+<li><code>584402e</code> <b>Mark Wilcox</b> <span class='date'>(2026-10-26)</span> — fix(fwd): deliver decrypted inner packets unicast to the inner tap MAC</li>
+<li><code>c929028</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-25)</span> — docs(MILESTONES): mark M1 ☑ DONE with a concise final-state exit gate</li>
+<li><code>3bc5590</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-25)</span> — feat(ctl): R2DP_SA_DUMP + r2dpctl + live sad_dump test</li>
+<li><code>d626596</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — patches: regenerate racoon2 backend patch from feat/r2dp-km-backend @ baf7094</li>
+<li><code>54049a2</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — test(e2e): R2DP_E2E_DIR override; document running unprivileged</li>
+<li><code>e532cb2</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — fix(libr2dp): report forwarder EOF as -ENOTCONN</li>
+<li><code>f5c1dbb</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — docs: document protocol v2, review hardening and the test suite</li>
+<li><code>a1c1ff2</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — test: end-to-end ESP data-path test (encrypt -&gt; decrypt) in CI</li>
+<li><code>5b06953</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — fix(fwd): evict least-recently-seen next hop when the table is full</li>
+<li><code>bfa201b</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — fix(fwd/ctl): lifetime-only UPDATE of a live SA does not touch the dataplane</li>
+<li><code>081cf41</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — fix(fwd): validate SA key blob length, integ and authkeylen for AEAD</li>
+<li><code>577a4d4</code> <b>Derek Moore</b> <span class='date'>(2026-10-25)</span> — fix(fwd): honour port selectors; inbound check bound to the SA&#x27;s policy, default deny</li></ul><p class='note'>The `lineage` branch is a meta tracking context; the code DAG lives in the source history above.</p></section>
 <section id="agent"><h2>Agent memory milestones</h2><pre class='doc'># Agent Memory Milestones
 
 This file is the agent&#x27;s own memory ledger — the durable entries and

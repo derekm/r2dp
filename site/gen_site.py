@@ -57,19 +57,48 @@ def section(title, body, anchor):
 
 
 def render_lineage():
-    # Walk HEAD's ancestry on the lineage branch (via git log --all --simplify).
-    log = git("log", "--format=%h|%ad|%an|%s", "--date=short", "--all",
-              "--simplify-by-decoration", "-120")
-    rows = []
-    for line in log.splitlines():
+    # Render the SOURCE double DAG: first the zip-based lineage (zip1 M0 ->
+    # zip2 M0+M1), then the main project DAG (all of main's source ancestry).
+    # The `lineage` meta branch no longer carries source, so we walk the true
+    # records: the source snapshots (pre-src/lineage) and main's history.
+    body = "<h3>Zip lineage (M0 → M0+M1)</h3>"
+    # Source of the zip-based lineage DAG: prefer the origin-pushed record
+    # (survives in CI), fall back to the local backup branch.
+    for cand in ("lineage-src", "refs/remotes/origin/lineage-src", "pre-src/lineage"):
+        if git("rev-parse", "-q", "--verify", cand).returncode == 0:
+            ziplog = git("log", "--format=%h|%ad|%an|%s", "--date=short", cand)
+            break
+    else:
+        ziplog = ""
+    ziprows = []
+    for line in ziplog.splitlines():
         parts = line.split("|", 3)
         if len(parts) != 4:
             continue
         short_sha, date, author, subject = parts
-        rows.append(
+        ziprows.append(
             f"<li><code>{h(short_sha)}</code> <b>{h(author)}</b> "
             f"<span class='date'>({h(date)})</span> — {h(subject)}</li>")
-    body = "<ul class='dag'>" + "\n".join(rows) + "</ul>" if rows else para("(no lineage history)")
+    body += "<ul class='dag'>" + "\n".join(ziprows) + "</ul>" if ziprows else para("(no zip lineage)")
+
+    body += "<h3>Project DAG (source development, via main)</h3>"
+    # main's own history (it carries the source); line up to a bounded window
+    if git("rev-parse", "-q", "--verify", "main") and git("rev-parse", "-q", "--verify", "refs/remotes/origin/main"):
+        base = "main"
+    else:
+        base = "refs/remotes/origin/main"
+    mainlog = git("log", "-30", "--format=%h|%ad|%an|%s", "--date=short", base)
+    mainrows = []
+    for line in mainlog.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            continue
+        short_sha, date, author, subject = parts
+        mainrows.append(
+            f"<li><code>{h(short_sha)}</code> <b>{h(author)}</b> "
+            f"<span class='date'>({h(date)})</span> — {h(subject)}</li>")
+    body += "<ul class='dag'>" + "\n".join(mainrows) + "</ul>" if mainrows else para("(no main history)")
+    body += "<p class='note'>The `lineage` branch is a meta tracking context; the code DAG lives in the source history above.</p>"
     return section("Lineage DAG", body, "lineage")
 
 
