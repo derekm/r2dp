@@ -165,6 +165,18 @@ reply_sp(int fd, const struct r2dp_msg *req, int status,
 	    sp, sizeof(*sp), NULL, 0);
 }
 
+/* Reply to a DUMP request with one SA entry (flags may set R2DP_HF_MORE).
+ * Always set NOKEYS: a dump completion must not carry key material, and
+ * without it an SA carrying enckeylen>0 would fail the client's key-tail
+ * validation (tail is absent). */
+static int
+reply_sa_dump(int fd, const struct r2dp_msg *req, int status,
+    const struct r2dp_sa *sa, uint32_t flags)
+{
+	return r2dp_send(fd, R2DP_SA_DUMP, req->h.seq, status,
+	    flags | R2DP_HF_NOKEYS, sa, sizeof(*sa), NULL, 0);
+}
+
 /* --------------------------------------------------------- handlers */
 static void
 do_hello(int fd, const struct r2dp_msg *m)
@@ -447,6 +459,24 @@ do_sa(int fd, const struct r2dp_msg *m)
 		if (!e || e->larval) { rc = ENOENT; goto out; }
 		reply_sa(fd, m, 0, e);
 		goto scrub;
+	case R2DP_SA_DUMP: {
+		/* Stream every live SA back as one SA_DUMP message each, MORE set
+		 * on all but the last -- mirrors SP_DUMP so r2dpctl can enumerate
+		 * the SAD and verify the dataplane matches.  Completing-reply type
+		 * is the request type (R2DP_SA_DUMP); each carries its own seq. */
+		int last = -1;
+		for (int i = 0; i < FWD_MAXSA; i++)
+			if (C->sad[i].used && !C->sad[i].larval) last = i;
+		if (last < 0) { rc = ENOENT; goto out; }
+		for (int i = 0; i <= last; i++) {
+			if (!C->sad[i].used || C->sad[i].larval) continue;
+			int more = 0;
+			for (int j = i + 1; j <= last; j++)
+				if (C->sad[j].used && !C->sad[j].larval) { more = 1; break; }
+			reply_sa_dump(fd, m, 0, &C->sad[i].sa,
+			    more ? R2DP_HF_MORE : 0);
+		}
+		goto out; }
 	default:
 		rc = ENOSYS;
 		goto out;
@@ -591,6 +621,7 @@ dispatch(int fd, const struct r2dp_msg *m)
 	case R2DP_HELLO:  do_hello(fd, m); break;
 	case R2DP_GETSPI: do_getspi(fd, m); break;
 	case R2DP_SA_ADD: case R2DP_SA_UPDATE: case R2DP_SA_DEL: case R2DP_SA_GET:
+	case R2DP_SA_DUMP:
 		do_sa(fd, m); break;
 	case R2DP_SP_ADD: case R2DP_SP_DEL: case R2DP_SP_GET: case R2DP_SP_DUMP:
 		do_sp(fd, m); break;

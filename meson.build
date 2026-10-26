@@ -26,6 +26,22 @@ r2dp_mockfwd = executable('r2dp-mockfwd',
   link_with: libr2dp,
   install: false)
 
+# Control-plane inspector: dump the live forwarder SAD/SPD over the wire
+# (exit gate: "r2dpctl dump matches SAD").
+r2dpctl = executable('r2dpctl',
+  'tools/r2dpctl.c',
+  include_directories: r2dp_inc,
+  link_with: libr2dp,
+  install: false)
+
+# Dev probe: install one SA + SP into a running forwarder (pairs with r2dpctl
+# to prove the dump matches the SAD/SPD).
+r2dp_ctl_probe = executable('r2dp-ctl-probe',
+  'tools/ctl_probe.c',
+  include_directories: r2dp_inc,
+  link_with: libr2dp,
+  install: false)
+
 subdir('fwd')
 
 subdir('tests')

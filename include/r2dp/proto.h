@@ -32,6 +32,7 @@ enum r2dp_msg_type {
 	R2DP_SA_UPDATE,    /* same; must follow GETSPI or exist */
 	R2DP_SA_DEL,       /* key = spi + dst + proto           */
 	R2DP_SA_GET,       /* key = spi + dst + proto           */
+	R2DP_SA_DUMP,      /* reply: one SA_DUMP per entry, MORE until last */
 	R2DP_SP_ADD,       /* struct r2dp_sp (R2DP_SPF_UPDATE = upsert) */
 	R2DP_SP_DEL,       /* by slid if nonzero, else dir+selector */
 	R2DP_SP_GET,       /* by slid                            */

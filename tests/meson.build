@@ -30,6 +30,16 @@ test('smoke_fwd',
   args: r2dp_fwd.full_path(),
   is_parallel: false)
 
+# sad_dump: live exit-gate test -- spawns the real r2dp-fwd, installs SAs over
+# the control socket, then R2DP_SA_DUMP must return exactly those SAs with the
+# right (spi,proto,dst,enc,mode) i.e. the wire dump matches the forwarder SAD.
+test('sad_dump',
+  executable('sad_dump', 'sad_dump.c',
+    include_directories: include_directories('../include'),
+    link_with: libr2dp),
+  args: r2dp_fwd.full_path(),
+  is_parallel: false)
+
 # gcm_kat: RFC 4106 ESP known-answer test for the DPDK dataplane (crypto_openssl
 # vdev, no hugepages).  Only when DPDK is built.  SKIP (77) on a lane that has
 # DPDK but no crypto_openssl/EAL must be treated as a failure (see KAT header).

@@ -202,6 +202,7 @@ r2dp_msg_validate(const struct r2dp_msg *m, size_t n)
 	case R2DP_SA_UPDATE:
 	case R2DP_SA_DEL:
 	case R2DP_SA_GET:
+	case R2DP_SA_DUMP:
 	case R2DP_EXPIRE:
 	case R2DP_ACQUIRE:
 		min = sizeof(struct r2dp_sa);
@@ -215,6 +216,13 @@ r2dp_msg_validate(const struct r2dp_msg *m, size_t n)
 	default:
 		return -EBADMSG;   /* unknown type: caller reports -ENOSYS */
 	}
+	/* A dump *request* (SA_DUMP/SP_DUMP) carries no meaningful body -- the
+	 * client simply asks to enumerate.  racoon2's send_sp sends a full
+	 * zeroed body anyway, but a bare (bodiless) dump request is equally
+	 * valid and must not fail the min-length check. */
+	if ((m->h.type == R2DP_SA_DUMP || m->h.type == R2DP_SP_DUMP) &&
+	    body < min)
+		return 0;
 	if (body < min)
 		return -EBADMSG;   /* body shorter than the required struct */
 
@@ -366,6 +374,7 @@ r2dp_msg_name(uint16_t type)
 		[R2DP_SA_UPDATE] = "SA_UPDATE",
 		[R2DP_SA_DEL]    = "SA_DEL",
 		[R2DP_SA_GET]    = "SA_GET",
+		[R2DP_SA_DUMP]   = "SA_DUMP",
 		[R2DP_SP_ADD]    = "SP_ADD",
 		[R2DP_SP_DEL]    = "SP_DEL",
 		[R2DP_SP_GET]    = "SP_GET",
