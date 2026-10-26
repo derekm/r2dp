@@ -41,6 +41,17 @@ if dpdk.found()
       dependencies: [dpdk, dependency('libcrypto')],
       c_args: ['-DR2DP_HAVE_DPDK=1']),
     is_parallel: false, timeout: 60)
+
+  # dp_sa: production dp_dpdk.c SA table under ASan/UBSan -- C1 (no
+  # sa_tab[-1] write on a fresh inbound install) and newest-SA egress pick.
+  test('dp_sa',
+    executable('dp_sa', 'dp_sa.c', '../fwd/dp_gcm.c',
+      include_directories: [include_directories('../include'),
+                            include_directories('../fwd')],
+      dependencies: dpdk,
+      link_with: libr2dp,
+      c_args: ['-DR2DP_HAVE_DPDK=1']),
+    is_parallel: false, timeout: 60)
 endif
 
 # ctl_poll: regression for the accept/poll desync in fwd_ctl_run (0bb71e1):
