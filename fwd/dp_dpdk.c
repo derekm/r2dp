@@ -202,7 +202,10 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	size_t sa_sz;
 	int ret;
 
-	(void)keylen;
+	/* The blob handed over must be exactly what the SA header claims:
+	 * enckeylen (cipher key || salt) followed by authkeylen. */
+	if (key == NULL || keylen != (size_t)rsa->enckeylen + rsa->authkeylen)
+		return -EINVAL;
 	if (!d->have_cdev)
 		return -ENODEV;
 	/* D10: refuse what the data plane cannot honour, instead of accepting

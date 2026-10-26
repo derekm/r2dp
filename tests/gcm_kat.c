@@ -14,6 +14,7 @@
  * SKIP (77) if EAL or crypto_openssl is unavailable -- treat SKIP on a DPDK
  * lane as a failure, per the CI lane this backs.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -256,6 +257,22 @@ main(void)
 	        st == RTE_CRYPTO_OP_STATUS_ERROR,
 	      "tampered ICV rejected");
 	  rte_pktmbuf_free(m); }
+
+	/* parameter validation in the production prm builder */
+	{ struct r2dp_sa r; struct rte_ipsec_sa_prm prm;
+	  struct rte_crypto_sym_xform ax; struct rte_ipv4_hdr eh2;
+	  memset(&r, 0, sizeof(r));
+	  r.mode = R2DP_MODE_TUNNEL; r.enc = R2DP_ENCR_AES_GCM_16;
+	  r.enckeylen = 20; r.proto = R2DP_PROTO_ESP; r.spi = htonl(SPI);
+	  r.src.family = r.dst.family = R2DP_AF_INET4;
+	  CHECK(r2dp_gcm_sa_prm(&r, keymat, 1, &prm, &ax, &eh2) == 0, "valid GCM SA accepted");
+	  r.enckeylen = 16;
+	  CHECK(r2dp_gcm_sa_prm(&r, keymat, 1, &prm, &ax, &eh2) == -EINVAL, "enckeylen 16 (no salt) refused");
+	  r.enckeylen = 20; r.integ = R2DP_INTEG_HMAC_SHA2_256_128;
+	  CHECK(r2dp_gcm_sa_prm(&r, keymat, 1, &prm, &ax, &eh2) == -EINVAL, "integ with AEAD refused");
+	  r.integ = R2DP_INTEG_NONE; r.authkeylen = 32;
+	  CHECK(r2dp_gcm_sa_prm(&r, keymat, 1, &prm, &ax, &eh2) == -EINVAL, "authkey with AEAD refused");
+	}
 
 	printf("%s\n", fails ? "FAIL" : "PASS");
 	teardown();

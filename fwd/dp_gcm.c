@@ -21,7 +21,11 @@ r2dp_gcm_sa_prm(const struct r2dp_sa *rsa, const void *key, int inbound,
 
 	if (rsa->mode != R2DP_MODE_TUNNEL || rsa->enc != R2DP_ENCR_AES_GCM_16)
 		return -EOPNOTSUPP;
+	/* AES-GCM-16 is an AEAD: the key blob is exactly cipher key (16) ||
+	 * salt (4) and there is no separate integrity transform or key. */
 	if (rsa->enckeylen != 20 || key == NULL)
+		return -EINVAL;
+	if (rsa->integ != R2DP_INTEG_NONE || rsa->authkeylen != 0)
 		return -EINVAL;
 	if (rsa->src.family != R2DP_AF_INET4 || rsa->dst.family != R2DP_AF_INET4)
 		return -EAFNOSUPPORT;

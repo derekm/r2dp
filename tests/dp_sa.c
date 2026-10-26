@@ -265,6 +265,11 @@ main(void)
 		    "SAD empty after delete");
 	}
 
+	/* key blob must match enckeylen + authkeylen exactly */
+	mk_sa(&r, 0x1101, "192.0.2.2", "192.0.2.1");
+	CHECK(sa_install(d, &r, key, 19, 0, 1) == -EINVAL, "short key blob refused");
+	CHECK(sa_install(d, &r, NULL, 0, 0, 1) == -EINVAL, "missing key blob refused");
+
 	/* --- 2. sa_by_policy prefers the newest outbound SA --- */
 	{
 		struct dp_sa *pick;
