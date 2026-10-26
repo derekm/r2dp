@@ -158,7 +158,9 @@ do_getspi(int fd, const struct r2dp_msg *m)
 	uint32_t cand;
 	int idx;
 
-	if (rq->dst.family == R2DP_AF_UNSET || lo > hi) {
+	/* SPIs 1..255 are reserved by IANA (RFC 4303 s2.1) and 0 is invalid:
+	 * never hand one out, whatever range the client asks for. */
+	if (rq->dst.family == R2DP_AF_UNSET || lo > hi || lo < 0x100) {
 		reply_sa(fd, m, EINVAL, NULL);
 		return;
 	}
@@ -367,9 +369,15 @@ do_sa(int fd, const struct r2dp_msg *m)
 			}
 		}
 		e->inbound = sa_is_inbound(e, rq);
+		/* The lifetime clock starts when key material is installed (the
+		 * larval promotion).  A lifetime-only UPDATE of a live SA must not
+		 * restart it, or repeated UPDATEs would keep an SA alive forever;
+		 * new thresholds apply against the original install time. */
+		if (e->larval) {
+			e->installed_at = time(NULL);
+			e->soft_notified = e->hard_notified = 0;
+		}
 		e->larval = 0; e->sa = *rq;
-		e->installed_at = time(NULL);
-		e->soft_notified = e->hard_notified = 0;
 		goto out_ok;
 	case R2DP_SA_DEL:
 		if (!e) { rc = ENOENT; goto out; }
@@ -404,6 +412,41 @@ scrub:
 	explicit_bzero(blob, sizeof(blob));
 }
 
+/* Selector prefix lengths must fit the address family. */
+static int
+sp_valid(const struct r2dp_sp *sp)
+{
+	const struct { const struct r2dp_addr *a; uint8_t p; } chk[] = {
+		{ &sp->sel_src, sp->pref_src }, { &sp->sel_dst, sp->pref_dst },
+	};
+
+	for (unsigned i = 0; i < 2; i++) {
+		unsigned max = chk[i].a->family == R2DP_AF_INET4 ? 32 :
+		    chk[i].a->family == R2DP_AF_INET6 ? 128 : 0;
+		if (chk[i].p > max)
+			return EINVAL;
+	}
+	return 0;
+}
+
+/* Next forwarder-assigned slid: never 0, never one already in use (the
+ * counter may wrap).  0 if the space is exhausted. */
+static uint32_t
+slid_alloc(struct fwd_ctl *c)
+{
+	for (uint32_t tries = 0; tries < FWD_MAXSP + 1; tries++) {
+		uint32_t s = c->next_slid++;
+		struct r2dp_sp k;
+		if (s == 0)
+			continue;
+		memset(&k, 0, sizeof(k));
+		k.slid = s;
+		if (!sp_find(c, &k, 0))
+			return s;
+	}
+	return 0;
+}
+
 static void
 do_sp(int fd, const struct r2dp_msg *m)
 {
@@ -412,11 +455,20 @@ do_sp(int fd, const struct r2dp_msg *m)
 	struct r2dp_sp out;
 
 	switch (m->h.type) {
-	case R2DP_SP_ADD:
+	case R2DP_SP_ADD: {
+		struct fwd_sp_ent prev;
+		int rc = sp_valid(rq);
+
+		if (rc) { reply_sp(fd, m, rc, rq, 0); return; }
 		e = sp_find(C, rq, 1);
 		if (e && !(rq->flags & R2DP_SPF_UPDATE)) {
 			reply_sp(fd, m, EEXIST, rq, 0);
 			return;
+		}
+		/* a client-chosen slid must not alias a different policy */
+		if (rq->slid) {
+			struct fwd_sp_ent *o = sp_find(C, rq, 0);
+			if (o && o != e) { reply_sp(fd, m, EEXIST, rq, 0); return; }
 		}
 		if (!e) {
 			int i;
@@ -424,24 +476,28 @@ do_sp(int fd, const struct r2dp_msg *m)
 				if (!C->spd[i].used) break;
 			if (i == FWD_MAXSP) { reply_sp(fd, m, ENOBUFS, rq, 0); return; }
 			e = &C->spd[i];
-			e->used = 1;
-			out = *rq; out.slid = rq->slid ? rq->slid : C->next_slid++;
+			out = *rq; out.slid = rq->slid ? rq->slid : slid_alloc(C);
+			if (!out.slid) { reply_sp(fd, m, ENOBUFS, rq, 0); return; }
 		} else {
 			out = *rq; out.slid = e->sp.slid;
 		}
 		out.flags &= ~R2DP_SPF_UPDATE;
-		e->sp = out;
+		prev = *e;
 		if (C->dp.ops && C->dp.ops->sp_add) {
 			int derr = C->dp.ops->sp_add(&C->dp, &out);
 			if (derr) {
-				/* don't commit a policy the dataplane refused */
-				e->used = 0;
+				/* Don't commit a policy the dataplane refused.  An upsert
+				 * keeps the previous policy (the dataplane still holds it);
+				 * a new add leaves the slot free. */
+				*e = prev;
 				reply_sp(fd, m, derr, rq, 0);
 				return;
 			}
 		}
+		e->used = 1;
+		e->sp = out;
 		reply_sp(fd, m, 0, &out, 0);
-		return;
+		return; }
 	case R2DP_SP_DEL:
 		e = rq->slid ? sp_find(C, rq, 0) : sp_find(C, rq, 1);
 		if (!e) { reply_sp(fd, m, ENOENT, rq, 0); return; }
@@ -573,7 +629,12 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 			struct r2dp_msg m;
 			if (!(pf[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
 			r = r2dp_recv(cli[i], &m);
-			if (r == 0) { dispatch(cli[i], &m); continue; }
+			if (r == 0)
+				dispatch(cli[i], &m);
+			/* the receive buffer may carry SA keys: scrub it */
+			explicit_bzero(&m, sizeof(m));
+			if (r == 0)
+				continue;
 			close(cli[i]); cli[i] = -1;   /* mark for removal */
 		}
 		/* compact out the -1 slots */

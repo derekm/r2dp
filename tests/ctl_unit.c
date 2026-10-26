@@ -138,6 +138,119 @@ t_direction(void)
 	CHECK(!(fk_last_flags & FWD_DP_SA_INBOUND), "dir=0 fresh ADD -> outbound");
 }
 
+static void
+mk_sp(struct r2dp_sp *sp, const char *src, uint8_t ps, const char *dst, uint8_t pd)
+{
+	memset(sp, 0, sizeof(*sp));
+	sp->dir = R2DP_DIR_OUT; sp->action = R2DP_ACT_PROTECT;
+	sp->mode = R2DP_MODE_TUNNEL; sp->protos = R2DP_SPP_ESP;
+	sp->ul_proto = R2DP_PROTO_ANY; sp->level = R2DP_LVL_REQUIRE;
+	sp->sel_src.family = sp->sel_dst.family = R2DP_AF_INET4;
+	inet_pton(AF_INET, src, sp->sel_src.addr);
+	inet_pton(AF_INET, dst, sp->sel_dst.addr);
+	sp->pref_src = ps; sp->pref_dst = pd;
+}
+
+static void
+t_reserved_spi(void)
+{
+	struct r2dp_sa sa;
+
+	mk_sa(&sa, 0);
+	sa.spi_min = 1; sa.spi_max = 0x200;
+	CHECK(req(R2DP_GETSPI, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == EINVAL,
+	    "GETSPI range reaching reserved SPIs 1..255 refused");
+	sa.spi_min = 0x100; sa.spi_max = 0x100;
+	CHECK(req(R2DP_GETSPI, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == 0,
+	    "GETSPI at 0x100 allowed");
+}
+
+static void
+t_prefix(void)
+{
+	struct r2dp_sp sp;
+
+	mk_sp(&sp, "10.0.0.0", 33, "10.1.0.0", 16);
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, NULL) == EINVAL,
+	    "v4 pref_src 33 refused");
+	mk_sp(&sp, "10.0.0.0", 8, "10.1.0.0", 200);
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, NULL) == EINVAL,
+	    "v4 pref_dst 200 refused");
+	mk_sp(&sp, "10.0.0.0", 32, "10.1.0.0", 0);
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, NULL) == 0,
+	    "v4 /32 -> /0 accepted");
+}
+
+static void
+t_lifetime_clock(void)
+{
+	struct r2dp_sa sa;
+	struct fwd_sa_ent *e;
+	uint8_t key[20] = { 0 };
+
+	mk_sa(&sa, 0x9001); sa.enckeylen = 20; sa.lft_hard_time = 100;
+	CHECK(req(R2DP_SA_ADD, 0, &sa, sizeof(sa), key, 20, NULL) == 0, "ADD for clock test");
+	e = sa_find(C, &sa);
+	if (!e) { CHECK(0, "SA present"); return; }
+	e->installed_at -= 50;            /* pretend 50s elapsed */
+	{
+		time_t t0 = e->installed_at;
+		mk_sa(&sa, 0x9001); sa.lft_hard_time = 200;
+		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == 0,
+		    "lifetime-only UPDATE");
+		CHECK(e->installed_at == t0, "lifetime-only UPDATE keeps the clock");
+		CHECK(e->sa.lft_hard_time == 200, "new hard lifetime applied");
+	}
+}
+
+static void
+t_sp_upsert(void)
+{
+	struct r2dp_sp sp;
+	struct r2dp_msg r;
+	uint32_t slid;
+	struct fwd_sp_ent *e;
+
+	mk_sp(&sp, "10.9.0.0", 16, "10.8.0.0", 16);
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, &r) == 0, "SP_ADD base");
+	slid = r2dp_msg_sp(&r)->slid;
+
+	/* upsert refused by the dataplane: previous policy kept */
+	sp.flags = R2DP_SPF_UPDATE; sp.action = R2DP_ACT_DISCARD;
+	fk_sp_fail = EIO;
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, NULL) == EIO,
+	    "failed upsert reports dp error");
+	fk_sp_fail = 0;
+	{
+		struct r2dp_sp k; memset(&k, 0, sizeof(k)); k.slid = slid;
+		e = sp_find(C, &k, 0);
+	}
+	CHECK(e && e->used && e->sp.action == R2DP_ACT_PROTECT,
+	    "failed upsert keeps the previous policy");
+
+	/* new add refused: slot stays free */
+	mk_sp(&sp, "10.7.0.0", 16, "10.6.0.0", 16);
+	fk_sp_fail = EIO;
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, NULL) == EIO, "failed add");
+	fk_sp_fail = 0;
+	CHECK(sp_find(C, &sp, 1) == NULL, "failed add leaves no ctl entry");
+
+	/* client-chosen slid aliasing another policy */
+	mk_sp(&sp, "10.5.0.0", 16, "10.4.0.0", 16); sp.slid = slid;
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, NULL) == EEXIST,
+	    "client slid colliding with another policy refused");
+
+	/* slid allocator skips 0 and in-use ids across wrap */
+	C->next_slid = UINT32_MAX;
+	mk_sp(&sp, "10.3.0.0", 16, "10.2.0.0", 16);
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, &r) == 0, "add at wrap");
+	CHECK(r2dp_msg_sp(&r)->slid == UINT32_MAX, "slid UINT32_MAX handed out");
+	mk_sp(&sp, "10.3.1.0", 24, "10.2.1.0", 24);
+	CHECK(req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, &r) == 0, "add after wrap");
+	CHECK(r2dp_msg_sp(&r)->slid != 0 && r2dp_msg_sp(&r)->slid != slid,
+	    "wrapped slid skips 0 and in-use ids (got %u)", r2dp_msg_sp(&r)->slid);
+}
+
 int
 main(void)
 {
@@ -149,6 +262,10 @@ main(void)
 	ctl.dp.ops = &fk_ops;
 
 	t_direction();
+	t_reserved_spi();
+	t_prefix();
+	t_lifetime_clock();
+	t_sp_upsert();
 
 	if (fails) { printf("ctl_unit: %d failures\n", fails); return 1; }
 	puts("ctl_unit: OK");
