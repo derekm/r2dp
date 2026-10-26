@@ -55,6 +55,33 @@ index 1170e61..6887c23 100644
  
    ESP AES-GCM (RFC 4106 ICV16), XFRM backend:
  
+diff --git a/iked/configure.ac b/iked/configure.ac
+index d783361..f96f6d2 100644
+--- a/iked/configure.ac
++++ b/iked/configure.ac
+@@ -432,5 +432,22 @@ esac
+ LDFLAGS="-L$RACOONLIBDIR $LDFLAGS"
+ LIBS="-lracoon $LIBS"
+ 
++dnl km-backend=r2dp: libracoon needs libr2dp; link it explicitly too so the
++dnl daemons do not rely on transitive DT_NEEDED resolution.
++if test x"$with_km_backend" = xr2dp; then
++	if test -n "$with_r2dp" && test x"$with_r2dp" != xyes; then
++		for d in "$with_r2dp"/lib/pkgconfig "$with_r2dp"/lib64/pkgconfig \
++		    "$with_r2dp"/lib/*/pkgconfig "$with_r2dp"/share/pkgconfig; do
++			test -d "$d" && PKG_CONFIG_PATH="$d${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
++		done
++		export PKG_CONFIG_PATH
++	fi
++	PKG_PROG_PKG_CONFIG
++	PKG_CHECK_MODULES([R2DP], [r2dp], [],
++		[AC_MSG_ERROR([libr2dp not found; pass --with-r2dp=PREFIX])])
++	r2dp_libdir=`$PKG_CONFIG --variable=libdir r2dp`
++	LIBS="$LIBS $R2DP_LIBS${r2dp_libdir:+ -Wl,-rpath,$r2dp_libdir}"
++fi
++
+ AC_CONFIG_FILES([Makefile iked.8])
+ AC_OUTPUT
 diff --git a/lib/Makefile.am b/lib/Makefile.am
 index 147b892..a12797b 100644
 --- a/lib/Makefile.am
@@ -79,22 +106,23 @@ index 147b892..a12797b 100644
  # libracoon.so.0). Bumping it to 1:0:0 (libracoon.so.1) IS the right ABI-drift
  # guard, but it is a coordinated deploy: every consumer (iked/spmd/kinkd) must
 diff --git a/lib/acinclude.m4 b/lib/acinclude.m4
-index bb89924..307ceb3 100644
+index bb89924..92cf6e2 100644
 --- a/lib/acinclude.m4
 +++ b/lib/acinclude.m4
-@@ -327,6 +327,33 @@ esac
+@@ -327,6 +327,32 @@ esac
  ])
  
  dnl
 +dnl Locate libr2dp (installed by the r2dp project) through pkg-config.
 +dnl --with-r2dp=PREFIX adds PREFIX's pkgconfig dirs (incl. multiarch libdirs).
++dnl An rpath to libr2dp's libdir is added so libracoon.so (and the daemons
++dnl linked against it) resolve libr2dp.so from a non-system prefix at both
++dnl link and run time.
 +AC_DEFUN([RC_WITH_R2DP],
 +[
 +AC_ARG_WITH(r2dp,
 +	[  --with-r2dp=PREFIX      prefix of an installed libr2dp (km-backend=r2dp)],
 +	[r2dp_prefix=$withval], [r2dp_prefix=])
-+AC_PATH_TOOL(PKG_CONFIG, pkg-config)
-+test -n "$PKG_CONFIG" || AC_MSG_ERROR([pkg-config is required to find libr2dp])
 +if test -n "$r2dp_prefix" && test x"$r2dp_prefix" != xyes; then
 +	for d in "$r2dp_prefix"/lib/pkgconfig "$r2dp_prefix"/lib64/pkgconfig \
 +	    "$r2dp_prefix"/lib/*/pkgconfig "$r2dp_prefix"/share/pkgconfig; do
@@ -102,21 +130,19 @@ index bb89924..307ceb3 100644
 +	done
 +	export PKG_CONFIG_PATH
 +fi
-+AC_MSG_CHECKING([for libr2dp])
-+if $PKG_CONFIG --exists r2dp; then
-+	R2DP_CFLAGS=`$PKG_CONFIG --cflags r2dp`
-+	R2DP_LIBS=`$PKG_CONFIG --libs r2dp`
-+	AC_MSG_RESULT([yes ($R2DP_LIBS)])
-+else
-+	AC_MSG_RESULT([no])
-+	AC_MSG_ERROR([libr2dp not found; build/install the r2dp project and pass --with-r2dp=PREFIX])
++PKG_PROG_PKG_CONFIG
++PKG_CHECK_MODULES([R2DP], [r2dp], [],
++	[AC_MSG_ERROR([libr2dp not found; build/install the r2dp project and pass --with-r2dp=PREFIX])])
++r2dp_libdir=`$PKG_CONFIG --variable=libdir r2dp`
++if test -n "$r2dp_libdir"; then
++	R2DP_LIBS="$R2DP_LIBS -Wl,-rpath,$r2dp_libdir"
 +fi
 +])
 +
  dnl SAD/SPD kernel backend: Linux NETLINK_XFRM vs BSD PF_KEY.
  dnl Same XOR source-file swap as iked RTSOCK (netlink.c vs rtsock.c).
  dnl
-@@ -334,9 +361,10 @@ AC_DEFUN([RC_KM_BACKEND],
+@@ -334,9 +360,10 @@ AC_DEFUN([RC_KM_BACKEND],
  [
  AC_MSG_CHECKING([kernel SAD/SPD backend])
  AC_ARG_WITH(km-backend,
@@ -129,14 +155,13 @@ index bb89924..307ceb3 100644
  	[km_backend=$withval], [km_backend=auto])
  if test x"$km_backend" = xauto; then
  	case $host_os in
-@@ -362,13 +390,21 @@ userspace)
+@@ -362,14 +389,25 @@ userspace)
  pfkey)
  	KM_IF=if_pfkeyv2.c
  	;;
 +r2dp)
 +	KM_IF=if_r2dp.c
 +	AC_DEFINE(HAVE_R2DP_KM, 1, [r2dp external-forwarder SAD/SPD backend])
-+	RC_WITH_R2DP
 +	;;
  *)
 -	AC_MSG_ERROR([--with-km-backend must be xfrm, pfkey, or userspace])
@@ -150,14 +175,19 @@ index bb89924..307ceb3 100644
 +AC_SUBST(R2DP_CFLAGS)
 +AC_SUBST(R2DP_LIBS)
  AC_MSG_RESULT([$km_backend ($KM_IF)])
++dnl Looked up after the backend result so configure output is not nested.
++if test x"$km_backend" = xr2dp; then
++	RC_WITH_R2DP
++fi
  ])
  
+ dnl
 diff --git a/lib/if_r2dp.c b/lib/if_r2dp.c
 new file mode 100644
-index 0000000..f0f8557
+index 0000000..112f282
 --- /dev/null
 +++ b/lib/if_r2dp.c
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,837 @@
 +/*
 + * lib/if_r2dp.c -- racoon2 SAD/SPD backend that speaks the r2dp control
 + * protocol to an external forwarder (e.g. the DPDK dataplane).
@@ -269,6 +299,7 @@ index 0000000..f0f8557
 +enc_from_wire(int w)
 +{
 +	switch (w) {
++	case 0:					/* no encryption (AH) */ return 0;
 +	case R2DP_ENCR_3DES:		return RCT_ALG_DES3_CBC;
 +	case R2DP_ENCR_NULL:		return RCT_ALG_NULL_ENC;
 +	case R2DP_ENCR_AES_CBC:		return RCT_ALG_RIJNDAEL_CBC;
@@ -281,13 +312,14 @@ index 0000000..f0f8557
 +	case R2DP_ENCR_AES_GCM_16:	return RCT_ALG_AES_GCM;
 +	case R2DP_ENCR_CHACHA20_POLY1305: return RCT_ALG_CHACHA20_POLY1305;
 +	}
-+	return 0;
++	return -1;
 +}
 +
 +static int
 +integ_from_wire(int w)
 +{
 +	switch (w) {
++	case R2DP_INTEG_NONE:		return RCT_ALG_NON_AUTH;
 +	case R2DP_INTEG_HMAC_MD5_96:	return RCT_ALG_HMAC_MD5;
 +	case R2DP_INTEG_HMAC_SHA1_96:	return RCT_ALG_HMAC_SHA1;
 +	case R2DP_INTEG_AES_XCBC_96:	return RCT_ALG_AES_XCBC;
@@ -296,7 +328,7 @@ index 0000000..f0f8557
 +	case R2DP_INTEG_HMAC_SHA2_384_192: return RCT_ALG_HMAC_SHA2_384;
 +	case R2DP_INTEG_HMAC_SHA2_512_256: return RCT_ALG_HMAC_SHA2_512;
 +	}
-+	return RCT_ALG_NON_AUTH;
++	return -1;
 +}
 +
 +static int
@@ -318,7 +350,7 @@ index 0000000..f0f8557
 +	case R2DP_PROTO_AH:	return RCT_SATYPE_AH;
 +	case R2DP_PROTO_IPCOMP:	return RCT_SATYPE_IPCOMP;
 +	}
-+	return 0;
++	return -1;
 +}
 +
 +static int
@@ -332,7 +364,7 @@ index 0000000..f0f8557
 +mode_from_wire(int m)
 +{
 +	return m == R2DP_MODE_TRANSPORT ? RCT_IPSM_TRANSPORT :
-+	       m == R2DP_MODE_TUNNEL ? RCT_IPSM_TUNNEL : 0;
++	       m == R2DP_MODE_TUNNEL ? RCT_IPSM_TUNNEL : -1;
 +}
 +
 +static int
@@ -348,7 +380,7 @@ index 0000000..f0f8557
 +{
 +	return d == R2DP_DIR_IN ? RCT_DIR_INBOUND :
 +	       d == R2DP_DIR_OUT ? RCT_DIR_OUTBOUND :
-+	       d == R2DP_DIR_FWD ? RCT_DIR_FWD : 0;
++	       d == R2DP_DIR_FWD ? RCT_DIR_FWD : -1;
 +}
 +
 +static int
@@ -367,7 +399,7 @@ index 0000000..f0f8557
 +{
 +	return a == R2DP_ACT_PROTECT ? RCT_ACT_AUTO_IPSEC :
 +	       a == R2DP_ACT_DISCARD ? RCT_ACT_DISCARD :
-+	       a == R2DP_ACT_BYPASS ? RCT_ACT_NONE : 0;
++	       a == R2DP_ACT_BYPASS ? RCT_ACT_NONE : -1;
 +}
 +
 +static int
@@ -381,7 +413,8 @@ index 0000000..f0f8557
 +level_from_wire(int l)
 +{
 +	return l == R2DP_LVL_USE ? RCT_IPSL_USE :
-+	       l == R2DP_LVL_UNIQUE ? RCT_IPSL_UNIQUE : RCT_IPSL_REQUIRE;
++	       l == R2DP_LVL_UNIQUE ? RCT_IPSL_UNIQUE :
++	       l == R2DP_LVL_REQUIRE ? RCT_IPSL_REQUIRE : -1;
 +}
 +
 +static int
@@ -411,7 +444,7 @@ index 0000000..f0f8557
 +	case R2DP_SPP_ESP | R2DP_SPP_IPCOMP: return RCT_SATYPE_ESP_IPCOMP;
 +	case R2DP_SPP_AH | R2DP_SPP_ESP | R2DP_SPP_IPCOMP: return RCT_SATYPE_AH_ESP_IPCOMP;
 +	}
-+	return 0;
++	return -1;
 +}
 +
 +/* ------------------------------------------------------------ lifecycle */
@@ -460,7 +493,7 @@ index 0000000..f0f8557
 +
 +	if (w < 0)
 +		return 0;
-+	return have_caps ? r2dp_cap(caps.enc_caps, w) : 1;
++	return have_caps ? r2dp_cap(caps.enc_caps, w) : 0;
 +}
 +
 +int
@@ -470,7 +503,7 @@ index 0000000..f0f8557
 +
 +	if (w < 0)
 +		return 0;
-+	return have_caps ? r2dp_cap(caps.integ_caps, w) : 1;
++	return have_caps ? r2dp_cap(caps.integ_caps, w) : 0;
 +}
 +
 +/* ----------------------------------------------------------------- send */
@@ -520,13 +553,71 @@ index 0000000..f0f8557
 +static int
 +pack_addr(struct rcpfk_msg *rc, struct r2dp_addr *a, struct sockaddr *sa)
 +{
-+	int r = r2dp_addr_from_sa(a, sa);
++	int r;
++
++	if (sa != NULL && sa->sa_family == AF_INET6) {
++		km_seterror(rc, EOPNOTSUPP, "IPv6 not supported by r2dp backend");
++		return -1;
++	}
++	r = r2dp_addr_from_sa(a, sa);
 +
 +	if (r < 0) {
 +		km_seterror(rc, -r, "unsupported address family");
 +		return -1;
 +	}
 +	return 0;
++}
++
++/* Per-tunnel egress reqid.  racoon2 passes reqid=0 (XFRM treats 0 as a
++ * wildcard and ignores it for SA selection), but the forwarder links SP->SA
++ * by reqid, so all-zero reqids would collapse every tunnel onto one egress
++ * SA.  When the caller has not set one, derive a stable, nonzero per-tunnel
++ * reqid from the tunnel endpoints + protocol so the SP_ADD and its
++ * SA_ADD/UPDATE always agree.  Any real rc->reqid is passed through
++ * untouched. */
++/* Hash only the address family and raw address bytes: the SP carries the
++ * tunnel endpoints with port 0 while iked's SA sockaddrs carry the IKE port
++ * (500/4500), and sin_zero / sin6_flowinfo may be uninitialised, so hashing
++ * the whole sockaddr made SP and SA reqids disagree. */
++static uint32_t
++fnv1a(uint32_t h, const void *p, size_t n)
++{
++	const unsigned char *b = p;
++
++	while (n--)
++		h = (h ^ *b++) * 16777619u;
++	return h;
++}
++
++static uint32_t
++reqid_addr(uint32_t h, const struct sockaddr *sa)
++{
++	unsigned char af;
++
++	if (sa == NULL)
++		return fnv1a(h, "", 1);
++	af = (unsigned char)sa->sa_family;
++	h = fnv1a(h, &af, 1);
++	switch (sa->sa_family) {
++	case AF_INET:
++		return fnv1a(h, &((const struct sockaddr_in *)(const void *)sa)->sin_addr, 4);
++	case AF_INET6:
++		return fnv1a(h, &((const struct sockaddr_in6 *)(const void *)sa)->sin6_addr, 16);
++	default:
++		return h;
++	}
++}
++
++static uint32_t
++tunnel_reqid(const struct sockaddr *src, const struct sockaddr *dst, int satype)
++{
++	uint32_t h = 2166136261u;
++	unsigned char p = (unsigned char)satype;
++
++	h = reqid_addr(h, src);
++	h = reqid_addr(h, dst);
++	h = fnv1a(h, &p, 1);
++	return h ? h : 0x1234ABCDu;
 +}
 +
 +/*
@@ -547,6 +638,14 @@ index 0000000..f0f8557
 +		km_seterror(rc, EOPNOTSUPP, "IPComp not supported by r2dp");
 +		return -1;
 +	}
++	/* NAT-T (ESP-in-UDP 4500) is supported by the forwarder (advertised via
++	 * the R2DP_FEAT_NATT HELLO bit) for both directions; the forwarder's
++	 * outer-tap demux handles it.  Only an unknown encapsulation is refused. */
++	if (rc->natt_type && rc->natt_type != UDP_ENCAP_ESPINUDP) {
++		km_seterror(rc, EOPNOTSUPP, "unknown NAT-T encapsulation %d",
++		    rc->natt_type);
++		return -1;
++	}
 +	m = mode_to_wire(rc->samode);
 +	e = enc_to_wire(rc->enctype);
 +	i = integ_to_wire(rc->authtype);
@@ -565,7 +664,8 @@ index 0000000..f0f8557
 +	sa->enc = e < 0 ? 0 : (uint8_t)e;
 +	sa->integ = i < 0 ? 0 : (uint8_t)i;
 +	sa->spi = rc->spi;
-+	sa->reqid = rc->reqid;
++	sa->reqid = rc->reqid ? rc->reqid :
++	    tunnel_reqid(rc->sa_src, rc->sa_dst, rc->satype);
 +	sa->saflags = (rc->saflags & SADB_X_SAFLAGS_ESN) ? R2DP_SAF_ESN : 0;
 +	sa->wsize = rc->wsize;
 +	sa->spi_min = rc_spirange_min;
@@ -657,7 +757,8 @@ index 0000000..f0f8557
 +			return -1;
 +	}
 +	sp.slid = rc->slid;
-+	sp.reqid = rc->reqid;
++	sp.reqid = rc->reqid ? rc->reqid :
++	    tunnel_reqid(rc->sa_src, rc->sa_dst, rc->satype);
 +	sp.flags = spflags;
 +	sp.ul_proto = rc->ul_proto;
 +	sp.pref_src = rc->pref_src;
@@ -698,15 +799,33 @@ index 0000000..f0f8557
 +	*out = (r2dp_addr_to_sa(a, st) == 0) ? (struct sockaddr *)st : NULL;
 +}
 +
-+static void
++static int
 +unpack_sa(struct rcpfk_msg *rc, const struct r2dp_sa *sa)
 +{
++	int v;
++
 +	rc->spi = sa->spi;
 +	rc->reqid = sa->reqid;
-+	rc->satype = (uint8_t)proto_from_wire(sa->proto);
-+	rc->samode = (uint8_t)mode_from_wire(sa->mode);
-+	rc->enctype = (uint8_t)enc_from_wire(sa->enc);
-+	rc->authtype = (uint8_t)integ_from_wire(sa->integ);
++	if ((v = proto_from_wire(sa->proto)) < 0) {
++		km_seterror(rc, EINVAL, "r2dp: unknown satype %u", sa->proto);
++		return -1;
++	}
++	rc->satype = (uint8_t)v;
++	if ((v = mode_from_wire(sa->mode)) < 0) {
++		km_seterror(rc, EINVAL, "r2dp: unknown mode %u", sa->mode);
++		return -1;
++	}
++	rc->samode = (uint8_t)v;
++	if ((v = enc_from_wire(sa->enc)) < 0) {
++		km_seterror(rc, EINVAL, "r2dp: unknown enc alg %u", sa->enc);
++		return -1;
++	}
++	rc->enctype = (uint8_t)v;
++	if ((v = integ_from_wire(sa->integ)) < 0) {
++		km_seterror(rc, EINVAL, "r2dp: unknown integ alg %u", sa->integ);
++		return -1;
++	}
++	rc->authtype = (uint8_t)v;
 +	rc->saflags = (sa->saflags & R2DP_SAF_ESN) ? SADB_X_SAFLAGS_ESN : 0;
 +	rc->wsize = sa->wsize;
 +	rc->natt_type = sa->natt_type ? UDP_ENCAP_ESPINUDP : 0;
@@ -731,18 +850,51 @@ index 0000000..f0f8557
 +	unpack_addr(&sa->dst, &rc->sa_dst_storage, &rc->sa_dst);
 +	unpack_addr(&sa->natoa_src, &rc->sa_natoa_src_storage, &rc->sa_natoa_src);
 +	unpack_addr(&sa->natoa_dst, &rc->sa_natoa_dst_storage, &rc->sa_natoa_dst);
++	return 0;
 +}
 +
-+static void
++static int
 +unpack_sp(struct rcpfk_msg *rc, const struct r2dp_sp *sp)
 +{
++	int v;
++
 +	rc->slid = sp->slid;
 +	rc->reqid = sp->reqid;
-+	rc->dir = (uint8_t)dir_from_wire(sp->dir);
-+	rc->pltype = (uint8_t)act_from_wire(sp->action);
-+	rc->samode = (uint8_t)mode_from_wire(sp->mode);
-+	rc->satype = (uint8_t)protos_from_wire(sp->protos);
-+	rc->ipsec_level = (uint8_t)level_from_wire(sp->level);
++	if ((v = dir_from_wire(sp->dir)) < 0) {
++		km_seterror(rc, EINVAL, "r2dp: unknown dir %u", sp->dir);
++		return -1;
++	}
++	rc->dir = (uint8_t)v;
++	if ((v = act_from_wire(sp->action)) < 0) {
++		km_seterror(rc, EINVAL, "r2dp: unknown action %u", sp->action);
++		return -1;
++	}
++	rc->pltype = (uint8_t)v;
++	/* mode/protos are only meaningful for a PROTECT policy; send_sp packs
++	 * them as 0 for BYPASS/DISCARD (memset at send_sp), so demanding a
++	 * translation for every action would EINVAL every non-PROTECT SP the
++	 * forwarder echoes back (SP_DUMP / SP_ADD / SP_DEL completions), broken
++	 * SPD sync.  Only translate when PROTECT. */
++	if (sp->action == R2DP_ACT_PROTECT) {
++		if ((v = mode_from_wire(sp->mode)) < 0) {
++			km_seterror(rc, EINVAL, "r2dp: unknown mode %u", sp->mode);
++			return -1;
++		}
++		rc->samode = (uint8_t)v;
++		if ((v = protos_from_wire(sp->protos)) < 0) {
++			km_seterror(rc, EINVAL, "r2dp: unknown protos %u", sp->protos);
++			return -1;
++		}
++		rc->satype = (uint8_t)v;
++	} else {
++		rc->samode = 0;
++		rc->satype = 0;
++	}
++	if ((v = level_from_wire(sp->level)) < 0) {
++		km_seterror(rc, EINVAL, "r2dp: unknown level %u", sp->level);
++		return -1;
++	}
++	rc->ipsec_level = (uint8_t)v;
 +	rc->ul_proto = sp->ul_proto;
 +	rc->pref_src = sp->pref_src;
 +	rc->pref_dst = sp->pref_dst;
@@ -756,6 +908,7 @@ index 0000000..f0f8557
 +	unpack_addr(&sp->sel_dst, &rc->sp_dst_storage, &rc->sp_dst);
 +	unpack_addr(&sp->tun_src, &rc->sa_src_storage, &rc->sa_src);
 +	unpack_addr(&sp->tun_dst, &rc->sa_dst_storage, &rc->sa_dst);
++	return 0;
 +}
 +
 +/* Parse one validated message into rc and run the matching callback. */
@@ -773,10 +926,12 @@ index 0000000..f0f8557
 +	switch (m->h.type) {
 +	case R2DP_GETSPI: case R2DP_SA_ADD: case R2DP_SA_UPDATE:
 +	case R2DP_SA_DEL: case R2DP_SA_GET: case R2DP_EXPIRE: case R2DP_ACQUIRE:
-+		unpack_sa(rc, r2dp_msg_sa(m));
++		if (unpack_sa(rc, r2dp_msg_sa(m)) < 0)
++			return -1;
 +		break;
 +	case R2DP_SP_ADD: case R2DP_SP_DEL: case R2DP_SP_GET: case R2DP_SP_DUMP:
-+		unpack_sp(rc, r2dp_msg_sp(m));
++		if (unpack_sp(rc, r2dp_msg_sp(m)) < 0)
++			return -1;
 +		break;
 +	default:
 +		return 0;	/* HELLO_ACK etc.: nothing for iked/spmd */
@@ -870,3 +1025,32 @@ index 0000000..f0f8557
 +	km_seterror(rc, ETIMEDOUT, "no r2dp reply to seq %u", rc->seq);
 +	return -1;
 +}
+diff --git a/spmd/configure.ac b/spmd/configure.ac
+index 957af58..ab8e8a4 100644
+--- a/spmd/configure.ac
++++ b/spmd/configure.ac
+@@ -131,6 +131,24 @@ AC_MSG_RESULT($libracoon_path)
+ dnl --with-openssl-libdir
+ RC_WITH_OPENSSL_LIB
+ 
++dnl km-backend=r2dp: libracoon needs libr2dp; link it explicitly too so the
++dnl daemons do not rely on transitive DT_NEEDED resolution.
++if test x"$with_km_backend" = xr2dp; then
++	if test -n "$with_r2dp" && test x"$with_r2dp" != xyes; then
++		for d in "$with_r2dp"/lib/pkgconfig "$with_r2dp"/lib64/pkgconfig \
++		    "$with_r2dp"/lib/*/pkgconfig "$with_r2dp"/share/pkgconfig; do
++			test -d "$d" && PKG_CONFIG_PATH="$d${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
++		done
++		export PKG_CONFIG_PATH
++	fi
++	PKG_PROG_PKG_CONFIG
++	PKG_CHECK_MODULES([R2DP], [r2dp], [],
++		[AC_MSG_ERROR([libr2dp not found; pass --with-r2dp=PREFIX])])
++	r2dp_libdir=`$PKG_CONFIG --variable=libdir r2dp`
++	LIBS="$LIBS $R2DP_LIBS${r2dp_libdir:+ -Wl,-rpath,$r2dp_libdir}"
++fi
++
++
+ AC_CHECK_HEADER(openssl/evp.h)
+ 
+ RC_CHECK_MAKE

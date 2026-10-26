@@ -21,7 +21,7 @@ See `MILESTONES.md` for the full plan, exit gates, and findings.
 | `include/r2dp/proto.h` | the wire contract (algorithms = IANA IKEv2 IDs, protocols = IP proto numbers) |
 | `include/r2dp/client.h`, `libr2dp/` | transport, validation, address helpers (client + server side) |
 | `tools/mockfwd.c` | `r2dp-mockfwd`: protocol-faithful forwarder with no dataplane |
-| `patches/racoon2-r2dp-backend.patch` | applies to racoon2 `93e3511` (pre-r2dp base): the r2dp backend |
+| `patches/racoon2-r2dp-backend.patch` | applies to racoon2 `93e3511` (pre-r2dp base): the r2dp backend, generated from derekm/racoon2 `feat/r2dp-km-backend` @ `1bf8eb1` (`git diff 93e3511 1bf8eb1`) |
 | `tests/` | `test_proto`, `test_mock`, `shim_contract` (meson); spin `r2dp-mockfwd` |
 | `build.sh` | deps / check / build / test / sanitize / e2e / milestones |
 
