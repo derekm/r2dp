@@ -2183,8 +2183,9 @@ worker_main(void *arg)
 			struct rte_mbuf *b[BURST_SZ];
 			struct rte_mbuf *ob[BURST_SZ], *ib[BURST_SZ];
 			uint16_t no = 0, ni = 0;
+			unsigned avail = 0;
 			uint16_t nd = rte_ring_sc_dequeue_burst(w->rxq,
-			    (void **)b, BURST_SZ);
+			    (void **)b, BURST_SZ, &avail);
 			for (uint16_t k = 0; k < nd; k++) {
 				if (d->inner_port >= 0 &&
 				    (int)b[k]->port == d->inner_port)
