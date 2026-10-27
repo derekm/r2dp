@@ -49,6 +49,7 @@
 #include <rte_lcore.h>
 #include <rte_mempool.h>
 #include <rte_rcu_qsbr.h>
+#include <rte_ring.h>
 #include <rte_acl.h>
 
 #include "r2dp/client.h"
@@ -226,6 +227,8 @@ struct dpdk_priv {
 	 * nb workers / queues set up in fwd_dp_dpdk_probe. */
 	uint16_t            nworkers;
 	struct dp_worker    *w;        /* array [nworkers] */
+	unsigned            dist_lcore;/* distributor lcore (RTE_MAX_LCORE = none) */
+	int                 have_dist; /* 1 => per-worker rx rings are live */
 	rte_spinlock_t      lock;
 	struct rte_rcu_qsbr *rcu;   /* H5: QSBR for the ctl<->worker SA/SP handoff */
 	struct dp_sa        sa_tab[MAX_SA];
@@ -245,8 +248,9 @@ struct dpdk_priv {
 struct dp_worker {
 	struct dpdk_priv *d;       /* shared priv (SAD/SPD/pools) */
 	unsigned            lcore;
-	uint16_t            qid;        /* rx/tx queue on both ports */
+	uint16_t            qid;        /* tx queue on both ports */
 	uint16_t            cqp;        /* cryptodev queue pair */
+	struct rte_ring    *rxq;        /* SPSC ring fed by the distributor */
 	struct r2dp_nh_tab  nh;         /* per-worker next-hop table */
 	uint8_t             our_mac[6];      /* outer (peer) tap MAC */
 	uint8_t             our_inner_mac[6]; /* inner (plaintext host) tap MAC */
@@ -1787,13 +1791,71 @@ is_tunnel_peer(struct dpdk_priv *d, uint32_t ip)
 	return 0;
 }
 
+static inline uint32_t
+pkt_flow_hash(const struct rte_mbuf *mb)
+{
+	/* Stable per-flow key so one SA stays on one worker (anti-replay and
+	 * the rte_ipsec session are per-SA, NOT safe to touch concurrently).
+	 * ESP -> (outer dst IP, SPI).  Everything else (IKE, inner/plaintext)
+	 * -> (src ^ dst ^ proto).  CRC32 the key for a flat distribution. */
+	const uint8_t *p = rte_pktmbuf_mtod(mb, const uint8_t *);
+	uint32_t pl = rte_pktmbuf_pkt_len(mb);
+	uint32_t h = 0x9e3779b9;
+	const struct rte_ipv4_hdr *ip;
+	if (pl < RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
+		return 0;
+	ip = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
+	if (((ip->version_ihl >> 4) != 4))
+		return 0;
+	h += ip->src_addr ^ ip->dst_addr ^ (uint32_t)ip->next_proto_id;
+	if (ip->next_proto_id == IPPROTO_ESP && pl >= RTE_ETHER_HDR_LEN + 20 + 8) {
+		const struct rte_esp_hdr *es = (const struct rte_esp_hdr *)
+		    (p + RTE_ETHER_HDR_LEN + 20);
+		h = (h << 5) + h + ntohl(es->spi);
+	}
+	return h;
+}
+
+/* Software distributor: one lcore drains EVERY tap RX queue on both ports
+ * and fans each packet out to the owning worker's SPSC ring.  This decouples
+ * worker assignment from the PMD/kernel RSS hash (which is uneven -- e.g.
+ * 8 flows landed on 2 workers) and hands it to the forwarder: worker =
+ * pkt_flow_hash % nworkers.  The mbuf's .port (set by rx_burst) is preserved
+ * so the worker knows which side to process it on. */
+static int
+distributor_main(void *arg)
+{
+	struct dpdk_priv *d = arg;
+	uint16_t ports[2]; int np = 0;
+	struct rte_mbuf *bufs[BURST_SZ];
+
+	if (d->port_id >= 0) ports[np++] = (uint16_t)d->port_id;
+	if (d->inner_port >= 0) ports[np++] = (uint16_t)d->inner_port;
+	if (np == 0) return 0;
+	while (d->running) {
+		for (int pi = 0; pi < np; pi++) {
+			uint16_t p = ports[pi];
+			uint16_t nq = (pi == 0) ? d->nworkers : d->nworkers;
+			for (uint16_t q = 0; q < nq; q++) {
+				uint16_t nr = rte_eth_rx_burst(p, q, bufs, BURST_SZ);
+				for (uint16_t i = 0; i < nr; i++) {
+					struct dp_worker *w = &d->w[
+					    pkt_flow_hash(bufs[i]) % d->nworkers];
+					if (rte_ring_sp_enqueue(w->rxq, bufs[i]) != 0)
+						rte_pktmbuf_free(bufs[i]);
+				}
+			}
+		}
+	}
+	return 0;
+}
+
 static void
-worker_outer(struct dp_worker *w, int port)
+worker_outer(struct dp_worker *w, int port,
+    struct rte_mbuf *bufs[], uint16_t nr)
 {
 	struct dpdk_priv *d = w->d;
-	struct rte_mbuf *bufs[BURST_SZ];
 	struct rte_mbuf *esp[BURST_SZ], *exc[BURST_SZ];
-	uint16_t nr = rte_eth_rx_burst(port, w->qid, bufs, BURST_SZ);
 
 	if (nr == 0)
 		return;
