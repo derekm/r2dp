@@ -158,7 +158,7 @@ measure(struct dpdk_priv *a, struct dpdk_priv *b, unsigned sz, int rep,
 			for (int i = 0; i < BURST; i++)
 				mk_inner(in[i], sz);
 			t = rte_rdtsc_precise();
-			esp_outbound(a, in, BURST, out, &no, &nb);
+			esp_outbound(&wa, in, BURST, out, &no, &nb);
 			ce += rte_rdtsc_precise() - t;
 			for (int i = 0; i < no; i++) {
 				uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(out[i], 14);
@@ -172,7 +172,7 @@ measure(struct dpdk_priv *a, struct dpdk_priv *b, unsigned sz, int rep,
 			struct rte_mbuf *o[BURST_SZ];
 			uint16_t n = RTE_MIN((unsigned)BURST, got - i), k = 0;
 			uint64_t t = rte_rdtsc_precise();
-			esp_inbound(b, &espq[i], n, o, &k);
+			esp_inbound(&wb, &espq[i], n, o, &k);
 			cd += rte_rdtsc_precise() - t;
 			ok += k;
 			rte_pktmbuf_free_bulk(o, k);
@@ -204,6 +204,7 @@ main(int argc, char **argv)
 	struct rte_cryptodev_config cc;
 	struct rte_cryptodev_qp_conf qc;
 	struct dpdk_priv *a, *b;
+	struct dp_worker wa, wb;   /* single worker driving each side's data path */
 	struct r2dp_sa r;
 	double enc[3], dec[3];
 	int check = 0, have = 1, fails = 0;
@@ -234,6 +235,11 @@ main(int argc, char **argv)
 	    RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
 	a = mk_priv("A"); b = mk_priv("B");
 	if (!mp || !a || !b) { puts("setup FAILED"); return 1; }
+	/* wire a single local worker per side (own queue 0 / crypto qp 0) */
+	memset(&wa, 0, sizeof(wa)); memset(&wb, 0, sizeof(wb));
+	wa.d = a; wb.d = b;
+	wa.qid = 0; wb.qid = 0;
+	wa.cqp = 0; wb.cqp = 0;
 
 	/* the measured tunnel: 10.2.0.0/24 -> 10.1.0.0/24 */
 	mk_sa(&r, 0x5001, "192.0.2.1", "192.0.2.2"); r.dir = R2DP_DIR_OUT;
