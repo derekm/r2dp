@@ -115,6 +115,8 @@ struct dp_sp_ent {
  * records the SA's install generation: if the slot has since been retired or
  * reused the generations differ and the packet is dropped (fail closed)
  * until the next rebuild. */
+#define PEER_HSZ 4096     /* power of two, > 2 * (2 * MAX_SA) */
+
 struct dp_pol {
 	const struct r2dp_sp *sp;
 	int32_t  sa_idx;          /* bound EGRESS SA slot, -1 = none */
@@ -127,6 +129,17 @@ struct dp_spd {
 	uint32_t       nout;
 	struct dp_pol *out;       /* OUT policies, most specific first */
 	struct rte_acl_ctx *acl;  /* OUT classifier over out[] (NULL: none) */
+	/* Inbound (RFC 4301 s5.2) check, indexed by SA slot: the IN/FWD PROTECT
+	 * policies whose tunnel endpoints/reqid fit that SA are
+	 * in_pol[in_off[slot] .. in_off[slot+1]), valid while the slot's gen
+	 * still equals in_gen[slot] (else the worker falls back to a scan). */
+	uint32_t      *in_off;              /* MAX_SA + 1 */
+	uint64_t      *in_gen;              /* MAX_SA */
+	const struct r2dp_sp **in_pol;
+	/* Tunnel peers (far ends of SAs and PROTECT policies), open addressing,
+	 * 0 = empty; peer_zero records 0.0.0.0 itself. */
+	uint32_t       peer[PEER_HSZ];
+	int            peer_zero;
 };
 
 /* rte_acl key for the OUT SPD.  Addresses/ports are raw wire order (rte_acl
@@ -324,6 +337,7 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 
 static int spd_rebuild_ex(struct dpdk_priv *d, int policies_changed);
 #define spd_rebuild(d) spd_rebuild_ex((d), 0)
+static int in_pol_fits(const struct r2dp_sp *sp, const struct dp_sa *ds);
 
 /* Tear down one slot: free the crypto session, ipsec SA, and zero it.
  * Caller holds d->lock. */
@@ -640,6 +654,75 @@ port_init(struct dpdk_priv *d, uint16_t port)
  * packets are freed.  Returns the number of mbufs consumed from `in`. */
 static int in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
     struct rte_mbuf *mb);
+/* Run n packets of ONE SA through lookaside crypto as a batch:
+ * bulk op alloc -> rte_ipsec prepare -> enqueue -> dequeue (all of it) ->
+ * per-op status check -> rte_ipsec process.  Every mbuf in mb[] is consumed:
+ * the successfully processed ones are returned in ok[] (count returned),
+ * every other one is dropped (counted, freed).  A failed op (AUTH_FAILED on
+ * a forged ICV, any error) never reaches rte_ipsec_pkt_process, which does
+ * not inspect op status (fail closed). */
+static uint16_t
+crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
+    struct rte_mbuf *mb[], uint16_t n, struct rte_mbuf *ok[])
+{
+	struct rte_crypto_op *cop[BURST_SZ];
+	uint16_t k, enq, dq = 0, ng = 0, proc;
+	unsigned spins = 0;
+
+	if (rte_crypto_op_bulk_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC,
+	    cop, n) == 0) {
+		for (uint16_t i = 0; i < n; i++) {
+			d->n_drop++;
+			rte_pktmbuf_free(mb[i]);
+		}
+		return 0;
+	}
+	for (uint16_t i = 0; i < n; i++)
+		rte_crypto_op_attach_sym_session(cop[i], ss->crypto.ses);
+	/* prepare moves the mbufs it rejected to the tail */
+	k = rte_ipsec_pkt_crypto_prepare(ss, mb, cop, n);
+	for (uint16_t i = k; i < n; i++) {
+		d->n_drop++;
+		rte_pktmbuf_free(mb[i]);
+	}
+	enq = k ? rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, k) : 0;
+	for (uint16_t i = enq; i < k; i++) {
+		d->n_drop++;
+		rte_pktmbuf_free(mb[i]);
+	}
+	if (enq < n)
+		rte_mempool_put_bulk(d->cop_mp, (void **)&cop[enq], n - enq);
+	/* own every op before touching any mbuf again (async PMDs) */
+	while (dq < enq) {
+		uint16_t got = rte_cryptodev_dequeue_burst(d->cdev_id, 0,
+		    &cop[dq], enq - dq);
+		dq += got;
+		if (!got && ++spins > (1u << 24))
+			break;           /* stuck device: leave its ops */
+	}
+	for (uint16_t i = 0; i < dq; i++) {
+		struct rte_mbuf *m = cop[i]->sym->m_src;
+		if (cop[i]->status == RTE_CRYPTO_OP_STATUS_SUCCESS)
+			ok[ng++] = m;
+		else {
+			d->n_drop++;
+			rte_pktmbuf_free(m);
+		}
+	}
+	if (dq)
+		rte_mempool_put_bulk(d->cop_mp, (void **)cop, dq);
+	d->n_drop += enq - dq;       /* abandoned in a stuck device */
+	if (!ng)
+		return 0;
+	/* process moves the mbufs it rejected (e.g. replay) to the tail */
+	proc = rte_ipsec_pkt_process(ss, ok, ng);
+	for (uint16_t i = proc; i < ng; i++) {
+		d->n_drop++;
+		rte_pktmbuf_free(ok[i]);
+	}
+	return proc;
+}
+
 static uint16_t
 esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout)
@@ -792,122 +875,36 @@ bad:
 		return nk;
 	}
 
-	/* per matched packet: prepare -> enqueue -> dequeue -> process */
-	struct rte_crypto_op *cop[1];
-	for (uint32_t i = 0; i < nk; i++) {
-		if (sas[i] == NULL) {
-			if (d->verbose)
-				fprintf(stderr, "r2dp-fwd: esp sas[%u]=NULL\n", i);
-			rte_pktmbuf_free(pm[i]);   /* partial match: drop */
-			continue;
-		}
+	/* Batch per run of packets on the same SA: one bulk op alloc, prepare,
+	 * enqueue and dequeue per run instead of per packet. */
+	for (uint32_t i = 0; i < nk; ) {
 		struct rte_ipsec_session *ss = sas[i];
-		cop[0] = rte_crypto_op_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
-		if (cop[0] == NULL) {
-			/* pool exhausted: drop the packet, don't leak it */
-			rte_pktmbuf_free(pm[i]);
-			continue;
-		}
-		rte_crypto_op_attach_sym_session(cop[0], ss->crypto.ses);
-		if (d->verbose)
-			fprintf(stderr,
-			    "r2dp-fwd: pre-prepare pkt_len=%u data_len=%u data_off=%u "
-			    "l2=%u l3=%u\n",
-			    (unsigned)rte_pktmbuf_pkt_len(pm[i]),
-			    (unsigned)rte_pktmbuf_data_len(pm[i]),
-			    (unsigned)rte_pktmbuf_headroom(pm[i]),
-			    (unsigned)pm[i]->l2_len, (unsigned)pm[i]->l3_len);
-		uint16_t np = rte_ipsec_pkt_crypto_prepare(ss, &pm[i], cop, 1);
-		if (d->verbose) {
-			uint8_t *b = rte_pktmbuf_mtod(pm[i], uint8_t *);
-			fprintf(stderr,
-			    "r2dp-fwd: post-prepare pkt=%u len=%u data.off=%u "
-			    "data.len=%u msrc=%p aadoff=%ld ivec=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-			    (unsigned)rte_pktmbuf_pkt_len(pm[i]),
-			    (unsigned)rte_pktmbuf_data_len(pm[i]),
-			    (unsigned)cop[0]->sym->aead.data.offset,
-			    (unsigned)cop[0]->sym->aead.data.length,
-			    (void *)cop[0]->sym->m_src,
-			    (long)((uint8_t *)cop[0]->sym->aead.aad.data - b),
-			    b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]);
-		fprintf(stderr, "r2dp-fwd: sa_type=%u\n",
-		    (unsigned)rte_ipsec_sa_type(ss->sa));
-	}
-	if (np == 0) {
-		rte_crypto_op_free(cop[0]);
-		rte_pktmbuf_free(pm[i]);
-		continue;
-	}
-	if (d->verbose) {
-			uint8_t *b = rte_pktmbuf_mtod(pm[i], uint8_t *);
-			uint32_t pl = rte_pktmbuf_pkt_len(pm[i]);
-			fprintf(stderr,
-			    "r2dp-fwd: esp pkt=%u b20=", pl);
-			for (int z = 0; z < 24 && z < (int)pl; z++)
-				fprintf(stderr, "%02x", b[z]);
-			fprintf(stderr, "\n");
-		}
-		uint16_t enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, np);
-		if (d->verbose)
-			fprintf(stderr,
-			    "r2dp-fwd: esp crypto np=%u enq=%u st=%u\n",
-			    np, enq, (enq && cop[0]->status) ? cop[0]->status : 0);
-		uint16_t dq = enq ?
-		    rte_cryptodev_dequeue_burst(d->cdev_id, 0, cop, enq) : 0;
-		/* CPU-crypto path is synchronous (dq == enq).  An enqueue failure
-		 * (enq==0) or async PMD with ops left in flight (dq < enq) means we
-		 * don't own every op yet: refund only what completed, drop the
-		 * packet, never free an mbuf the device still holds. */
-		if (!enq) {
-			for (uint16_t k = 0; k < np; k++)
-				rte_crypto_op_free(cop[k]);
-			rte_pktmbuf_free(pm[i]);
-			continue;
-		}
-		/* Packet i is the one due back from crypto.  rte_ipsec_pkt_process
-		 * on dq (==1 here) leaves the DECRYPTED inner packet in pm[i];
-		 * forward it.  On any failure drop it. */
-		if (dq >= 1 && cop[0]->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
-			/* AUTH_FAILED (forged/corrupted ICV) or any crypto error:
-			 * librte_ipsec's process step does not look at the op, so
-			 * this packet must never reach it -- drop (fail closed). */
+		struct rte_mbuf *ok[BURST_SZ];
+		uint32_t j = i + 1;
+		uint16_t ng;
+
+		if (ss == NULL) {
 			d->n_drop++;
-			rte_pktmbuf_free(pm[i]);
-		} else if (dq >= 1) {
-			uint16_t proc = rte_ipsec_pkt_process(ss, &pm[i], 1);
-			if (d->verbose) {
-				uint8_t *bb = rte_pktmbuf_mtod(pm[i], uint8_t *);
-				fprintf(stderr,
-				    "r2dp-fwd: post-proc proc=%u pkt=%u ol=%08llx "
-				    "b0=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-				    proc, (unsigned)rte_pktmbuf_pkt_len(pm[i]),
-				    (unsigned long long)pm[i]->ol_flags,
-				    bb[0],bb[1],bb[2],bb[3],bb[4],bb[5],bb[6],bb[7]);
-			}
-			/* processed packets have the inner (cleartext) frame.  D8:
-			 * after a successful decrypt, apply the RFC 4301 s5.2 IN
-			 * selector check and trim to the inner IP length; drop on
-			 * mismatch/spoof. */
-			if (proc == 1 && out && no < BURST_SZ &&
-			    in_inner_ok(d, ss, pm[i])) {
-				/* byte-lifetime: count what was crypted on this SA */
-				sa_bytes_add(d, ss,
-				    rte_pktmbuf_pkt_len(pm[i]));
-				out[no++] = pm[i];
-			}
-			else {
-				if (proc == 1 && d->verbose)
+			rte_pktmbuf_free(pm[i]);   /* no SA: drop */
+			i++;
+			continue;
+		}
+		while (j < nk && sas[j] == ss)
+			j++;
+		ng = crypto_run(d, ss, &pm[i], (uint16_t)(j - i), ok);
+		for (uint16_t k = 0; k < ng; k++) {
+			/* D8: RFC 4301 s5.2 IN selector check + trim to inner IP */
+			if (out && no < BURST_SZ && in_inner_ok(d, ss, ok[k])) {
+				sa_bytes_add(d, ss, rte_pktmbuf_pkt_len(ok[k]));
+				out[no++] = ok[k];
+			} else {
+				if (d->verbose)
 					fprintf(stderr, "r2dp-fwd: inner SEL reject\n");
 				d->n_drop++;
-				rte_pktmbuf_free(pm[i]);
+				rte_pktmbuf_free(ok[k]);
 			}
-		} else {
-			/* op still in flight (async): drop the packet, leave cop. */
-			d->n_drop += dq == 0 ? 1 : 0;
 		}
-		/* refund the ops that actually came back */
-		for (uint16_t k = 0; k < dq; k++)
-			rte_crypto_op_free(cop[k]);
+		i = j;
 	}
 	(void)nlook;
 	if (nout) *nout = no;
@@ -1044,19 +1041,21 @@ static int
 inbound_policy_ok(struct dpdk_priv *d, const struct dp_sa *ds,
     const uint8_t *ip, size_t avail)
 {
+	const struct dp_spd *s = __atomic_load_n(&d->spd, __ATOMIC_ACQUIRE);
+	uint32_t j = (uint32_t)(ds - d->sa_tab);
+
+	/* fast path: the snapshot's per-SA list, if it was built for this
+	 * very SA install (gen match) */
+	if (s && s->in_off && j < MAX_SA && s->in_gen[j] == ds->gen) {
+		for (uint32_t k = s->in_off[j]; k < s->in_off[j + 1]; k++)
+			if (r2dp_sel_match(s->in_pol[k], ip, avail))
+				return 1;
+		return 0;
+	}
+	/* snapshot not (yet) rebuilt for this SA: full scan */
 	for (int i = 0; i < MAX_SA; i++) {
 		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
-		uint32_t ts, td;
-		if (!sp || sp->action != R2DP_ACT_PROTECT ||
-		    (sp->dir != R2DP_DIR_IN && sp->dir != R2DP_DIR_FWD))
-			continue;
-		memcpy(&ts, &sp->tun_src.addr[0], 4);
-		memcpy(&td, &sp->tun_dst.addr[0], 4);
-		if (ts != ds->srca || td != ds->dsta)
-			continue;
-		if (sp->reqid && ds->reqid && sp->reqid != ds->reqid)
-			continue;
-		if (r2dp_sel_match(sp, ip, avail))
+		if (in_pol_fits(sp, ds) && r2dp_sel_match(sp, ip, avail))
 			return 1;
 	}
 	return 0;
@@ -1141,6 +1140,9 @@ spd_free(struct dp_spd *s)
 	if (s->acl)
 		rte_acl_free(s->acl);
 	free(s->out);
+	free(s->in_off);
+	free(s->in_gen);
+	free(s->in_pol);
 	free(s);
 }
 
@@ -1274,6 +1276,100 @@ acl_key_fill(struct acl_key *k, const uint8_t *ip, size_t avail)
 /* Build a new snapshot from sp_tab/sa_tab, publish it, wait a grace period,
  * free the old one.  Caller holds d->lock.  On allocation failure nothing is
  * published and the worker keeps the previous snapshot. */
+static inline uint32_t
+peer_hash(uint32_t ip)
+{
+	return (ip * 2654435761u) >> 20;     /* 12 bits = PEER_HSZ */
+}
+
+static void
+peer_put(struct dp_spd *s, uint32_t ip)
+{
+	uint32_t h;
+
+	if (ip == 0) { s->peer_zero = 1; return; }
+	for (h = peer_hash(ip); s->peer[h] && s->peer[h] != ip;
+	    h = (h + 1) & (PEER_HSZ - 1))
+		;
+	s->peer[h] = ip;
+}
+
+/* IN/FWD PROTECT policy `sp` may admit traffic decrypted by SA `ds`. */
+static int
+in_pol_fits(const struct r2dp_sp *sp, const struct dp_sa *ds)
+{
+	uint32_t ts, td;
+
+	if (!sp || sp->action != R2DP_ACT_PROTECT ||
+	    (sp->dir != R2DP_DIR_IN && sp->dir != R2DP_DIR_FWD))
+		return 0;
+	memcpy(&ts, &sp->tun_src.addr[0], 4);
+	memcpy(&td, &sp->tun_dst.addr[0], 4);
+	if (ts != ds->srca || td != ds->dsta)
+		return 0;
+	if (sp->reqid && ds->reqid && sp->reqid != ds->reqid)
+		return 0;
+	return 1;
+}
+
+/* Inbound per-SA policy index + peer hash (control time, d->lock held). */
+static int
+spd_build_in(struct dpdk_priv *d, struct dp_spd *s)
+{
+	uint32_t tot = 0, k = 0;
+
+	s->in_off = calloc(MAX_SA + 1, sizeof(*s->in_off));
+	s->in_gen = calloc(MAX_SA, sizeof(*s->in_gen));
+	if (!s->in_off || !s->in_gen)
+		return -ENOMEM;
+	for (int pass = 0; pass < 2; pass++) {
+		k = 0;
+		for (int j = 0; j < MAX_SA; j++) {
+			const struct dp_sa *ds = &d->sa_tab[j];
+			if (pass)
+				s->in_off[j] = k;
+			if (!sa_live(ds) || !ds->inbound)
+				continue;
+			if (pass)
+				s->in_gen[j] = ds->gen;
+			for (int i = 0; i < MAX_SA; i++) {
+				const struct r2dp_sp *sp = d->sp_tab[i].sp;
+				if (!in_pol_fits(sp, ds))
+					continue;
+				if (pass)
+					s->in_pol[k] = sp;
+				k++;
+			}
+		}
+		if (!pass) {
+			tot = k;
+			s->in_pol = calloc(tot ? tot : 1, sizeof(*s->in_pol));
+			if (!s->in_pol)
+				return -ENOMEM;
+		}
+	}
+	s->in_off[MAX_SA] = k;
+	for (int j = 0; j < MAX_SA; j++) {
+		const struct dp_sa *ds = &d->sa_tab[j];
+		if (sa_live(ds))
+			peer_put(s, ds->inbound ? ds->srca : ds->dsta);
+	}
+	for (int i = 0; i < MAX_SA; i++) {
+		const struct r2dp_sp *sp = d->sp_tab[i].sp;
+		uint32_t a;
+		if (!sp || sp->action != R2DP_ACT_PROTECT)
+			continue;
+		if (sp->dir == R2DP_DIR_OUT)
+			memcpy(&a, &sp->tun_dst.addr[0], 4);
+		else if (sp->dir == R2DP_DIR_IN)
+			memcpy(&a, &sp->tun_src.addr[0], 4);
+		else
+			continue;
+		peer_put(s, a);
+	}
+	return 0;
+}
+
 static int
 spd_rebuild_ex(struct dpdk_priv *d, int policies_changed)
 {
@@ -1306,6 +1402,8 @@ spd_rebuild_ex(struct dpdk_priv *d, int policies_changed)
 	}
 	ns->nout = n;
 	qsort(ns->out, n, sizeof(*ns->out), pol_cmp);
+	if (spd_build_in(d, ns) < 0)
+		goto fail;
 
 	old = d->spd;
 	if (!policies_changed && old && old->nout == n) {
@@ -1391,15 +1489,16 @@ static void
 esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout, uint16_t *nbypass)
 {
-	uint16_t no = 0, nb = 0;
+	uint16_t no = 0, nb = 0, nm = 0;
+	struct rte_mbuf *pm[BURST_SZ];
+	struct dp_sa *pds[BURST_SZ];
 
+	if (nr > BURST_SZ) nr = BURST_SZ;
 	for (uint16_t i = 0; i < nr; i++) {
 		struct dp_sa *ds;
 		const struct r2dp_sp *sp;
 		uint8_t ihl;
 		struct rte_ipv4_hdr *ip, *lip;
-		struct rte_crypto_op *cop;
-		uint16_t np, enq, dq, proc;
 
 		/* inner tap delivers Ethernet: parse the inner IP at the L2 offset
 		 * for policy matching; only STRIP L2 below for a matched packet so
@@ -1447,83 +1546,11 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 				rte_pktmbuf_trim(bufs[i], cur - iplen);
 		}
 
-		cop = rte_crypto_op_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
-		if (!cop) goto drop;
-		rte_crypto_op_attach_sym_session(cop, ds->sess.crypto.ses);
-		np = rte_ipsec_pkt_crypto_prepare(&ds->sess, &bufs[i], &cop, 1);
-		if (np == 0) { rte_crypto_op_free(cop); goto drop; }
-		enq = rte_cryptodev_enqueue_burst(d->cdev_id, 0, &cop, np);
-		if (enq == 0) { rte_crypto_op_free(cop); goto drop; }
-		dq = rte_cryptodev_dequeue_burst(d->cdev_id, 0, &cop, enq);
-		/* CPU-crypto path is synchronous (dq == enq); a PMD that reports
-		 * dq < enq means ops still in flight and this single-op loop does
-		 * not own them yet -- free only what came back, drop the rest. */
-		if (d->verbose)
-			fprintf(stderr, "r2dp-fwd: egress crypto np=%u enq=%u dq=%u st=%u\n",
-			    np, enq, dq, (dq && cop->status) ? cop->status : 0);
-		if (dq == 0) { rte_crypto_op_free(cop); goto drop; }
-		if (cop->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
-			rte_crypto_op_free(cop);   /* never emit a failed encrypt */
-			goto drop;
-		}
-		proc = rte_ipsec_pkt_process(&ds->sess, &bufs[i], dq);
-		rte_crypto_op_free(cop);
-		if (proc == 1 && out && no < BURST_SZ) {
-			/* byte-lifetime: count the crypted bytes on this egress SA */
-			__atomic_fetch_add(&ds->bytes,
-			    rte_pktmbuf_pkt_len(bufs[i]), __ATOMIC_RELAXED);
-			struct rte_ipv4_hdr *oip =
-			    rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
-			/* NAT-T egress: insert UDP(8)+marker(4) after the outer IP
-			 * and retag proto to UDP (RFC 3948).  memmove the ESP part
-			 * up 12 B, then fill UDP hdr (sport/dport 4500) + marker. */
-			if (ds->natt == R2DP_NATT_ESPINUDP && oip &&
-			    (oip->version_ihl >> 4) == 4) {
-				uint8_t ihl = (oip->version_ihl & 0x0f) * 4;
-				uint32_t len = rte_pktmbuf_pkt_len(bufs[i]);
-				uint8_t *base = rte_pktmbuf_mtod(bufs[i], uint8_t*);
-				uint16_t plen;
-				if (rte_pktmbuf_append(bufs[i], 12)) {
-					memmove(base + ihl + 12, base + ihl,
-					    len - ihl);
-					base[ihl+0] = 0x11; base[ihl+1] = 0x94;
-					base[ihl+2] = 0x11; base[ihl+3] = 0x94;
-					plen = (uint16_t)(len - ihl + 12);
-					base[ihl+4] = plen >> 8; base[ihl+5] = plen & 0xff;
-					base[ihl+6] = 0; base[ihl+7] = 0;  /* UDP csum */
-					base[ihl+8]=0;base[ihl+9]=0;base[ihl+10]=0;base[ihl+11]=0;
-					oip->next_proto_id = IPPROTO_UDP;
-					/* bump outer IP total_length by the 12 encap bytes */
-					{
-						uint16_t tl = (
-						    ((uint16_t)base[2] << 8) | base[3]) + 12;
-						base[2] = tl >> 8; base[3] = tl & 0xff;
-					}
-					oip->hdr_checksum = 0;
-				}
-			}
-			/* librte's outbound tunnel prepare only patches
-			 * total_length/packet_id; it leaves hdr_checksum=0, which
-			 * every real peer drops (ip_rcv -> InHdrErrors).  Compute
-			 * it here (H1). */
-			if ((oip->version_ihl >> 4) == 4) {
-				oip->hdr_checksum = 0;
-				oip->hdr_checksum = rte_ipv4_cksum(oip);
-			}
-			if (d->verbose) {
-				uint8_t *b = rte_pktmbuf_mtod(bufs[i], uint8_t *);
-				fprintf(stderr,
-				    "r2dp-fwd: egress-proc proc=%u pkt=%u b0=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-				    proc, (unsigned)rte_pktmbuf_pkt_len(bufs[i]),
-				    b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]);
-			}
-			d->n_esp++;
-			out[no++] = bufs[i];
-			bufs[i] = NULL;      /* consumed: mark for caller */
-			continue;
-		}
-		/* Crypto/decrypt failed or the processed packet was invalid: drop. */
-		goto drop;
+		/* matched + PROTECT + SA: queue for the batched crypto pass */
+		pm[nm] = bufs[i];
+		pds[nm++] = ds;
+		bufs[i] = NULL;
+		continue;
 drop:
 		/* Single drop path: never forward cleartext after a policy matched,
 		 * and never leak the mbuf (H4).  Count and mark the slot NULL so
@@ -1531,6 +1558,81 @@ drop:
 		d->n_drop++;
 		rte_pktmbuf_free(bufs[i]);
 		bufs[i] = NULL;
+	}
+
+	/* batched crypto, one run per SA (bursts are usually one flow) */
+	for (uint16_t i = 0; i < nm; ) {
+		struct dp_sa *ds = pds[i];
+		struct rte_mbuf *ok[BURST_SZ];
+		uint16_t j = i + 1, ng;
+
+		while (j < nm && pds[j] == ds)
+			j++;
+		ng = crypto_run(d, &ds->sess, &pm[i], j - i, ok);
+		for (uint16_t k = 0; k < ng; k++) {
+			struct rte_mbuf *m = ok[k];
+			uint16_t proc = 1;
+
+			if (!out || no >= BURST_SZ) {
+				d->n_drop++;
+				rte_pktmbuf_free(m);
+				continue;
+			}
+			/* byte-lifetime: count the crypted bytes on this egress SA */
+			__atomic_fetch_add(&ds->bytes, rte_pktmbuf_pkt_len(m),
+			    __ATOMIC_RELAXED);
+			{
+				struct rte_ipv4_hdr *oip =
+				    rte_pktmbuf_mtod(m, struct rte_ipv4_hdr *);
+				/* NAT-T egress: insert UDP(8)+marker(4) after the outer IP
+				 * and retag proto to UDP (RFC 3948).  memmove the ESP part
+				 * up 12 B, then fill UDP hdr (sport/dport 4500) + marker. */
+				if (ds->natt == R2DP_NATT_ESPINUDP && oip &&
+				    (oip->version_ihl >> 4) == 4) {
+					uint8_t ihl = (oip->version_ihl & 0x0f) * 4;
+					uint32_t len = rte_pktmbuf_pkt_len(m);
+					uint8_t *base = rte_pktmbuf_mtod(m, uint8_t*);
+					uint16_t plen;
+					if (rte_pktmbuf_append(m, 12)) {
+						memmove(base + ihl + 12, base + ihl,
+						    len - ihl);
+						base[ihl+0] = 0x11; base[ihl+1] = 0x94;
+						base[ihl+2] = 0x11; base[ihl+3] = 0x94;
+						plen = (uint16_t)(len - ihl + 12);
+						base[ihl+4] = plen >> 8; base[ihl+5] = plen & 0xff;
+						base[ihl+6] = 0; base[ihl+7] = 0;  /* UDP csum */
+						base[ihl+8]=0;base[ihl+9]=0;base[ihl+10]=0;base[ihl+11]=0;
+						oip->next_proto_id = IPPROTO_UDP;
+						/* bump outer IP total_length by the 12 encap bytes */
+						{
+						uint16_t tl = (
+						    ((uint16_t)base[2] << 8) | base[3]) + 12;
+						base[2] = tl >> 8; base[3] = tl & 0xff;
+						}
+						oip->hdr_checksum = 0;
+					}
+				}
+				/* librte's outbound tunnel prepare only patches
+				 * total_length/packet_id; it leaves hdr_checksum=0, which
+				 * every real peer drops (ip_rcv -> InHdrErrors).  Compute
+				 * it here (H1). */
+				if ((oip->version_ihl >> 4) == 4) {
+					oip->hdr_checksum = 0;
+					oip->hdr_checksum = rte_ipv4_cksum(oip);
+				}
+				if (d->verbose) {
+					uint8_t *b = rte_pktmbuf_mtod(m, uint8_t *);
+					fprintf(stderr,
+					    "r2dp-fwd: egress-proc proc=%u pkt=%u b0=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+					    proc, (unsigned)rte_pktmbuf_pkt_len(m),
+					    b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]);
+				}
+			}
+			(void)proc;
+			d->n_esp++;
+			out[no++] = m;
+		}
+		i = j;
 	}
 	if (nout) *nout = no;
 	if (nbypass) *nbypass = nb;
@@ -1552,25 +1654,16 @@ drop:
 static int
 is_tunnel_peer(struct dpdk_priv *d, uint32_t ip)
 {
-	for (int i = 0; i < MAX_SA; i++) {
-		const struct dp_sa *ds = &d->sa_tab[i];
-		if (sa_live(ds) && (ds->inbound ? ds->srca : ds->dsta) == ip)
+	const struct dp_spd *s = __atomic_load_n(&d->spd, __ATOMIC_ACQUIRE);
+
+	if (!s)
+		return 0;
+	if (ip == 0)
+		return s->peer_zero;
+	for (uint32_t h = peer_hash(ip); s->peer[h];
+	    h = (h + 1) & (PEER_HSZ - 1))
+		if (s->peer[h] == ip)
 			return 1;
-	}
-	for (int i = 0; i < MAX_SA; i++) {
-		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
-		uint32_t a;
-		if (!sp || sp->action != R2DP_ACT_PROTECT)
-			continue;
-		if (sp->dir == R2DP_DIR_OUT)
-			memcpy(&a, &sp->tun_dst.addr[0], 4);
-		else if (sp->dir == R2DP_DIR_IN)
-			memcpy(&a, &sp->tun_src.addr[0], 4);
-		else
-			continue;
-		if (a == ip)
-			return 1;
-	}
 	return 0;
 }
 
@@ -1824,15 +1917,12 @@ worker_inner(struct dpdk_priv *d, int port)
 		uint16_t ntx = 0;
 		struct rte_mbuf *txq[BURST_SZ];
 		uint16_t to = (d->port_id >= 0) ? d->port_id : port;
-		for (uint16_t i = 0; i < nnon; i++) {
-			int consumed = 0;
-			if (nonesp[i] == NULL) { continue; }   /* consumed by esp_outbound */
-			for (uint16_t j = 0; j < nout; j++)
-				if (nonesp[i] == esp_out[j]) { consumed = 1; break; }
-			if (!consumed)
+		/* esp_outbound NULLs every slot it consumed or dropped, so
+		 * the survivors are exactly the bypass set (O(n), was O(n^2)) */
+		for (uint16_t i = 0; i < nnon; i++)
+			if (nonesp[i] != NULL)
 				txq[ntx++] = nonesp[i];
-		}
-		if (is_udp(txq[0]))
+		if (ntx && is_udp(txq[0]))
 			d->n_ike += ntx;
 		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
 		d->n_tx += sent;

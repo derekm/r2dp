@@ -261,6 +261,40 @@ main(void)
 		CHECK(allok, "inner lengths 255..1400 incl. 256/512/513 round-trip");
 	}
 
+	/* Batched crypto: a 32-packet burst (every 8th outside A's policy ->
+	 * bypass) is encrypted in one run; packet 5 is then forged.  Exactly the
+	 * other protected packets decrypt, in order, byte-identical. */
+	{
+		enum { N = 32 };
+		static uint8_t w[N][64];
+		struct rte_mbuf *in[N], *esp[N], *dec[BURST_SZ];
+		uint16_t nout = 0, nb = 0, ndec = 0, nprot = 0, good = 1;
+
+		for (int k = 0; k < N; k++) {
+			char src[32];
+			snprintf(src, sizeof(src), k % 8 == 7 ? "10.1.0.%d" : "10.0.1.%d", k + 1);
+			in[k] = inner_frame(src, "10.0.2.5", 17, 1000 + k, w[k]);
+			nprot += k % 8 != 7;
+		}
+		esp_outbound(a, in, N, esp, &nout, &nb);
+		CHECK(nout == nprot && nb == N - nprot, "burst: one batched encrypt, bypass left alone");
+		for (int k = 0; k < N; k++)
+			if (in[k]) rte_pktmbuf_free(in[k]);
+		for (uint16_t k = 0; k < nout; k++) {
+			uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(esp[k], 14);
+			memset(f, 0, 14); f[12] = 0x08;
+			if (k == 5) f[14 + 40] ^= 1;
+		}
+		esp_inbound(b, esp, nout, dec, &ndec);
+		CHECK(ndec == nout - 1, "burst: forged packet dropped, the rest decrypt");
+		for (uint16_t k = 0, src = 0; k < ndec; k++, src++) {
+			while (src % 8 == 7 || src == 5) src++;   /* skip bypass + forged */
+			if (memcmp(rte_pktmbuf_mtod(dec[k], uint8_t *), w[src], 64)) good = 0;
+			rte_pktmbuf_free(dec[k]);
+		}
+		CHECK(good, "burst: decrypted in order, byte-identical");
+	}
+
 	/* port-specific DISCARD (TCP/23) overrides the covering PROTECT */
 	add_sp(a, 2, R2DP_DIR_OUT, R2DP_ACT_DISCARD, "10.0.0.0", 16, "10.0.0.0", 16,
 	    6, 23);

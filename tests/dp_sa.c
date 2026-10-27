@@ -223,6 +223,61 @@ t_inbound_policy(struct dpdk_priv *d)
 	spd_teardown(d);
 }
 
+/* Indexed inbound check (installed SAs -> snapshot per-SA policy list) and
+ * the hashed tunnel-peer set; plus the fallback scan when the snapshot was
+ * not rebuilt for an SA (generation mismatch). */
+static void
+t_inbound_indexed(struct dpdk_priv *d)
+{
+	struct r2dp_sa r;
+	struct dp_sa *a = NULL, *b = NULL;
+	const struct dp_spd *s;
+	uint8_t p[40];
+	uint32_t ip;
+
+	add_in_sp(d, 201, "192.0.2.2", "10.0.2.0", "10.0.1.0");
+	add_in_sp(d, 202, "192.0.2.3", "10.0.3.0", "10.0.1.0");
+	mk_sa(&r, 0x4001, "192.0.2.2", "192.0.2.1");
+	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0, "idx: inbound SA A");
+	mk_sa(&r, 0x4002, "192.0.2.3", "192.0.2.1");
+	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0, "idx: inbound SA B");
+	for (int i = 0; i < MAX_SA; i++) {
+		if (!d->sa_tab[i].used) continue;
+		if (d->sa_tab[i].spi == 0x4001) a = &d->sa_tab[i];
+		if (d->sa_tab[i].spi == 0x4002) b = &d->sa_tab[i];
+	}
+	s = d->spd;
+	CHECK(a && b && s && s->in_gen[a - d->sa_tab] == a->gen &&
+	    s->in_off[a - d->sa_tab + 1] - s->in_off[a - d->sa_tab] == 1,
+	    "idx: snapshot holds exactly A's IN policy for SA A");
+	ipkt(p, "10.0.2.5", "10.0.1.5");
+	CHECK(inbound_policy_ok(d, a, p, 40) && !inbound_policy_ok(d, b, p, 40),
+	    "idx: A's traffic only under A's SA");
+	ipkt(p, "10.0.3.5", "10.0.1.5");
+	CHECK(inbound_policy_ok(d, b, p, 40) && !inbound_policy_ok(d, a, p, 40),
+	    "idx: B's traffic only under B's SA");
+	a->gen += 1000;                         /* snapshot stale for A */
+	ipkt(p, "10.0.2.5", "10.0.1.5");
+	CHECK(inbound_policy_ok(d, a, p, 40), "idx: stale snapshot falls back to a scan");
+	a->gen -= 1000;
+
+	inet_pton(AF_INET, "192.0.2.2", &ip);
+	CHECK(is_tunnel_peer(d, ip), "peer: inbound SA source is a peer");
+	inet_pton(AF_INET, "192.0.2.99", &ip);
+	CHECK(!is_tunnel_peer(d, ip), "peer: unrelated host is not");
+	inet_pton(AF_INET, "0.0.0.0", &ip);
+	CHECK(!is_tunnel_peer(d, ip), "peer: 0.0.0.0 is not");
+	mk_sa(&r, 0x4001, "192.0.2.2", "192.0.2.1");
+	sa_install(d, &r, NULL, 0, 1, 1);
+	mk_sa(&r, 0x4002, "192.0.2.3", "192.0.2.1");
+	sa_install(d, &r, NULL, 0, 1, 1);
+	inet_pton(AF_INET, "192.0.2.3", &ip);
+	CHECK(is_tunnel_peer(d, ip), "peer: IN PROTECT policy tun_src stays a peer");
+	spd_teardown(d);
+	inet_pton(AF_INET, "192.0.2.3", &ip);
+	CHECK(!is_tunnel_peer(d, ip), "peer: gone after policies removed");
+}
+
 /* Control-time policy->SA binding: the egress path reads the binding from
  * the published snapshot (no SA scan); rekey rebinds to the newest SA, a
  * delete rebinds to what is left, a stale binding fails closed, and the
@@ -466,6 +521,7 @@ main(void)
 	t_sp_concurrency(d);
 	t_inbound_policy(d);
 	t_binding(d);
+	t_inbound_indexed(d);
 	t_acl_diff(d);
 
 	/* teardown: free every session (no leaks under LSan) */
