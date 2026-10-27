@@ -345,6 +345,8 @@ main(void)
 		uint64_t sa = 0, sb = 0;
 		char buf[1024] = "";
 		FILE *f = tmpfile();
+		/* dpd_stats_dump aggregates d->w[]; the counters live on wb here */
+		b->w = &wb; b->nworkers = 1;
 		for (int r = 0; r < DR_NUM; r++) { sa += wa.n_dropr[r]; sb += wb.n_dropr[r]; }
 		CHECK(sa == wa.n_drop && sb == wb.n_drop, "drops: reasons sum to n_drop");
 		CHECK(wa.n_dropr[DR_NO_SA_OUT] == 1, "drops: PROTECT without SA -> no_sa_out");

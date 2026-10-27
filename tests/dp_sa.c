@@ -473,10 +473,13 @@ main(void)
 	struct dpdk_priv *d;
 	struct r2dp_sa r;
 	struct r2dp_sp sp;
-	/* rcu sits immediately before sa_tab in dpdk_priv: use it as the canary
-	 * so a buggy sa_tab[-1] write is caught (the old rcu_tid canary moved
-	 * into the per-worker struct). */
-	struct rte_rcu_qsbr *canary_rcu = (struct rte_rcu_qsbr *)(uintptr_t)0xC1C1C1C1ULL;
+	/* rcu sits immediately before sa_tab in dpdk_priv: use a REAL qsbr
+	 * object as the canary.  A buggy sa_tab[-1] write would clobber this
+	 * pointer; and because it is a live qsbr, the sa_install upsert/retire
+	 * path may legitimately call rte_rcu_qsbr_synchronize() on it (the old
+	 * int rcu_tid canary moved into the per-worker struct). */
+	struct rte_rcu_qsbr *canary_rcu;
+	size_t canary_rsz;
 	union rte_ipsec_sad_key k;
 	const union rte_ipsec_sad_key *kp[1] = { &k };
 	void *val[1];
@@ -485,6 +488,10 @@ main(void)
 		if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
 		puts("SKIP: EAL/crypto"); return 77;
 	}
+	canary_rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
+	canary_rcu = rte_zmalloc("canary", canary_rsz, RTE_CACHE_LINE_SIZE);
+	if (!canary_rcu) { puts("canary rcu alloc FAILED"); return 1; }
+	rte_rcu_qsbr_init(canary_rcu, RTE_MAX_LCORE);
 
 	/* --- 1. C1: fresh inbound install must not write before sa_tab --- */
 	d->rcu = canary_rcu;            /* marked canary: any write = bug */
