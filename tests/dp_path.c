@@ -305,6 +305,29 @@ main(void)
 		CHECK(run(a, b, m, &enc, got) && enc, "TCP/22 still protected end to end");
 	}
 
+	/* per-reason drop counters account for every drop above */
+	{
+		uint64_t sa = 0, sb = 0;
+		char buf[1024] = "";
+		FILE *f = tmpfile();
+		for (int r = 0; r < DR_NUM; r++) { sa += a->n_dropr[r]; sb += b->n_dropr[r]; }
+		CHECK(sa == a->n_drop && sb == b->n_drop, "drops: reasons sum to n_drop");
+		CHECK(a->n_dropr[DR_NO_SA_OUT] == 1, "drops: PROTECT without SA -> no_sa_out");
+		CHECK(a->n_dropr[DR_POLICY_DISCARD] == 1, "drops: TCP/23 -> policy_discard");
+		CHECK(b->n_dropr[DR_CRYPTO_FAIL] == 3, "drops: 3 forged datagrams -> crypto_fail");
+		CHECK(b->n_dropr[DR_INNER_SEL] == 1, "drops: off-selector inner -> inner_sel");
+		if (f) {
+			size_t n;
+			dpd_stats_dump(b, f);
+			rewind(f);
+			n = fread(buf, 1, sizeof(buf) - 1, f);
+			buf[n] = 0;
+			fclose(f);
+		}
+		CHECK(strstr(buf, " crypto_fail=3 ") && strstr(buf, " inner_sel=1 "),
+		    "drops: stats dump names each reason");
+	}
+
 	free_priv(a); free_priv(b);
 	rte_mempool_free(mp);
 	rte_cryptodev_stop(cdev);

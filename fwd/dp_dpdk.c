@@ -115,6 +115,31 @@ struct dp_sp_ent {
  * records the SA's install generation: if the slot has since been retired or
  * reused the generations differ and the packet is dropped (fail closed)
  * until the next rebuild. */
+/* Drop reasons (n_drop == sum of n_dropr[]); dumped on SIGUSR1. */
+enum dp_drop {
+	DR_MALFORMED,       /* runt / bad IHL / bad ESP framing */
+	DR_NO_SA_IN,        /* ESP with no inbound SA (SAD miss) */
+	DR_NO_SA_OUT,       /* PROTECT policy matched, no egress SA (fail closed) */
+	DR_POLICY_DISCARD,  /* DISCARD policy */
+	DR_INNER_SEL,       /* decrypted inner packet outside the SA's IN policy */
+	DR_CRYPTO_FAIL,     /* crypto op failed: ICV/auth failure, PMD error */
+	DR_IPSEC_REJECT,    /* rte_ipsec prepare/process rejected (replay, ...) */
+	DR_CRYPTO_ENQ,      /* cryptodev queue full / stuck */
+	DR_NOMEM,           /* op pool, headroom, output array */
+	DR_NO_NEXTHOP,      /* egress ESP with no learned peer MAC */
+	DR_CLEAR_OUTER,     /* non-IKE/ARP cleartext on the outer side */
+	DR_ESP_ON_INNER,    /* ESP arriving on the plaintext side */
+	DR_TX_FULL,         /* tx ring full */
+	DR_NUM
+};
+static const char *const dp_drop_name[DR_NUM] = {
+	"malformed", "no_sa_in", "no_sa_out", "policy_discard", "inner_sel",
+	"crypto_fail", "ipsec_reject", "crypto_enq", "nomem", "no_nexthop",
+	"clear_outer", "esp_on_inner", "tx_full",
+};
+#define DROP(d, r, n) do { uint64_t n_ = (n); (d)->n_drop += n_; \
+	(d)->n_dropr[(r)] += n_; } while (0)
+
 #define PEER_HSZ 4096     /* power of two, > 2 * (2 * MAX_SA) */
 
 struct dp_pol {
@@ -202,6 +227,7 @@ struct dpdk_priv {
 	unsigned            worker_lcore;
 	/* per-queue counters for the worker (single rx/tx queue) */
 	uint64_t            n_rx, n_tx, n_esp, n_ike, n_drop;
+	uint64_t            n_dropr[DR_NUM]; /* n_drop split by reason */
 };
 
 /* The inbound SAD stores &dp_sa.sess as its value, so a session handed back
@@ -672,7 +698,7 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	if (rte_crypto_op_bulk_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 	    cop, n) == 0) {
 		for (uint16_t i = 0; i < n; i++) {
-			d->n_drop++;
+			DROP(d, DR_NOMEM, 1);
 			rte_pktmbuf_free(mb[i]);
 		}
 		return 0;
@@ -682,12 +708,12 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	/* prepare moves the mbufs it rejected to the tail */
 	k = rte_ipsec_pkt_crypto_prepare(ss, mb, cop, n);
 	for (uint16_t i = k; i < n; i++) {
-		d->n_drop++;
+		DROP(d, DR_IPSEC_REJECT, 1);
 		rte_pktmbuf_free(mb[i]);
 	}
 	enq = k ? rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, k) : 0;
 	for (uint16_t i = enq; i < k; i++) {
-		d->n_drop++;
+		DROP(d, DR_CRYPTO_ENQ, 1);
 		rte_pktmbuf_free(mb[i]);
 	}
 	if (enq < n)
@@ -705,19 +731,19 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 		if (cop[i]->status == RTE_CRYPTO_OP_STATUS_SUCCESS)
 			ok[ng++] = m;
 		else {
-			d->n_drop++;
+			DROP(d, DR_CRYPTO_FAIL, 1);
 			rte_pktmbuf_free(m);
 		}
 	}
 	if (dq)
 		rte_mempool_put_bulk(d->cop_mp, (void **)cop, dq);
-	d->n_drop += enq - dq;       /* abandoned in a stuck device */
+	DROP(d, DR_CRYPTO_ENQ, enq - dq);       /* abandoned in a stuck device */
 	if (!ng)
 		return 0;
 	/* process moves the mbufs it rejected (e.g. replay) to the tail */
 	proc = rte_ipsec_pkt_process(ss, ok, ng);
 	for (uint16_t i = proc; i < ng; i++) {
-		d->n_drop++;
+		DROP(d, DR_IPSEC_REJECT, 1);
 		rte_pktmbuf_free(ok[i]);
 	}
 	return proc;
@@ -852,7 +878,7 @@ bad:
 		/* malformed/undersized frame: drop it and move on so the rest of
 		 * the burst is still processed (a `break` here would leak every
 		 * remaining mbuf -- a remote pool-exhaustion DoS). */
-		d->n_drop++;
+		DROP(d, DR_MALFORMED, 1);
 		rte_pktmbuf_free(bufs[i]);
 	}
 	if (nk == 0) {
@@ -884,7 +910,7 @@ bad:
 		uint16_t ng;
 
 		if (ss == NULL) {
-			d->n_drop++;
+			DROP(d, DR_NO_SA_IN, 1);
 			rte_pktmbuf_free(pm[i]);   /* no SA: drop */
 			i++;
 			continue;
@@ -900,7 +926,7 @@ bad:
 			} else {
 				if (d->verbose)
 					fprintf(stderr, "r2dp-fwd: inner SEL reject\n");
-				d->n_drop++;
+				DROP(d, DR_INNER_SEL, 1);
 				rte_pktmbuf_free(ok[k]);
 			}
 		}
@@ -1492,6 +1518,7 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 	uint16_t no = 0, nb = 0, nm = 0;
 	struct rte_mbuf *pm[BURST_SZ];
 	struct dp_sa *pds[BURST_SZ];
+	enum dp_drop why = DR_MALFORMED;
 
 	if (nr > BURST_SZ) nr = BURST_SZ;
 	for (uint16_t i = 0; i < nr; i++) {
@@ -1517,8 +1544,10 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		/* A matched policy decides the disposition (H2, RFC 4301 5.1):
 		 * DISCARD always drops; PROTECT with no SA drops (fail-closed, the
 		 * SA must exist before we protect); only BYPASS forwards clear. */
+		why = DR_POLICY_DISCARD;
 		if (sp->action == R2DP_ACT_DISCARD)
 			goto drop;
+		why = DR_NO_SA_OUT;
 		if (sp->action == R2DP_ACT_PROTECT && !ds)
 			goto drop;
 		if (sp->action != R2DP_ACT_PROTECT) { nb++; continue; } /* BYPASS */
@@ -1530,6 +1559,7 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		bufs[i]->l2_len = 0;
 		lip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
 		ihl = (lip->version_ihl & 0x0f) * 4;
+		why = DR_MALFORMED;
 		if (ihl < 20 || ihl > rte_pktmbuf_data_len(bufs[i]))
 			goto drop;   /* M5c: reject malformed/oversized IHL */
 		bufs[i]->l3_len = ihl;
@@ -1555,7 +1585,7 @@ drop:
 		/* Single drop path: never forward cleartext after a policy matched,
 		 * and never leak the mbuf (H4).  Count and mark the slot NULL so
 		 * worker_inner does not forward or free it again. */
-		d->n_drop++;
+		DROP(d, why, 1);
 		rte_pktmbuf_free(bufs[i]);
 		bufs[i] = NULL;
 	}
@@ -1574,7 +1604,7 @@ drop:
 			uint16_t proc = 1;
 
 			if (!out || no >= BURST_SZ) {
-				d->n_drop++;
+				DROP(d, DR_NOMEM, 1);
 				rte_pktmbuf_free(m);
 				continue;
 			}
@@ -1741,6 +1771,7 @@ worker_outer(struct dpdk_priv *d, int port)
 				char *h = rte_pktmbuf_prepend(dec[i],
 				    RTE_ETHER_HDR_LEN);
 				if (h == NULL) {   /* no headroom: drop */
+					DROP(d, DR_NOMEM, 1);
 					rte_pktmbuf_free(dec[i]);
 					dec[i] = NULL;
 					continue;
@@ -1788,6 +1819,7 @@ worker_outer(struct dpdk_priv *d, int port)
 					txq[ntx++] = dec[i];
 			uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
 			d->n_tx += sent;
+			DROP(d, DR_TX_FULL, ntx - sent);
 			if (d->verbose)
 				fprintf(stderr, "r2dp-fwd: esp-tx ndec=%u ntx=%u sent=%u\n",
 				    ndec, ntx, sent);
@@ -1807,14 +1839,14 @@ worker_outer(struct dpdk_priv *d, int port)
 			if (is_ike_arp(exc[i]))
 				fwd[nf++] = exc[i];
 			else
-				d->n_drop++;
+				DROP(d, DR_CLEAR_OUTER, 1);
 		}
 		if (nf) {
 			if (is_udp(fwd[0]))
 				d->n_ike += nf;   /* IKE */
 			uint16_t sent = rte_eth_tx_burst(to, 0, fwd, nf);
 			d->n_tx += sent;
-			d->n_drop += nf - sent;
+			DROP(d, DR_TX_FULL, nf - sent);
 			for (uint16_t i = sent; i < nf; i++)
 				rte_pktmbuf_free(fwd[i]);
 		}
@@ -1844,8 +1876,10 @@ worker_inner(struct dpdk_priv *d, int port)
 	struct rte_mbuf *nonesp[BURST_SZ];
 	uint16_t nnon = 0;
 	for (uint16_t i = 0; i < nr; i++) {
-		if (is_esp(bufs[i]))
+		if (is_esp(bufs[i])) {
+			DROP(d, DR_ESP_ON_INNER, 1);
 			rte_pktmbuf_free(bufs[i]);
+		}
 		else
 			nonesp[nnon++] = bufs[i];
 	}
@@ -1867,7 +1901,7 @@ worker_inner(struct dpdk_priv *d, int port)
 		for (uint16_t i = 0; i < nout; i++) {
 			struct rte_ether_hdr *eh;
 			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
-			if (!h) { rte_pktmbuf_free(esp_out[i]); continue; }
+			if (!h) { DROP(d, DR_NOMEM, 1); rte_pktmbuf_free(esp_out[i]); continue; }
 			eh = rte_pktmbuf_mtod(esp_out[i], struct rte_ether_hdr *);
 			/* Egress ESP is unicast to the tunnel peer's learned
 			 * next hop (keyed by the outer destination IP).  With
@@ -1881,7 +1915,7 @@ worker_inner(struct dpdk_priv *d, int port)
 				memcpy(&odst, &oip->dst_addr, 4);
 				nmac = r2dp_nh_lookup(&d->nh, odst);
 				if (nmac == NULL) {
-					d->n_drop++;
+					DROP(d, DR_NO_NEXTHOP, 1);
 					rte_pktmbuf_free(esp_out[i]);
 					continue;
 				}
@@ -1903,6 +1937,7 @@ worker_inner(struct dpdk_priv *d, int port)
 		}
 		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
 		d->n_tx += sent;
+		DROP(d, DR_TX_FULL, ntx - sent);
 		if (d->verbose)
 			fprintf(stderr, "r2dp-fwd: egress-tx nout=%u ntx=%u sent=%u\n",
 			    nout, ntx, sent);
@@ -1926,10 +1961,31 @@ worker_inner(struct dpdk_priv *d, int port)
 			d->n_ike += ntx;
 		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
 		d->n_tx += sent;
-		d->n_drop += ntx - sent;
+		DROP(d, DR_TX_FULL, ntx - sent);
 		for (uint16_t i = sent; i < ntx; i++)
 			rte_pktmbuf_free(txq[i]);
 	}
+}
+
+/* Weak so test programs that #include this file without dp.c link; the
+ * forwarder's strong definition lives in dp.c. */
+__attribute__((weak)) volatile sig_atomic_t fwd_stats_req;
+
+/* One-shot stats dump (SIGUSR1 -> fwd_stats_req, read by the worker). */
+static void
+dpd_stats_dump(struct dpdk_priv *d, FILE *f)
+{
+	fprintf(f, "r2dp-fwd: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu "
+	    "spd_fail=%llu\n", (unsigned long long)d->n_rx,
+	    (unsigned long long)d->n_tx, (unsigned long long)d->n_esp,
+	    (unsigned long long)d->n_ike, (unsigned long long)d->n_drop,
+	    (unsigned long long)d->n_spd_fail);
+	fprintf(f, "r2dp-fwd: drops");
+	for (int r = 0; r < DR_NUM; r++)
+		fprintf(f, " %s=%llu", dp_drop_name[r],
+		    (unsigned long long)d->n_dropr[r]);
+	fprintf(f, "\n");
+	fflush(f);
 }
 
 static int
@@ -1966,6 +2022,10 @@ worker_main(void *arg)
 		if (d->rcu)
 			rte_rcu_qsbr_quiescent(d->rcu, d->worker_lcore);
 
+		if (fwd_stats_req) {
+			fwd_stats_req = 0;
+			dpd_stats_dump(d, stderr);
+		}
 		if (!last_t)
 			last_t = now;
 		else if (now - last_t >= rte_get_timer_hz()) {  /* ~1s */

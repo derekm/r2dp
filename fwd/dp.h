@@ -14,6 +14,7 @@
 #ifndef R2DP_FWD_DP_H
 #define R2DP_FWD_DP_H
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -61,6 +62,10 @@ struct fwd_dp {
 	uint32_t caps_bits_enc[8];
 	uint32_t caps_bits_integ[8];
 };
+
+/* Set (async-signal-safely) by the SIGUSR1 handler; the datapath worker
+ * dumps its counters, incl. per-reason drops, and clears it. */
+extern volatile sig_atomic_t fwd_stats_req;
 
 /* Defaults: zero -> no backend (ctl.c still answers protocol). */
 void fwd_dp_init(struct fwd_dp *dp);

@@ -28,6 +28,7 @@ static struct fwd_ctl ctl;
 static volatile sig_atomic_t g_stop;
 
 static void on_sig(int s) { (void)s; g_stop = 1; }
+static void on_usr1(int s) { (void)s; fwd_stats_req = 1; }
 
 int
 main(int argc, char **argv)
@@ -65,6 +66,7 @@ main(int argc, char **argv)
 	}
 
 	signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGPIPE, SIG_IGN);
+	signal(SIGUSR1, on_usr1);   /* dump datapath stats + drop reasons */
 
 	fwd_ctl_init(&ctl, sockpath, verbose);
 

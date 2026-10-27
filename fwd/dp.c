@@ -8,6 +8,8 @@
 
 #include "dp.h"
 
+volatile sig_atomic_t fwd_stats_req;
+
 #ifndef R2DP_HAVE_DPDK
 #include <errno.h>
 int
