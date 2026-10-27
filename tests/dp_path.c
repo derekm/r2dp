@@ -305,6 +305,35 @@ main(void)
 		CHECK(run(a, b, m, &enc, got) && enc, "TCP/22 still protected end to end");
 	}
 
+	/* anti-replay: the same ESP datagram delivered twice is accepted once;
+	 * an out-of-order older one inside the window is accepted once too */
+	{
+		static uint8_t w[64];
+		struct rte_mbuf *in[2], *esp[2], *dup[2], *dec[BURST_SZ];
+		uint16_t nout = 0, nb = 0, n1 = 0, n2 = 0, n3 = 0, n4 = 0;
+		uint64_t rej = b->n_dropr[DR_REPLAY];
+		in[0] = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		in[1] = inner_frame("10.0.1.6", "10.0.2.5", 1, 0, w);
+		esp_outbound(a, in, 2, esp, &nout, &nb);
+		for (int k = 0; k < 2; k++) {
+			uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(esp[k], 14);
+			memset(f, 0, 14); f[12] = 0x08;
+			dup[k] = rte_pktmbuf_copy(esp[k], mp, 0, UINT32_MAX);
+		}
+		esp_inbound(b, &esp[1], 1, dec, &n1);           /* seq N+1 */
+		for (uint16_t k = 0; k < n1; k++) rte_pktmbuf_free(dec[k]);
+		esp_inbound(b, &esp[0], 1, dec, &n2);           /* seq N, older */
+		for (uint16_t k = 0; k < n2; k++) rte_pktmbuf_free(dec[k]);
+		esp_inbound(b, &dup[0], 1, dec, &n3);           /* replay N */
+		for (uint16_t k = 0; k < n3; k++) rte_pktmbuf_free(dec[k]);
+		esp_inbound(b, &dup[1], 1, dec, &n4);           /* replay N+1 */
+		for (uint16_t k = 0; k < n4; k++) rte_pktmbuf_free(dec[k]);
+		printf("     replay: n1=%u n2=%u n3=%u n4=%u\n", n1, n2, n3, n4);
+		CHECK(nout == 2 && n1 == 1 && n2 == 1, "replay: in-window reordering accepted");
+		CHECK(n3 == 0 && n4 == 0 && b->n_dropr[DR_REPLAY] == rej + 2,
+		    "replay: duplicates dropped (replay)");
+	}
+
 	/* per-reason drop counters account for every drop above */
 	{
 		uint64_t sa = 0, sb = 0;

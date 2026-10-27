@@ -223,6 +223,38 @@ t_inbound_policy(struct dpdk_priv *d)
 	spd_teardown(d);
 }
 
+/* Our anti-replay window (librte_ipsec's drops bits 32..63 of each
+ * bucket): duplicates in every bit position, window edges, windows > 64,
+ * and ESN reconstruction across a 2^32 wrap. */
+static void
+t_replay_window(void)
+{
+	static struct dp_sa s;
+	int bad = 0;
+
+	memset(&s, 0, sizeof(s)); s.rp_w = 64;
+	for (uint32_t q = 1; q <= 300; q++)
+		bad += !replay_accept(&s, q);
+	for (uint32_t q = 237; q <= 300; q++)       /* every bit position */
+		bad += replay_accept(&s, q);
+	CHECK(!bad, "replay: each of the last 64 seqs accepted once, then refused");
+	CHECK(!replay_accept(&s, 236), "replay: distance 64 is outside a 64-window");
+	CHECK(!replay_accept(&s, 0), "replay: seq 0 refused");
+	CHECK(replay_accept(&s, 1000) && replay_accept(&s, 937) && !replay_accept(&s, 936),
+	    "replay: jump ahead, then the oldest slot in, one past it out");
+
+	memset(&s, 0, sizeof(s)); s.rp_w = 200;
+	CHECK(replay_accept(&s, 500) && replay_accept(&s, 301) && !replay_accept(&s, 300) &&
+	    !replay_accept(&s, 301), "replay: 200-packet window (> 64) honoured");
+
+	memset(&s, 0, sizeof(s)); s.rp_w = 64; s.rp_esn = 1;
+	s.rp_top = 0xfffffff0ull;
+	CHECK(replay_accept(&s, 5) && s.rp_top == 0x100000005ull,
+	    "replay/ESN: low seq after the top wraps into the next epoch");
+	CHECK(replay_accept(&s, 0xfffffff8u) && !replay_accept(&s, 0xfffffff8u),
+	    "replay/ESN: late packet from the previous epoch once, not twice");
+}
+
 /* Indexed inbound check (installed SAs -> snapshot per-SA policy list) and
  * the hashed tunnel-peer set; plus the fallback scan when the snapshot was
  * not rebuilt for an SA (generation mismatch). */
@@ -521,6 +553,7 @@ main(void)
 	t_sp_concurrency(d);
 	t_inbound_policy(d);
 	t_binding(d);
+	t_replay_window();
 	t_inbound_indexed(d);
 	t_acl_diff(d);
 

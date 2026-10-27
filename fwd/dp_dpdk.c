@@ -66,6 +66,9 @@
 #define BURST_SZ      128
 #define TAP_IF_DEFAULT "r2dp-tap"
 
+#define RP_BITS  256              /* >= the largest window (wsize is a u8) */
+#define RP_WORDS (RP_BITS / 64)
+
 struct dp_sa {
 	struct rte_ipsec_sa *sa;      /* opaque, allocated from the ipsec lib */
 	struct rte_ipsec_session sess;/* ipsec session bound to the crypto dev */
@@ -90,6 +93,17 @@ struct dp_sa {
 	                              * the post-rekey SA egress must use */
 	uint64_t           bytes;    /* total bytes crypted on this SA (soft/hard
 	                              * byte lifetime accounting, young seq) */
+	/* Our own anti-replay window (inbound SAs, worker-only state), checked
+	 * after the ICV verified and before rte_ipsec_pkt_process.  librte_ipsec
+	 * (24.11 and current main) records the window bit in a uint32_t
+	 * (esn_inb_update_sqn: `uint32_t bit = (uint64_t)1 << (sqn & 63)`), so
+	 * bits 32..63 of every bucket are never set and a replay of any
+	 * sequence number with (sqn & 63) >= 32 is accepted.  This window is
+	 * authoritative; rte_ipsec's stays as a second line. */
+	uint64_t           rp_top;   /* highest accepted (64-bit, ESN-expanded) */
+	uint64_t           rp_map[RP_WORDS]; /* bit (seq % RP_BITS) seen */
+	uint32_t           rp_w;     /* window size (packets), 1..RP_BITS */
+	uint8_t            rp_esn;   /* SA uses extended sequence numbers */
 };
 
 /* SPD entry mirror for the egress (outbound) worker: populated by dpd_sp_add/
@@ -123,7 +137,8 @@ enum dp_drop {
 	DR_POLICY_DISCARD,  /* DISCARD policy */
 	DR_INNER_SEL,       /* decrypted inner packet outside the SA's IN policy */
 	DR_CRYPTO_FAIL,     /* crypto op failed: ICV/auth failure, PMD error */
-	DR_IPSEC_REJECT,    /* rte_ipsec prepare/process rejected (replay, ...) */
+	DR_REPLAY,          /* authenticated, but a replay or left of the window */
+	DR_IPSEC_REJECT,    /* rte_ipsec prepare/process rejected (window, ...) */
 	DR_CRYPTO_ENQ,      /* cryptodev queue full / stuck */
 	DR_NOMEM,           /* op pool, headroom, output array */
 	DR_NO_NEXTHOP,      /* egress ESP with no learned peer MAC */
@@ -134,7 +149,7 @@ enum dp_drop {
 };
 static const char *const dp_drop_name[DR_NUM] = {
 	"malformed", "no_sa_in", "no_sa_out", "policy_discard", "inner_sel",
-	"crypto_fail", "ipsec_reject", "crypto_enq", "nomem", "no_nexthop",
+	"crypto_fail", "replay", "ipsec_reject", "crypto_enq", "nomem", "no_nexthop",
 	"clear_outer", "esp_on_inner", "tx_full",
 };
 #define DROP(d, r, n) do { uint64_t n_ = (n); (d)->n_drop += n_; \
@@ -353,6 +368,10 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 
 	ds->spi = ntohl(rsa->spi);
 	ds->proto = rsa->proto;
+	ds->rp_top = 0;
+	memset(ds->rp_map, 0, sizeof(ds->rp_map));
+	ds->rp_w = rsa->wsize ? rsa->wsize : 64;     /* as r2dp_gcm_sa_prm */
+	ds->rp_esn = (rsa->saflags & R2DP_SAF_ESN) != 0;
 	/* tunnel endpoints: addr4_to_u32 memcpy's rsa->dst.addr[0..4], raw wire
 	 * order; match that exactly for endpoint selection (H3). */
 	memcpy(&ds->dsta, &rsa->dst.addr[0], 4);
@@ -680,6 +699,44 @@ port_init(struct dpdk_priv *d, uint16_t port)
  * packets are freed.  Returns the number of mbufs consumed from `in`. */
 static int in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
     struct rte_mbuf *mb);
+static struct dp_sa *sa_of_sess(struct dpdk_priv *d, struct rte_ipsec_session *ss);
+
+/* RFC 4303 s3.4.3 / App. A anti-replay on an authenticated packet's 32-bit
+ * sequence number: 1 = accept (and record), 0 = replay / too old. */
+static int
+replay_accept(struct dp_sa *ds, uint32_t lo)
+{
+	uint64_t t = ds->rp_top, sqn = lo;
+	uint32_t w = ds->rp_w, tl = (uint32_t)t;
+
+	if (ds->rp_esn) {                /* RFC 4303 App. A2.2 reconstruction */
+		uint64_t hi = t >> 32;
+		if (tl >= w - 1) {
+			if (lo < tl - w + 1) hi++;
+		} else if (lo >= tl - w + 1 && hi) {
+			hi--;
+		}
+		sqn = (hi << 32) | lo;
+	}
+	if (sqn == 0)
+		return 0;
+	if (sqn > t) {                   /* advance: clear the slots passed over */
+		uint64_t d = sqn - t;
+		if (d >= RP_BITS)
+			memset(ds->rp_map, 0, sizeof(ds->rp_map));
+		else
+			for (uint64_t s = t + 1; s <= sqn; s++)
+				ds->rp_map[(s % RP_BITS) / 64] &= ~(1ull << (s % 64));
+		ds->rp_top = sqn;
+	} else if (t - sqn >= w) {
+		return 0;                    /* left of the window */
+	} else if (ds->rp_map[(sqn % RP_BITS) / 64] & (1ull << (sqn % 64))) {
+		return 0;                    /* seen */
+	}
+	ds->rp_map[(sqn % RP_BITS) / 64] |= 1ull << (sqn % 64);
+	return 1;
+}
+
 /* Run n packets of ONE SA through lookaside crypto as a batch:
  * bulk op alloc -> rte_ipsec prepare -> enqueue -> dequeue (all of it) ->
  * per-op status check -> rte_ipsec process.  Every mbuf in mb[] is consumed:
@@ -694,6 +751,8 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	struct rte_crypto_op *cop[BURST_SZ];
 	uint16_t k, enq, dq = 0, ng = 0, proc;
 	unsigned spins = 0;
+	int rp = !(rte_ipsec_sa_type(ss->sa) & RTE_IPSEC_SATP_DIR_MASK);  /* inbound */
+	struct dp_sa *ds;
 
 	if (rte_crypto_op_bulk_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 	    cop, n) == 0) {
@@ -726,11 +785,22 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 		if (!got && ++spins > (1u << 24))
 			break;           /* stuck device: leave its ops */
 	}
+	ds = rp ? sa_of_sess(d, ss) : NULL;
 	for (uint16_t i = 0; i < dq; i++) {
 		struct rte_mbuf *m = cop[i]->sym->m_src;
-		if (cop[i]->status == RTE_CRYPTO_OP_STATUS_SUCCESS)
+		if (cop[i]->status == RTE_CRYPTO_OP_STATUS_SUCCESS) {
+			if (ds) {
+				/* authenticated: now the sequence number counts */
+				const struct rte_esp_hdr *eh = rte_pktmbuf_mtod_offset(
+				    m, const struct rte_esp_hdr *, m->l2_len + m->l3_len);
+				if (!replay_accept(ds, rte_be_to_cpu_32(eh->seq))) {
+					DROP(d, DR_REPLAY, 1);
+					rte_pktmbuf_free(m);
+					continue;
+				}
+			}
 			ok[ng++] = m;
-		else {
+		} else {
 			DROP(d, DR_CRYPTO_FAIL, 1);
 			rte_pktmbuf_free(m);
 		}
