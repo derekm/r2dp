@@ -1,0 +1,2 @@
+bench/lab/*.sh text eol=lf
+bench/lab/*.py text eol=lf
