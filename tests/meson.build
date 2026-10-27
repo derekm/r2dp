@@ -105,3 +105,10 @@ test('sel_test',
     include_directories: [include_directories('../include'),
                           include_directories('../fwd')]),
   is_parallel: false)
+
+# r2dpctl write commands (sa-add/sa-del/sp-add/sp-del/hello) against the mock.
+test('r2dpctl_write',
+  find_program('r2dpctl_test.sh'),
+  args: [r2dpctl.full_path(), mockfwd_path],
+  depends: [r2dpctl, r2dp_mockfwd],
+  is_parallel: false)
