@@ -28,6 +28,7 @@ static uint8_t key[20] = { 9,8,7,6,5,4,3,2,1,0,1,2,3,4,5,6, 0xde,0xad,0xbe,0xef 
 static struct rte_mempool *mp;
 static int cdev = -1;
 static struct rte_mbuf *espq[NPKT];
+static struct dp_worker wa, wb;   /* per-side data-path worker (queue/qp 0) */
 
 static struct dpdk_priv *
 mk_priv(const char *tag)
@@ -204,7 +205,6 @@ main(int argc, char **argv)
 	struct rte_cryptodev_config cc;
 	struct rte_cryptodev_qp_conf qc;
 	struct dpdk_priv *a, *b;
-	struct dp_worker wa, wb;   /* single worker driving each side's data path */
 	struct r2dp_sa r;
 	double enc[3], dec[3];
 	int check = 0, have = 1, fails = 0;
