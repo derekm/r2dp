@@ -80,6 +80,10 @@ jobs:
   # land on its exact counter (tests/e2e/fwd_e2e.sh).
   e2e:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [dpdk, kernel]
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
@@ -88,6 +92,8 @@ jobs:
           sudo apt-get install -y ninja-build meson pkg-config libdpdk-dev libssl-dev iproute2 python3-venv
           # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # kernel lane: ESP + netlink XFRM (modules are not autoloaded from a userns)
+          sudo modprobe -a esp4 xfrm_user xfrm4_tunnel tunnel4 ip_tunnel || true
       - name: Python venv (scapy + cryptography)
         run: |
           python3 -m venv "$RUNNER_TEMP/venv"
@@ -97,10 +103,14 @@ jobs:
           meson setup build-e2e --buildtype=debug -Denable_dpdk=enabled \
             -Db_sanitize=address,undefined -Db_lundef=false
           meson compile -C build-e2e
-      - name: fwd_e2e (unshare -Urnm)
+      - name: kfwd_test (kernel backend through the r2dp socket)
+        if: matrix.backend == 'kernel'
+        run: R2DP_REQUIRE_KERNEL=1 meson test -C build-e2e kfwd_test --print-errorlogs
+      - name: fwd_e2e (unshare -Urnm, ${{ matrix.backend }})
         run: |
           unshare -Urnm --propagation private bash -c '
             mount -t tmpfs none /run &&
+            BACKEND=${{ matrix.backend }} \
             PYTHON="$RUNNER_TEMP/venv/bin/python" R2DP_E2E_DIR="$RUNNER_TEMP/e2e" \
               tests/e2e/fwd_e2e.sh build-e2e/fwd/r2dp-fwd build-e2e/r2dpctl'
       - name: Forwarder log on failure

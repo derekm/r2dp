@@ -112,3 +112,11 @@ test('r2dpctl_write',
   args: [r2dpctl.full_path(), mockfwd_path],
   depends: [r2dpctl, r2dp_mockfwd],
   is_parallel: false)
+
+# Kernel XFRM backend (r2dp-fwd --dp kernel) end to end over the r2dp socket,
+# in its own user+net namespace (SKIP where that is unavailable).
+test('kfwd_test',
+  find_program('kfwd_test.sh'),
+  args: [r2dp_fwd.full_path(), r2dpctl.full_path()],
+  depends: [r2dp_fwd, r2dpctl],
+  is_parallel: false)

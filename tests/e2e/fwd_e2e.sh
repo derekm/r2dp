@@ -48,11 +48,12 @@ echo 1 >/proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null
 HOST_TTL=$(cat /proc/sys/net/ipv4/ip_default_ttl)
 
 if [ "$BACKEND" = kernel ]; then
-	ip link add r2o type veth peer name r2ok; ip link add r2i type veth peer name r2ik
-	for l in r2o r2ok r2i r2ik; do ip link set $l up; done
+	# the kernel is the tunnel endpoint AND the protected host (10.2.0.2 on
+	# lo); the scapy peer sits behind the r2o/r2ok veth pair
+	ip link add r2o type veth peer name r2ok
+	ip link set r2o up; ip link set r2ok up
 	ip addr add 192.0.2.1/24 dev r2ok
-	echo 1 >/proc/sys/net/ipv4/ip_forward
-	"$FWD" -s "$D/fwd.sock" --dp kernel --dp-cleanup >"$D/fwd.out" 2>&1 &
+	"$FWD" -s "$D/fwd.sock" --dp kernel --dp-cleanup -v >"$D/fwd.out" 2>&1 &
 else
 	"$FWD" -s "$D/fwd.sock" -l 0,1 --no-huge -m 512 --no-pci --no-telemetry \
 	    --file-prefix "r2e2e$$" --vdev=net_tap0,iface=r2o --vdev=net_tap1,iface=r2i \
@@ -67,18 +68,21 @@ done
 [ -S "$D/fwd.sock" ] || { cat "$D/fwd.out"; fail "control socket never appeared"; }
 if [ "$BACKEND" = dpdk ]; then
 	grep -q "DPDK dataplane ready" "$D/fwd.out" || { cat "$D/fwd.out"; fail "DPDK data plane did not come up"; }
-	HIF=r2i
+	# the plaintext host behind the forwarder: answers pings, routes the
+	# far subnet into the inner tap
+	ip addr add 10.2.0.2/24 dev r2i
+	ip route add 10.1.0.0/24 via 10.2.0.1 dev r2i
+	ip neigh replace 10.2.0.1 lladdr 02:00:00:00:00:99 dev r2i nud permanent
 else
-	HIF=r2ik
+	grep -q "kernel XFRM dataplane ready" "$D/fwd.out" || { cat "$D/fwd.out"; fail "XFRM data plane did not come up"; }
+	ip addr add 10.2.0.2/32 dev lo
+	ip route add 10.1.0.0/24 via 192.0.2.2 dev r2ok src 10.2.0.2
+	ip neigh replace 192.0.2.2 lladdr $PMAC dev r2ok nud permanent
 fi
-
-# the plaintext host: answers pings, routes the far subnet into the tunnel
-ip addr add 10.2.0.2/24 dev $HIF
-ip route add 10.1.0.0/24 via 10.2.0.1 dev $HIF
-ip neigh replace 10.2.0.1 lladdr 02:00:00:00:00:99 dev $HIF nud permanent
 # (not /sys/class/net: under unshare -n without a sysfs remount it shows
 # the parent namespace)
-FMAC=$(ip -o link show r2o | grep -o 'link/ether [0-9a-f:]*' | cut -d' ' -f2)
+[ "$BACKEND" = kernel ] && R2O_PEER=r2ok || R2O_PEER=r2o
+FMAC=$(ip -o link show $R2O_PEER | grep -o 'link/ether [0-9a-f:]*' | cut -d' ' -f2)
 [ -n "$FMAC" ] || fail "no r2o interface"
 
 c() { "$CTL" "$D/fwd.sock" "$@"; }
@@ -88,11 +92,11 @@ c sa-add dir=in  spi=0x1000 src=192.0.2.2 dst=192.0.2.1 enc=aes-gcm-16 key=$K1 >
 c sa-add dir=out spi=0x2000 src=192.0.2.1 dst=192.0.2.2 enc=aes-gcm-16 key=$K2 >/dev/null || fail "outbound SA rejected"
 c sp-add slid=1 dir=in  action=protect src=10.1.0.0/24 dst=10.2.0.0/24 tsrc=192.0.2.2 tdst=192.0.2.1 >/dev/null || fail "in SP rejected"
 c sp-add slid=2 dir=out action=protect src=10.2.0.0/24 dst=10.1.0.0/24 tsrc=192.0.2.1 tdst=192.0.2.2 >/dev/null || fail "out SP rejected"
-[ "$BACKEND" = kernel ] && { c sp-add slid=3 dir=fwd action=protect src=10.1.0.0/24 dst=10.2.0.0/24 tsrc=192.0.2.2 tdst=192.0.2.1 >/dev/null || fail "fwd SP rejected"; }
 
-# The forwarder is a bump in the wire: it does not route, so the inner reply
-# reaches the peer with the host's own TTL (the kernel backend forwards: -1).
-RTTL=$HOST_TTL; [ "$BACKEND" = kernel ] && RTTL=$((HOST_TTL - 1))
+# Nothing routes the inner reply on its way back (the DPDK forwarder is a
+# bump in the wire; with the kernel backend the host is the endpoint), so
+# it reaches the peer with the host's own default TTL.
+RTTL=$HOST_TTL
 peer() { "$PY" "$HERE/fwd_peer.py" r2o "$PMAC" "$FMAC" $K1 $K2 "$1" $RTTL; }
 dump_stats() {
 	local n; n=$(grep -c "r2dp-fwd: drops" "$D/fwd.out")

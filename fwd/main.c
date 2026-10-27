@@ -35,6 +35,8 @@ main(int argc, char **argv)
 {
 	const char *sockpath = getenv("R2DP_SOCK");
 	int verbose = 0;
+	const char *dpname = "dpdk";   /* --dp dpdk|kernel */
+	int dp_cleanup = 0;
 	/* DPDK EAL args (everything not one of our own) go to rte_eal_init */
 	char **eal_argv, **eal_base;
 	int eal_argc = 1, i;
@@ -58,6 +60,10 @@ main(int argc, char **argv)
 			sockpath = argv[++i];
 		} else if (strcmp(a, "-v") == 0) {
 			verbose = 1;
+		} else if (strcmp(a, "--dp") == 0 && i + 1 < argc) {
+			dpname = argv[++i];
+		} else if (strcmp(a, "--dp-cleanup") == 0) {
+			dp_cleanup = 1;
 		} else if (strcmp(a, "-n") == 0 && i + 1 < argc) {
 			i++;               /* processing lcores; probe claims it */
 		} else {
@@ -70,6 +76,21 @@ main(int argc, char **argv)
 
 	fwd_ctl_init(&ctl, sockpath, verbose);
 
+	if (strcmp(dpname, "kernel") == 0) {
+		/* Linux XFRM data plane: a kernel that cannot hold any ESP state
+		 * is fatal here -- the operator asked for this backend. */
+		int r = fwd_dp_xfrm_probe(&ctl.dp, verbose, dp_cleanup);
+		if (r < 0) {
+			fprintf(stderr, "r2dp-fwd: kernel XFRM dataplane: %s\n",
+			    strerror(-r));
+			free(eal_base);
+			return 1;
+		}
+	} else if (strcmp(dpname, "dpdk") != 0) {
+		fprintf(stderr, "r2dp-fwd: --dp dpdk|kernel (got '%s')\n", dpname);
+		free(eal_base);
+		return 2;
+	} else
 	/* Optional DPDK dataplane probe.  Failure is non-fatal: we still serve
 	 * the control socket (racoon2 bring-up + M0 tests). */
 	{

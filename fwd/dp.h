@@ -74,4 +74,10 @@ void fwd_dp_init(struct fwd_dp *dp);
 int fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
     const char *sockpath, int verbose);
 
+/* Linux kernel XFRM backend (fwd/dp_xfrm.c, `r2dp-fwd --dp kernel`):
+ * opens NETLINK_XFRM and probes which transforms the kernel accepts.
+ * cleanup != 0: remove every SA/SP this process installed on stop. */
+int fwd_dp_xfrm_probe(struct fwd_dp *dp, int verbose, int cleanup);
+void fwd_dp_xfrm_free(struct fwd_dp *dp);
+
 #endif /* R2DP_FWD_DP_H */

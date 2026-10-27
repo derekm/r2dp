@@ -12,12 +12,14 @@ dpdk = dependency('libdpdk', required: get_option('enable_dpdk'),
 fwd_sources = files(
   'ctl.c',
   'dp.c',
+  'dp_sel.c',
+  'dp_xfrm.c',
   'main.c',
 )
 
 fwd_o = fwd_sources
 if dpdk.found()
-  fwd_o += files('dp_dpdk.c', 'dp_gcm.c', 'dp_nh.c', 'dp_sel.c')
+  fwd_o += files('dp_dpdk.c', 'dp_gcm.c', 'dp_nh.c')
   dpdk_inc = dpdk
 else
   # When DPDK is disabled, dp_dpdk.c is not compiled; dp.h's
