@@ -59,8 +59,8 @@ free_priv(struct dpdk_priv *d)
 	for (int i = 0; i < MAX_SA; i++) {
 		if (d->sa_tab[i].used)
 			sa_slot_free(d, &d->sa_tab[i]);
-		free(d->sp_tab[i].sp);
 	}
+	spd_teardown(d);
 	rte_ipsec_sad_destroy(d->sad);
 	rte_mempool_free(d->sess_mp);
 	rte_mempool_free(d->cop_mp);

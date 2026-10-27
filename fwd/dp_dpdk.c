@@ -102,6 +102,31 @@ struct dp_sp_ent {
 	struct r2dp_sp *sp;
 };
 
+/* Policy snapshot (SPD view of the worker).  Built by the control thread
+ * under d->lock whenever an SA or SP changes, published with a release
+ * store, and freed only after a QSBR grace period, so the worker reads a
+ * consistent, immutable view with one acquire load per burst.
+ *
+ * OUT policies are pre-sorted most-specific first (r2dp_sel_score desc,
+ * sp_tab slot asc as the tie-break, i.e. the same winner as a full scan) and
+ * each PROTECT policy is BOUND to its EGRESS SA here, at control time
+ * (sa_by_policy), so the packet path never scans the SA table.  The binding
+ * records the SA's install generation: if the slot has since been retired or
+ * reused the generations differ and the packet is dropped (fail closed)
+ * until the next rebuild. */
+struct dp_pol {
+	const struct r2dp_sp *sp;
+	int32_t  sa_idx;          /* bound EGRESS SA slot, -1 = none */
+	uint64_t sa_gen;          /* that slot's gen at bind time */
+	int      score;           /* r2dp_sel_score(sp) */
+	int      slot;            /* sp_tab slot (tie-break) */
+};
+
+struct dp_spd {
+	uint32_t       nout;
+	struct dp_pol *out;       /* OUT policies, most specific first */
+};
+
 /* Worker-side accessors: acquire pairs with the ctl-side release publish. */
 static inline const struct r2dp_sp *
 sp_load(const struct dp_sp_ent *e)
@@ -131,6 +156,8 @@ struct dpdk_priv {
 	unsigned            rcu_tid; /* worker thread id registered with the QSBR */
 	struct dp_sa        sa_tab[MAX_SA];
 	struct dp_sp_ent    sp_tab[MAX_SA];
+	struct dp_spd      *spd;      /* published policy snapshot (see above) */
+	uint64_t            n_spd_fail; /* snapshot rebuilds that failed (ENOMEM) */
 	int                 verbose;
 	uint64_t            sa_gen;       /* last dp_sa.gen handed out */
 	/* Egress ESP L2: per-peer next hop learned from IKE/ESP sent by a
@@ -278,6 +305,8 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	return 0;
 }
 
+static int spd_rebuild(struct dpdk_priv *d);
+
 /* Tear down one slot: free the crypto session, ipsec SA, and zero it.
  * Caller holds d->lock. */
 static void
@@ -337,6 +366,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 			    d->sa_tab[i].proto == rsa->proto &&
 			    d->sa_tab[i].dip == dip) {
 				sa_slot_retire(d, &d->sa_tab[i]);
+				(void)spd_rebuild(d);  /* rebind to a remaining SA */
 				break;
 			}
 		}
@@ -393,6 +423,12 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	d->sa_tab[newidx].gen = ++d->sa_gen;
 	/* publish last: the worker only proceeds past `used` == 1 */
 	__atomic_store_n(&d->sa_tab[newidx].used, 1, __ATOMIC_RELEASE);
+
+	/* Rebind policies before retiring the old session: a rekey switches
+	 * egress to the newest SA with no window where the policy has none.
+	 * A failed rebuild leaves the previous snapshot, whose bindings the
+	 * worker re-validates by generation (stale => drop, never misuse). */
+	(void)spd_rebuild(d);
 
 	/* tear down the old same-SPI session (now that a replacement exists) */
 	if (idx >= 0)
@@ -472,10 +508,20 @@ dpd_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	}
 	old = d->sp_tab[slot].sp;
 	__atomic_store_n(&d->sp_tab[slot].sp, nsp, __ATOMIC_RELEASE);
-	if (old) {
-		/* the worker may still hold `old` from this iteration */
+	if (spd_rebuild(d) < 0) {
+		/* the worker keeps enforcing the previous snapshot; put the
+		 * table back so control state and dataplane agree */
+		__atomic_store_n(&d->sp_tab[slot].sp, old, __ATOMIC_RELEASE);
 		if (d->rcu)
 			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+		rte_spinlock_unlock(&d->lock);
+		free(nsp);
+		return -ENOMEM;
+	}
+	if (old) {
+		/* spd_rebuild waited a grace period after publishing the
+		 * snapshot that no longer references `old`; the direct sp_tab
+		 * readers are covered by the same wait */
 		free(old);
 	}
 	rte_spinlock_unlock(&d->lock);
@@ -493,14 +539,19 @@ dpd_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 		if (d->sp_tab[i].sp && d->sp_tab[i].sp->slid == sp->slid) {
 			old = d->sp_tab[i].sp;
 			__atomic_store_n(&d->sp_tab[i].sp, NULL, __ATOMIC_RELEASE);
+			if (spd_rebuild(d) < 0) {
+				/* keep enforcing the old (stricter or equal)
+				 * policy rather than dropping it unseen */
+				__atomic_store_n(&d->sp_tab[i].sp, old,
+				    __ATOMIC_RELEASE);
+				rte_spinlock_unlock(&d->lock);
+				return -ENOMEM;
+			}
 			break;
 		}
 	}
-	if (old) {
-		if (d->rcu)
-			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
-		free(old);
-	}
+	if (old)
+		free(old);   /* spd_rebuild already waited a grace period */
 	rte_spinlock_unlock(&d->lock);
 	return 0;
 }
@@ -1054,35 +1105,116 @@ sa_by_policy(struct dpdk_priv *d, const struct r2dp_sp *sp)
 	return by_reqid ? by_reqid : by_endpoint;
 }
 
-/* Find the OUT policy that (longest-prefix) matches this inner IPv4 packet.
- * Returns the matched sp (or NULL); sets *sa to the reqid-linked EGRESS SA. */
+static int
+pol_cmp(const void *a, const void *b)
+{
+	const struct dp_pol *x = a, *y = b;
+
+	if (x->score != y->score)
+		return y->score - x->score;      /* most specific first */
+	return x->slot - y->slot;            /* then table order */
+}
+
+static void
+spd_free(struct dp_spd *s)
+{
+	if (!s)
+		return;
+	free(s->out);
+	free(s);
+}
+
+/* Build a new snapshot from sp_tab/sa_tab, publish it, wait a grace period,
+ * free the old one.  Caller holds d->lock.  On allocation failure nothing is
+ * published and the worker keeps the previous snapshot. */
+static int
+spd_rebuild(struct dpdk_priv *d)
+{
+	struct dp_spd *ns, *old;
+	uint32_t n = 0;
+
+	ns = calloc(1, sizeof(*ns));
+	if (!ns)
+		goto fail;
+	ns->out = calloc(MAX_SA, sizeof(*ns->out));
+	if (!ns->out)
+		goto fail;
+	for (int i = 0; i < MAX_SA; i++) {
+		const struct r2dp_sp *sp = d->sp_tab[i].sp;
+		struct dp_pol *p;
+		struct dp_sa *ds;
+
+		if (!sp || sp->dir != R2DP_DIR_OUT)
+			continue;
+		p = &ns->out[n++];
+		p->sp = sp;
+		p->slot = i;
+		p->score = r2dp_sel_score(sp);
+		p->sa_idx = -1;
+		if (sp->action == R2DP_ACT_PROTECT &&
+		    (ds = sa_by_policy(d, sp)) != NULL) {
+			p->sa_idx = (int32_t)(ds - d->sa_tab);
+			p->sa_gen = ds->gen;
+		}
+	}
+	ns->nout = n;
+	qsort(ns->out, n, sizeof(*ns->out), pol_cmp);
+
+	old = d->spd;
+	__atomic_store_n(&d->spd, ns, __ATOMIC_RELEASE);
+	if (old) {
+		if (d->rcu)
+			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+		spd_free(old);
+	}
+	return 0;
+fail:
+	spd_free(ns);
+	d->n_spd_fail++;
+	return -ENOMEM;
+}
+
+/* Control-side teardown (dpd_stop / tests): free the snapshot and SP copies. */
+static void
+spd_teardown(struct dpdk_priv *d)
+{
+	spd_free(d->spd);
+	d->spd = NULL;
+	for (int i = 0; i < MAX_SA; i++) {
+		free(d->sp_tab[i].sp);
+		d->sp_tab[i].sp = NULL;
+	}
+}
+
+/* Find the most specific OUT policy matching this inner IPv4 packet in the
+ * published snapshot (pre-sorted, so the first match wins) and return its
+ * control-time bound EGRESS SA in *sa (NULL if none, or if the binding went
+ * stale: retired/reused slot => generation mismatch => fail closed). */
 static const struct r2dp_sp *
 sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip, size_t avail,
     struct dp_sa **sa)
 {
-	const struct r2dp_sp *best = NULL;
-	int bestscore = -1;
+	const struct dp_spd *s = __atomic_load_n(&d->spd, __ATOMIC_ACQUIRE);
 
-	for (int i = 0; i < MAX_SA; i++) {
-		const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
-		int sc;
-		if (!sp || sp->dir != R2DP_DIR_OUT)
-			continue;
+	*sa = NULL;
+	if (!s)
+		return NULL;
+	for (uint32_t i = 0; i < s->nout; i++) {
+		const struct dp_pol *p = &s->out[i];
+
 		/* match any action so DISCARD/BYPASS policies can override a
-		 * PROTECT (M6); esp_outbound then enforces the disposition.
-		 * Port selectors are honoured (M5): a port-specific policy is
-		 * never silently skipped in favour of a broader one. */
-		if (!r2dp_sel_match(sp, (const uint8_t *)ip, avail))
+		 * PROTECT (M6); esp_outbound enforces the disposition.  Port
+		 * selectors are honoured (M5). */
+		if (!r2dp_sel_match(p->sp, (const uint8_t *)ip, avail))
 			continue;
-		sc = r2dp_sel_score(sp);
-		if (sc > bestscore) {
-			bestscore = sc;
-			best = sp;
+		if (p->sp->action == R2DP_ACT_PROTECT && p->sa_idx >= 0) {
+			struct dp_sa *ds = &d->sa_tab[p->sa_idx];
+			if (sa_live(ds) && ds->gen == p->sa_gen && !ds->inbound)
+				*sa = ds;
 		}
+		return p->sp;
 	}
-	*sa = (best && best->action == R2DP_ACT_PROTECT) ?
-	    sa_by_policy(d, best) : NULL;
-	return best;
+	return NULL;
 }
 
 /* Outbound ESP: take inner IPv4 plaintext (L2 already stripped, l2_len=0),
@@ -1651,6 +1783,7 @@ dpd_stop(struct fwd_dp *dp)
 		rte_free(d->rcu);
 		d->rcu = NULL;
 	}
+	spd_teardown(d);
 }
 
 /* ------------------------------------------------------------------ */

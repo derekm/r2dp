@@ -107,6 +107,18 @@ reader(void *arg)
 			    sp->pref_src != k % 33)
 				rd_torn++;
 		}
+		/* the published snapshot (what the egress path reads) */
+		{
+			const struct dp_spd *ss = __atomic_load_n(&d->spd, __ATOMIC_ACQUIRE);
+			for (uint32_t i = 0; ss && i < ss->nout; i++) {
+				const struct r2dp_sp *sp = ss->out[i].sp;
+				uint8_t k = sp->tag[0];
+				for (unsigned j = 0; j < sizeof(sp->tag); j++)
+					if ((uint8_t)sp->tag[j] != k) rd_torn++;
+				if (sp->sel_src.addr[3] != k || (i && ss->out[i - 1].score < ss->out[i].score))
+					rd_torn++;
+			}
+		}
 		rd_iters++;
 		rte_rcu_qsbr_quiescent(d->rcu, d->worker_lcore);
 	}
@@ -145,11 +157,7 @@ t_sp_concurrency(struct dpdk_priv *d)
 	rte_eal_wait_lcore(lc);
 	CHECK(rd_iters > 0, "reader ran concurrently with policy churn");
 	CHECK(rd_torn == 0, "no torn policy reads under concurrent replace/delete");
-	for (int i = 0; i < MAX_SA; i++)
-		if (d->sp_tab[i].sp) {
-			free(d->sp_tab[i].sp);
-			d->sp_tab[i].sp = NULL;
-		}
+	spd_teardown(d);
 	rte_free(d->rcu);
 	d->rcu = NULL;
 }
@@ -212,8 +220,74 @@ t_inbound_policy(struct dpdk_priv *d)
 	    "B's traffic under B's SA accepted (not judged by A's policy)");
 	CHECK(!inbound_policy_ok(d, &a, p, 40), "B's selectors under A's SA rejected");
 
+	spd_teardown(d);
+}
+
+/* Control-time policy->SA binding: the egress path reads the binding from
+ * the published snapshot (no SA scan); rekey rebinds to the newest SA, a
+ * delete rebinds to what is left, a stale binding fails closed, and the
+ * most specific policy wins independent of table order. */
+static void
+t_binding(struct dpdk_priv *d)
+{
+	struct fwd_dp dp = { .priv = d };
+	struct r2dp_sp sp;
+	struct r2dp_sa r;
+	struct dp_sa *ds = NULL;
+	const struct r2dp_sp *m;
+	uint8_t pkt[40];
+
+	memset(pkt, 0, sizeof(pkt));
+	pkt[0] = 0x45; pkt[9] = 17;
+	inet_pton(AF_INET, "10.9.0.5", pkt + 12);
+	inet_pton(AF_INET, "10.8.0.5", pkt + 16);
+	pkt[22] = 0; pkt[23] = 53;
+
+	memset(&sp, 0, sizeof(sp));
+	sp.slid = 77; sp.dir = R2DP_DIR_OUT; sp.action = R2DP_ACT_PROTECT;
+	sp.ul_proto = R2DP_PROTO_ANY;
+	sp.sel_src.family = sp.sel_dst.family = R2DP_AF_INET4;
+	sp.tun_src.family = sp.tun_dst.family = R2DP_AF_INET4;
+	inet_pton(AF_INET, "10.9.0.0", sp.sel_src.addr); sp.pref_src = 24;
+	inet_pton(AF_INET, "10.8.0.0", sp.sel_dst.addr); sp.pref_dst = 24;
+	inet_pton(AF_INET, "192.0.2.21", sp.tun_src.addr);
+	inet_pton(AF_INET, "192.0.2.22", sp.tun_dst.addr);
+	CHECK(dpd_sp_add(&dp, &sp) == 0, "bind: OUT policy installed");
+	m = sp_match_out(d, (const struct rte_ipv4_hdr *)pkt, sizeof(pkt), &ds);
+	CHECK(m && m->slid == 77 && !ds, "bind: PROTECT without an SA -> no SA (drop)");
+
+	mk_sa(&r, 0x3001, "192.0.2.21", "192.0.2.22");
+	CHECK(sa_install(d, &r, key, 20, 0, 0) == 0, "bind: SA #1");
+	m = sp_match_out(d, (const struct rte_ipv4_hdr *)pkt, sizeof(pkt), &ds);
+	CHECK(ds && ds->spi == 0x3001, "bind: policy bound to SA #1 at install");
+	mk_sa(&r, 0x3002, "192.0.2.21", "192.0.2.22");
+	CHECK(sa_install(d, &r, key, 20, 0, 0) == 0, "bind: SA #2 (rekey)");
+	m = sp_match_out(d, (const struct rte_ipv4_hdr *)pkt, sizeof(pkt), &ds);
+	CHECK(ds && ds->spi == 0x3002, "bind: rekey rebinds to the newest SA");
+	CHECK(sa_install(d, &r, NULL, 0, 1, 0) == 0, "bind: delete SA #2");
+	m = sp_match_out(d, (const struct rte_ipv4_hdr *)pkt, sizeof(pkt), &ds);
+	CHECK(ds && ds->spi == 0x3001, "bind: delete rebinds to the remaining SA");
+	ds->gen += 1000;                         /* slot reused behind our back */
+	m = sp_match_out(d, (const struct rte_ipv4_hdr *)pkt, sizeof(pkt), &ds);
+	CHECK(m && !ds, "bind: stale binding (generation mismatch) fails closed");
 	for (int i = 0; i < MAX_SA; i++)
-		if (d->sp_tab[i].sp) { free(d->sp_tab[i].sp); d->sp_tab[i].sp = NULL; }
+		if (d->sa_tab[i].used && d->sa_tab[i].spi == 0x3001)
+			d->sa_tab[i].gen -= 1000;
+
+	/* a more specific DISCARD installed later still wins */
+	sp.slid = 78; sp.action = R2DP_ACT_DISCARD;
+	inet_pton(AF_INET, "10.9.0.5", sp.sel_src.addr); sp.pref_src = 32;
+	CHECK(dpd_sp_add(&dp, &sp) == 0, "bind: specific DISCARD installed");
+	m = sp_match_out(d, (const struct rte_ipv4_hdr *)pkt, sizeof(pkt), &ds);
+	CHECK(m && m->slid == 78 && m->action == R2DP_ACT_DISCARD,
+	    "bind: most specific policy wins regardless of slot order");
+	CHECK(dpd_sp_del(&dp, &sp) == 0, "bind: DISCARD removed");
+	m = sp_match_out(d, (const struct rte_ipv4_hdr *)pkt, sizeof(pkt), &ds);
+	CHECK(m && m->slid == 77 && ds && ds->spi == 0x3001, "bind: back to the PROTECT policy");
+
+	mk_sa(&r, 0x3001, "192.0.2.21", "192.0.2.22");
+	sa_install(d, &r, NULL, 0, 1, 0);
+	spd_teardown(d);
 }
 
 int
@@ -306,6 +380,7 @@ main(void)
 
 	t_sp_concurrency(d);
 	t_inbound_policy(d);
+	t_binding(d);
 
 	/* teardown: free every session (no leaks under LSan) */
 	for (int i = 0; i < MAX_SA; i++)
