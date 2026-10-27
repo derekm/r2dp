@@ -965,6 +965,7 @@ bad:
 
 	if (nlook == 0) {
 		/* no SA matched -- drop the whole burst */
+		DROP(d, DR_NO_SA_IN, nk);
 		for (uint32_t i = 0; i < nk; i++)
 			rte_pktmbuf_free(pm[i]);
 		if (nout) *nout = 0;
