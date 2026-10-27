@@ -2166,8 +2166,8 @@ dpd_start(struct fwd_dp *dp)
 	if (nw > (int)RTE_MAX_LCORE - 1) nw = (int)RTE_MAX_LCORE - 1;
 	{
 		unsigned av = 0;
-		for (unsigned x = rte_get_next_lcore(-1, 1, 1); x < RTE_MAX_LCORE;
-		     x = rte_get_next_lcore(x, 1, 1)) av++;
+		for (unsigned x = rte_get_next_lcore(-1, 1, 0); x < RTE_MAX_LCORE;
+		     x = rte_get_next_lcore(x, 1, 0)) av++;
 		if (av == 0) {
 			fprintf(stderr, "r2dp-fwd: no spare lcore for a worker "
 			    "(run with -l 0,<n>, e.g. -l 0-1)\n");
@@ -2286,8 +2286,8 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		if (nw < 1) nw = 1;
 		if (nw > (int)RTE_MAX_LCORE - 1) nw = (int)RTE_MAX_LCORE - 1;
 		unsigned av = 0;
-		for (unsigned x = rte_get_next_lcore(-1, 1, 1); x < RTE_MAX_LCORE;
-		     x = rte_get_next_lcore(x, 1, 1)) av++;
+		for (unsigned x = rte_get_next_lcore(-1, 1, 0); x < RTE_MAX_LCORE;
+		     x = rte_get_next_lcore(x, 1, 0)) av++;
 		if (av && nw > (int)av) nw = (int)av;
 		d->nworkers = (uint16_t)nw;
 	}
