@@ -100,34 +100,43 @@ add_sp(struct dpdk_priv *d, uint32_t slid, uint8_t dir, uint8_t act,
 
 /* Ethernet + IPv4 inner frame (64-byte IP packet). */
 static struct rte_mbuf *
-inner_frame(const char *src, const char *dst, uint8_t proto, uint16_t dport,
-    uint8_t *ipcopy)
+inner_frame_len(const char *src, const char *dst, uint8_t proto, uint16_t dport,
+    uint8_t *ipcopy, uint16_t len)
 {
 	struct rte_mbuf *m = rte_pktmbuf_alloc(mp);
 	uint8_t *f;
 
 	if (!m)
 		return NULL;
-	f = (uint8_t *)rte_pktmbuf_append(m, 14 + 64);
-	memset(f, 0, 14 + 64);
+	f = (uint8_t *)rte_pktmbuf_append(m, 14 + len);
+	if (!f) { rte_pktmbuf_free(m); return NULL; }
+	memset(f, 0, 14 + len);
 	f[12] = 0x08;
-	f[14] = 0x45; f[16] = 0; f[17] = 64; f[22] = 64; f[23] = proto;
+	f[14] = 0x45; f[16] = (uint8_t)(len >> 8); f[17] = (uint8_t)len;
+	f[22] = 64; f[23] = proto;
 	inet_pton(AF_INET, src, f + 14 + 12);
 	inet_pton(AF_INET, dst, f + 14 + 16);
 	f[14 + 20 + 2] = (uint8_t)(dport >> 8); f[14 + 20 + 3] = (uint8_t)dport;
-	for (int i = 28; i < 64; i++) f[14 + i] = (uint8_t)i;
+	for (int i = 28; i < len; i++) f[14 + i] = (uint8_t)i;
 	((struct rte_ipv4_hdr *)(f + 14))->hdr_checksum =
 	    rte_ipv4_cksum((struct rte_ipv4_hdr *)(f + 14));
 	if (ipcopy)
-		memcpy(ipcopy, f + 14, 64);
+		memcpy(ipcopy, f + 14, len);
 	return m;
+}
+
+static struct rte_mbuf *
+inner_frame(const char *src, const char *dst, uint8_t proto, uint16_t dport,
+    uint8_t *ipcopy)
+{
+	return inner_frame_len(src, dst, proto, dport, ipcopy, 64);
 }
 
 /* A -> encrypt -> B -> decrypt.  Returns 1 if an inner packet came out of
  * B (copied to `got`), 0 if dropped; *encrypted says whether A emitted ESP. */
 static int
-run(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
-    int *encrypted, uint8_t *got)
+run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
+    int *encrypted, uint8_t *got, uint16_t len)
 {
 	struct rte_mbuf *in[1] = { m }, *esp[1] = { NULL }, *dec[BURST_SZ];
 	uint16_t nout = 0, nb = 0, ndec = 0;
@@ -147,10 +156,17 @@ run(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
 	if (ndec != 1)
 		return 0;
 	memcpy(got, rte_pktmbuf_mtod(dec[0], uint8_t *),
-	    RTE_MIN(64u, rte_pktmbuf_pkt_len(dec[0])));
+	    RTE_MIN((uint32_t)len, rte_pktmbuf_pkt_len(dec[0])));
 	ndec = (uint16_t)rte_pktmbuf_pkt_len(dec[0]);
 	rte_pktmbuf_free(dec[0]);
-	return ndec == 64;
+	return ndec == len;
+}
+
+static int
+run(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
+    int *encrypted, uint8_t *got)
+{
+	return run_len(a, b, m, encrypted, got, 64);
 }
 
 int
@@ -211,6 +227,20 @@ main(void)
 		struct rte_mbuf *m = inner_frame("10.0.9.5", "10.0.2.5", 1, 0, want);
 		int ok = run(a, b, m, &enc, got);
 		CHECK(enc && !ok, "inner packet outside B's IN selector dropped after decrypt");
+	}
+
+	/* Inner lengths whose low byte is < 20 (256, 512, 513, 270...) were
+	 * dropped by an 8-bit truncation of the mbuf length in the IHL check. */
+	{
+		static const uint16_t lens[] = { 255, 256, 257, 269, 270, 276, 512, 513, 1024, 1400 };
+		static uint8_t w[1500], g[1500];
+		int allok = 1;
+		for (unsigned k = 0; k < RTE_DIM(lens); k++) {
+			struct rte_mbuf *m = inner_frame_len("10.0.1.5", "10.0.2.5", 1, 0, w, lens[k]);
+			int ok = m && run_len(a, b, m, &enc, g, lens[k]) && memcmp(g, w, lens[k]) == 0;
+			if (!ok) { printf("     len %u failed\n", lens[k]); allok = 0; }
+		}
+		CHECK(allok, "inner lengths 255..1400 incl. 256/512/513 round-trip");
 	}
 
 	/* port-specific DISCARD (TCP/23) overrides the covering PROTECT */

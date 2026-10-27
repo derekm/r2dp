@@ -1127,7 +1127,7 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		bufs[i]->l2_len = 0;
 		lip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
 		ihl = (lip->version_ihl & 0x0f) * 4;
-		if (ihl < 20 || ihl > (uint8_t)rte_pktmbuf_data_len(bufs[i]))
+		if (ihl < 20 || ihl > rte_pktmbuf_data_len(bufs[i]))
 			goto drop;   /* M5c: reject malformed/oversized IHL */
 		bufs[i]->l3_len = ihl;
 		bufs[i]->packet_type = RTE_PTYPE_L3_IPV4;
