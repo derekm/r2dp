@@ -37,6 +37,7 @@ main(int argc, char **argv)
 	int verbose = 0;
 	const char *dpname = "dpdk";   /* --dp dpdk|kernel */
 	int dp_cleanup = 0;
+	int nworkers = 1;   /* DPDK run-to-completion workers (-n N) */
 	/* DPDK EAL args (everything not one of our own) go to rte_eal_init */
 	char **eal_argv, **eal_base;
 	int eal_argc = 1, i;
@@ -68,7 +69,7 @@ main(int argc, char **argv)
 			/* processing/running lcores: count of run-to-completion DPDK
 			 * workers (default 1).  Probe clamps it to what the EAL lcore
 			 * mask + the NIC/crypto queue-pair limits actually allow. */
-			ctl.dp.nworkers = atoi(argv[++i]);
+			nworkers = atoi(argv[++i]);
 		} else {
 			eal_argv[eal_argc++] = argv[i];
 		}
@@ -78,6 +79,7 @@ main(int argc, char **argv)
 	signal(SIGUSR1, on_usr1);   /* dump datapath stats + drop reasons */
 
 	fwd_ctl_init(&ctl, sockpath, verbose);
+	ctl.dp.nworkers = nworkers;   /* fwd_ctl_init zeros c->dp via memset; re-apply -n */
 
 	if (strcmp(dpname, "kernel") == 0) {
 		/* Linux XFRM data plane: a kernel that cannot hold any ESP state
