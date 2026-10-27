@@ -51,7 +51,8 @@ static int
 setup(void)
 {
 	struct rte_cryptodev_config cc; struct rte_cryptodev_qp_conf qc;
-	cdev = rte_cryptodev_get_dev_id("crypto_openssl0");
+	cdev = rte_cryptodev_get_dev_id(getenv("R2DP_CRYPTO_DEV") ?
+	    getenv("R2DP_CRYPTO_DEV") : "crypto_aesni_mb0");
 	if (cdev < 0) return -1;
 	memset(&cc, 0, sizeof(cc)); cc.socket_id = SOCKET_ID_ANY; cc.nb_queue_pairs = 1;
 	if (rte_cryptodev_configure(cdev, &cc) < 0) return -1;
@@ -196,8 +197,12 @@ run(struct rte_ipsec_session *ss, struct rte_mbuf **m)
 int
 main(void)
 {
-	char *ea[] = { "gcm_kat", "--no-huge", "--no-pci", "-m", "256",
-	    "--vdev=crypto_openssl0", "--log-level=1", NULL };
+	/* use hugepages (we reserve enough for DPDK) + AES-NI PMD, matching
+	 * r2dp-fwd; the crypto device is env-overridable (R2DP_CRYPTO_DEV). */
+	const char *cdexp = getenv("R2DP_CRYPTO_DEV") ? getenv("R2DP_CRYPTO_DEV")
+	    : "crypto_aesni_mb0";
+	char *ea[] = { "gcm_kat", "--no-pci", "-l", "0", "--vdev", cdexp,
+	    "--log-level=1", NULL };
 	uint8_t body[200]; uint8_t inner[84]; size_t n;
 	int st;
 

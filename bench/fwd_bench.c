@@ -198,9 +198,9 @@ envf(const char *n, double def)
 int
 main(int argc, char **argv)
 {
-	char *ea[] = { "fwd_bench", "-l", "0", "--no-huge", "-m", "1024",
-	    "--no-pci", "--no-telemetry", "--vdev=crypto_openssl0",
-	    "--log-level=1", NULL };
+	char *ea[] = { "fwd_bench", "-l", "0", "--no-pci", "--no-telemetry",
+	    "--vdev", (getenv("R2DP_CRYPTO_DEV") ? getenv("R2DP_CRYPTO_DEV")
+	        : "crypto_aesni_mb0"), "--log-level=1", NULL };
 	static const int tunnels[] = { 1, 65, 201 };
 	struct rte_cryptodev_config cc;
 	struct rte_cryptodev_qp_conf qc;
@@ -221,10 +221,11 @@ main(int argc, char **argv)
 		return 2;
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);
-	if (rte_eal_init(10, ea) < 0 ||
-	    (cdev = rte_cryptodev_get_dev_id("crypto_openssl0")) < 0) {
+	if (rte_eal_init(8, ea) < 0 ||
+	    (cdev = rte_cryptodev_get_dev_id(getenv("R2DP_CRYPTO_DEV") ?
+	        getenv("R2DP_CRYPTO_DEV") : "crypto_aesni_mb0")) < 0) {
 		if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
-		puts("SKIP: EAL/crypto_openssl"); return 77;
+		puts("SKIP: EAL/crypto"); return 77;
 	}
 	memset(&cc, 0, sizeof(cc)); cc.socket_id = SOCKET_ID_ANY; cc.nb_queue_pairs = 1;
 	memset(&qc, 0, sizeof(qc)); qc.nb_descriptors = 2048;

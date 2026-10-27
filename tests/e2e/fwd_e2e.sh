@@ -55,9 +55,9 @@ if [ "$BACKEND" = kernel ]; then
 	ip addr add 192.0.2.1/24 dev r2ok
 	"$FWD" -s "$D/fwd.sock" --dp kernel --dp-cleanup -v >"$D/fwd.out" 2>&1 &
 else
-	"$FWD" -s "$D/fwd.sock" -l 0,1 --no-huge -m 512 --no-pci --no-telemetry \
+	"$FWD" -s "$D/fwd.sock" -l 0,1 --no-pci --no-telemetry \
 	    --file-prefix "r2e2e$$" --vdev=net_tap0,iface=r2o --vdev=net_tap1,iface=r2i \
-	    --vdev=crypto_openssl0 >"$D/fwd.out" 2>&1 &
+	    --vdev="${R2DP_CRYPTO_DEV:-crypto_aesni_mb0}" >"$D/fwd.out" 2>&1 &
 fi
 FPID=$!
 for _ in $(seq 100); do

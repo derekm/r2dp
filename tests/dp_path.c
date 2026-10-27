@@ -178,8 +178,9 @@ run(struct dp_worker *wa_, struct dp_worker *wb_, struct rte_mbuf *m,
 int
 main(void)
 {
-	char *ea[] = { "dp_path", "--no-huge", "--no-pci", "-m", "256",
-	    "--vdev=crypto_openssl0", "--log-level=1", NULL };
+	char *ea[] = { "dp_path", "--no-pci", "-l", "0-1",
+	    "--vdev", (getenv("R2DP_CRYPTO_DEV") ? getenv("R2DP_CRYPTO_DEV")
+	        : "crypto_aesni_mb0"), "--log-level=1", NULL };
 	struct rte_cryptodev_config cc;
 	struct rte_cryptodev_qp_conf qc;
 	struct dpdk_priv *a, *b;
@@ -189,9 +190,10 @@ main(void)
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (rte_eal_init(7, ea) < 0 ||
-	    (cdev = rte_cryptodev_get_dev_id("crypto_openssl0")) < 0) {
+	    (cdev = rte_cryptodev_get_dev_id(getenv("R2DP_CRYPTO_DEV") ?
+	        getenv("R2DP_CRYPTO_DEV") : "crypto_aesni_mb0")) < 0) {
 		if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
-		puts("SKIP: EAL/crypto_openssl"); return 77;
+		puts("SKIP: EAL/crypto"); return 77;
 	}
 	memset(&cc, 0, sizeof(cc)); cc.socket_id = SOCKET_ID_ANY; cc.nb_queue_pairs = 1;
 	memset(&qc, 0, sizeof(qc)); qc.nb_descriptors = 256;

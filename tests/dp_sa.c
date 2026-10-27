@@ -33,7 +33,8 @@ mk_priv(void)
 	if (!d)
 		return NULL;
 	memset(d, 0, sizeof(*d));
-	if ((id = rte_cryptodev_get_dev_id("crypto_openssl0")) < 0)
+	if ((id = rte_cryptodev_get_dev_id(getenv("R2DP_CRYPTO_DEV") ?
+	    getenv("R2DP_CRYPTO_DEV") : "crypto_aesni_mb0")) < 0)
 		return NULL;
 	d->cdev_id = (uint8_t)id;
 	memset(&cc, 0, sizeof(cc)); cc.socket_id = SOCKET_ID_ANY; cc.nb_queue_pairs = 1;
@@ -466,8 +467,9 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	char *ea[] = { "dp_sa", "--no-huge", "--no-pci", "-m", "256",
-	    "--vdev=crypto_openssl0", "--log-level=1", "-l", "0-1", NULL };
+	char *ea[] = { "dp_sa", "--no-pci", "-l", "0-1",
+	    "--vdev", (getenv("R2DP_CRYPTO_DEV") ? getenv("R2DP_CRYPTO_DEV")
+	        : "crypto_aesni_mb0"), "--log-level=1", NULL };
 	struct dpdk_priv *d;
 	struct r2dp_sa r;
 	struct r2dp_sp sp;
@@ -479,9 +481,9 @@ main(void)
 	const union rte_ipsec_sad_key *kp[1] = { &k };
 	void *val[1];
 
-	if (rte_eal_init(9, ea) < 0 || (d = mk_priv()) == NULL) {
+	if (rte_eal_init(7, ea) < 0 || (d = mk_priv()) == NULL) {
 		if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
-		puts("SKIP: EAL/crypto_openssl"); return 77;
+		puts("SKIP: EAL/crypto"); return 77;
 	}
 
 	/* --- 1. C1: fresh inbound install must not write before sa_tab --- */
