@@ -68,6 +68,14 @@ sa_find(struct fwd_ctl *c, const struct r2dp_sa *k)
 	return NULL;
 }
 
+/* Data-plane hooks return -errno; the wire carries a positive errno
+ * (libr2dp maps anything else to EPROTO, hiding the real reason). */
+static int
+dp_errno(int e)
+{
+	return e < 0 ? -e : e;
+}
+
 static int
 sa_apply_dp(struct fwd_ctl *c, int add, const struct r2dp_sa *sa,
     const void *blob, size_t blen)
@@ -386,7 +394,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 				 * free the slot. */
 				if (!e->larval)
 					e->used = 0;
-				rc = dperr;
+				rc = dp_errno(dperr);
 				goto out;
 			}
 		}
@@ -427,7 +435,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 				/* e->sa was not touched: the ctl entry still reflects the
 				 * last-known-good SA, consistent with the dataplane which
 				 * either kept the old entry or rolled back its del-then-add. */
-				rc = dperr;
+				rc = dp_errno(dperr);
 				goto out;
 			}
 		}
@@ -448,7 +456,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 			int dperr = sa_apply_dp(C, 0, rq, NULL, 0);
 			if (dperr) {
 				/* dataplane still owns the SA; keep the ctl entry live */
-				rc = dperr;
+				rc = dp_errno(dperr);
 				goto out;
 			}
 		}
@@ -571,7 +579,7 @@ do_sp(int fd, const struct r2dp_msg *m)
 				 * keeps the previous policy (the dataplane still holds it);
 				 * a new add leaves the slot free. */
 				*e = prev;
-				reply_sp(fd, m, derr, rq, 0);
+				reply_sp(fd, m, dp_errno(derr), rq, 0);
 				return;
 			}
 		}
@@ -586,7 +594,7 @@ do_sp(int fd, const struct r2dp_msg *m)
 		if (C->dp.ops && C->dp.ops->sp_del) {
 			int derr = C->dp.ops->sp_del(&C->dp, &out);
 			if (derr) {
-				reply_sp(fd, m, derr, &out, 0);
+				reply_sp(fd, m, dp_errno(derr), &out, 0);
 				return;   /* keep the ctl entry: dataplane still holds it */
 			}
 		}

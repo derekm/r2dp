@@ -206,8 +206,11 @@ request(int fd, uint16_t type, uint32_t flags, const void *body, size_t blen,
 		r = r2dp_recv(fd, &m);
 		if (r < 0)
 			return r;
-		if (m.h.seq == seq && m.h.type == type)
-			return -(int)m.h.status;
+		if (m.h.seq == seq && m.h.type == type) {
+			/* errno-style; tolerate a forwarder that sent -errno */
+			int st = (int)m.h.status;
+			return st < 0 ? st : -st;
+		}
 	}
 }
 
