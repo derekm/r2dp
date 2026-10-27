@@ -61,8 +61,6 @@
 #define MEMPOOL_CACHE 256
 #define MEMPOOL_SIZE  16384
 #define MAX_SA        FWD_MAXSA
-#define NB_RX_QUEUE   1
-#define NB_TX_QUEUE   1
 #define BURST_SZ      128
 #define TAP_IF_DEFAULT "r2dp-tap"
 
@@ -152,8 +150,8 @@ static const char *const dp_drop_name[DR_NUM] = {
 	"crypto_fail", "replay", "ipsec_reject", "crypto_enq", "nomem", "no_nexthop",
 	"clear_outer", "esp_on_inner", "tx_full",
 };
-#define DROP(d, r, n) do { uint64_t n_ = (n); (d)->n_drop += n_; \
-	(d)->n_dropr[(r)] += n_; } while (0)
+#define DROP(w, r, n) do { uint64_t n_ = (n); (w)->n_drop += n_; \
+	(w)->n_dropr[(r)] += n_; } while (0)
 
 #define PEER_HSZ 4096     /* power of two, > 2 * (2 * MAX_SA) */
 
@@ -222,26 +220,36 @@ struct dpdk_priv {
 	uint8_t             cdev_id;
 	const char          *cdev_name_sel; /* PMD actually selected (diagnostics) */
 	int                 have_cdev;
+	/* N workers (M3): one run-to-completion lcore each, own RX/TX queue and
+	 * own crypto queue pair and own counters.  SAD/SPD/sa_tab/sp_tab/spd are
+	 * SHARED read-mostly across workers (QSBR-protected handoff from ctl).
+	 * nb workers / queues set up in fwd_dp_dpdk_probe. */
+	uint16_t            nworkers;
+	struct dp_worker    *w;        /* array [nworkers] */
 	rte_spinlock_t      lock;
 	struct rte_rcu_qsbr *rcu;   /* H5: QSBR for the ctl<->worker SA/SP handoff */
-	unsigned            rcu_tid; /* worker thread id registered with the QSBR */
 	struct dp_sa        sa_tab[MAX_SA];
 	struct dp_sp_ent    sp_tab[MAX_SA];
 	struct dp_spd      *spd;      /* published policy snapshot (see above) */
 	uint64_t            n_spd_fail; /* snapshot rebuilds that failed (ENOMEM) */
 	int                 verbose;
 	uint64_t            sa_gen;       /* last dp_sa.gen handed out */
-	/* Egress ESP L2: per-peer next hop learned from IKE/ESP sent by a
-	 * configured tunnel peer (dp_nh.c), and our own outer-port MAC.
-	 * Worker-thread only. */
-	struct r2dp_nh_tab  nh;
-	uint8_t             our_mac[6];      /* outer (peer) tap MAC */
-	uint8_t             our_inner_mac[6]; /* inner (plaintext host) tap MAC */
-
 	char                tap_if[IFNAMSIZ];
 	volatile int        running;
-	unsigned            worker_lcore;
-	/* per-queue counters for the worker (single rx/tx queue) */
+};
+
+/* Per-worker state (M3).  Own copy of everything the run-to-completion loop
+ * touches so workers never contend on a shared counter or a shared next-hop
+ * table (which is peer-keyed and may be relearned mid-flight by a different
+ * lcore's MAC learning). */
+struct dp_worker {
+	struct dpdk_priv *d;       /* shared priv (SAD/SPD/pools) */
+	unsigned            lcore;
+	uint16_t            qid;        /* rx/tx queue on both ports */
+	uint16_t            cqp;        /* cryptodev queue pair */
+	struct r2dp_nh_tab  nh;         /* per-worker next-hop table */
+	uint8_t             our_mac[6];      /* outer (peer) tap MAC */
+	uint8_t             our_inner_mac[6]; /* inner (plaintext host) tap MAC */
 	uint64_t            n_rx, n_tx, n_esp, n_ike, n_drop;
 	uint64_t            n_dropr[DR_NUM]; /* n_drop split by reason */
 };
@@ -661,7 +669,7 @@ static struct fwd_dp_ops dpdk_ops;
  * interface; ESP is later processed, non-ESP IKE/ARP rides the exception
  * path -- both re-emit on the same port so the kernel sees them). */
 static int
-port_init(struct dpdk_priv *d, uint16_t port)
+port_init(struct dpdk_priv *d, uint16_t port, uint16_t nq)
 {
 	struct rte_eth_conf conf;
 	struct rte_eth_dev_info dev_info;
@@ -676,7 +684,8 @@ port_init(struct dpdk_priv *d, uint16_t port)
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
-	uint16_t nrxq = NB_RX_QUEUE, ntxq = NB_TX_QUEUE;
+	/* M3: one RX/TX queue per worker (worker i polls queue i). */
+	uint16_t nrxq = nq, ntxq = nq;
 	if (rte_eth_dev_configure(port, nrxq, ntxq, &conf) < 0)
 		return -rte_errno;
 	for (uint16_t q = 0; q < nrxq; q++)
@@ -746,19 +755,20 @@ replay_accept(struct dp_sa *ds, uint32_t lo)
  * a forged ICV, any error) never reaches rte_ipsec_pkt_process, which does
  * not inspect op status (fail closed). */
 static uint16_t
-crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
+crypto_run(struct dp_worker *w, struct rte_ipsec_session *ss,
     struct rte_mbuf *mb[], uint16_t n, struct rte_mbuf *ok[])
 {
+	struct dpdk_priv *d = w->d;
 	struct rte_crypto_op *cop[BURST_SZ];
 	uint16_t k, enq, dq = 0, ng = 0, proc;
-	unsigned spins = 0;
+	unsigned rounds = 0;
 	int rp = !(rte_ipsec_sa_type(ss->sa) & RTE_IPSEC_SATP_DIR_MASK);  /* inbound */
 	struct dp_sa *ds;
 
 	if (rte_crypto_op_bulk_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 	    cop, n) == 0) {
 		for (uint16_t i = 0; i < n; i++) {
-			DROP(d, DR_NOMEM, 1);
+			DROP(w, DR_NOMEM, 1);
 			rte_pktmbuf_free(mb[i]);
 		}
 		return 0;
@@ -768,23 +778,29 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	/* prepare moves the mbufs it rejected to the tail */
 	k = rte_ipsec_pkt_crypto_prepare(ss, mb, cop, n);
 	for (uint16_t i = k; i < n; i++) {
-		DROP(d, DR_IPSEC_REJECT, 1);
+		DROP(w, DR_IPSEC_REJECT, 1);
 		rte_pktmbuf_free(mb[i]);
 	}
-	enq = k ? rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, k) : 0;
+	enq = k ? rte_cryptodev_enqueue_burst(d->cdev_id, w->cqp, cop, k) : 0;
 	for (uint16_t i = enq; i < k; i++) {
-		DROP(d, DR_CRYPTO_ENQ, 1);
+		DROP(w, DR_CRYPTO_ENQ, 1);
 		rte_pktmbuf_free(mb[i]);
 	}
 	if (enq < n)
 		rte_mempool_put_bulk(d->cop_mp, (void **)&cop[enq], n - enq);
-	/* own every op before touching any mbuf again (async PMDs) */
-	while (dq < enq) {
-		uint16_t got = rte_cryptodev_dequeue_burst(d->cdev_id, 0,
+	/* M3 (async crypto): do NOT busy-spin here waiting for the device --
+	 * that synchronous spin pegged one core at 99.5% while 11 sat idle.
+	 * A CPU-crypto PMD (aesni_mb / openssl) completes enqueued ops
+	 * synchronously in this same lcore, so a short NON-BLOCKING dequeue
+	 * pass reaps them all (usually on the first call).  Keep it bounded:
+	 * anything still outstanding after the bound was not completed and is
+	 * abandoned (counted DR_CRYPTO_ENQ below) -- never half-processed, so
+	 * a torn mbuf is never forwarded and no op is double-reaped. */
+	while (dq < enq && rounds < 4) {
+		uint16_t got = rte_cryptodev_dequeue_burst(d->cdev_id, w->cqp,
 		    &cop[dq], enq - dq);
 		dq += got;
-		if (!got && ++spins > (1u << 24))
-			break;           /* stuck device: leave its ops */
+		rounds++;
 	}
 	ds = rp ? sa_of_sess(d, ss) : NULL;
 	for (uint16_t i = 0; i < dq; i++) {
@@ -795,35 +811,36 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 				const struct rte_esp_hdr *eh = rte_pktmbuf_mtod_offset(
 				    m, const struct rte_esp_hdr *, m->l2_len + m->l3_len);
 				if (!replay_accept(ds, rte_be_to_cpu_32(eh->seq))) {
-					DROP(d, DR_REPLAY, 1);
+					DROP(w, DR_REPLAY, 1);
 					rte_pktmbuf_free(m);
 					continue;
 				}
 			}
 			ok[ng++] = m;
 		} else {
-			DROP(d, DR_CRYPTO_FAIL, 1);
+			DROP(w, DR_CRYPTO_FAIL, 1);
 			rte_pktmbuf_free(m);
 		}
 	}
 	if (dq)
 		rte_mempool_put_bulk(d->cop_mp, (void **)cop, dq);
-	DROP(d, DR_CRYPTO_ENQ, enq - dq);       /* abandoned in a stuck device */
+	DROP(w, DR_CRYPTO_ENQ, enq - dq);       /* abandoned in a stuck device */
 	if (!ng)
 		return 0;
 	/* process moves the mbufs it rejected (e.g. replay) to the tail */
 	proc = rte_ipsec_pkt_process(ss, ok, ng);
 	for (uint16_t i = proc; i < ng; i++) {
-		DROP(d, DR_IPSEC_REJECT, 1);
+		DROP(w, DR_IPSEC_REJECT, 1);
 		rte_pktmbuf_free(ok[i]);
 	}
 	return proc;
 }
 
 static uint16_t
-esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
+esp_inbound(struct dp_worker *w, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout)
 {
+	struct dpdk_priv *d = w->d;
 	union rte_ipsec_sad_key kkey[BURST_SZ];
 	const union rte_ipsec_sad_key *keys[BURST_SZ];
 	struct rte_mbuf *pm[BURST_SZ];
@@ -949,7 +966,7 @@ bad:
 		/* malformed/undersized frame: drop it and move on so the rest of
 		 * the burst is still processed (a `break` here would leak every
 		 * remaining mbuf -- a remote pool-exhaustion DoS). */
-		DROP(d, DR_MALFORMED, 1);
+		DROP(w, DR_MALFORMED, 1);
 		rte_pktmbuf_free(bufs[i]);
 	}
 	if (nk == 0) {
@@ -966,7 +983,7 @@ bad:
 
 	if (nlook == 0) {
 		/* no SA matched -- drop the whole burst */
-		DROP(d, DR_NO_SA_IN, nk);
+		DROP(w, DR_NO_SA_IN, nk);
 		for (uint32_t i = 0; i < nk; i++)
 			rte_pktmbuf_free(pm[i]);
 		if (nout) *nout = 0;
@@ -982,14 +999,14 @@ bad:
 		uint16_t ng;
 
 		if (ss == NULL) {
-			DROP(d, DR_NO_SA_IN, 1);
+			DROP(w, DR_NO_SA_IN, 1);
 			rte_pktmbuf_free(pm[i]);   /* no SA: drop */
 			i++;
 			continue;
 		}
 		while (j < nk && sas[j] == ss)
 			j++;
-		ng = crypto_run(d, ss, &pm[i], (uint16_t)(j - i), ok);
+		ng = crypto_run(w, ss, &pm[i], (uint16_t)(j - i), ok);
 		for (uint16_t k = 0; k < ng; k++) {
 			/* D8: RFC 4301 s5.2 IN selector check + trim to inner IP */
 			if (out && no < BURST_SZ && in_inner_ok(d, ss, ok[k])) {
@@ -998,7 +1015,7 @@ bad:
 			} else {
 				if (d->verbose)
 					fprintf(stderr, "r2dp-fwd: inner SEL reject\n");
-				DROP(d, DR_INNER_SEL, 1);
+				DROP(w, DR_INNER_SEL, 1);
 				rte_pktmbuf_free(ok[k]);
 			}
 		}
@@ -1584,9 +1601,10 @@ sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip, size_t avail,
  * the resulting ESP datagram (outer IP + ESP, L2 NOT yet re-added) into `out`.
  * Non-protected packets are left alone (returned as unchanged bypass). */
 static void
-esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
+esp_outbound(struct dp_worker *w, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout, uint16_t *nbypass)
 {
+	struct dpdk_priv *d = w->d;
 	uint16_t no = 0, nb = 0, nm = 0;
 	struct rte_mbuf *pm[BURST_SZ];
 	struct dp_sa *pds[BURST_SZ];
@@ -1657,7 +1675,7 @@ drop:
 		/* Single drop path: never forward cleartext after a policy matched,
 		 * and never leak the mbuf (H4).  Count and mark the slot NULL so
 		 * worker_inner does not forward or free it again. */
-		DROP(d, why, 1);
+		DROP(w, why, 1);
 		rte_pktmbuf_free(bufs[i]);
 		bufs[i] = NULL;
 	}
@@ -1670,13 +1688,13 @@ drop:
 
 		while (j < nm && pds[j] == ds)
 			j++;
-		ng = crypto_run(d, &ds->sess, &pm[i], j - i, ok);
+		ng = crypto_run(w, &ds->sess, &pm[i], j - i, ok);
 		for (uint16_t k = 0; k < ng; k++) {
 			struct rte_mbuf *m = ok[k];
 			uint16_t proc = 1;
 
 			if (!out || no >= BURST_SZ) {
-				DROP(d, DR_NOMEM, 1);
+				DROP(w, DR_NOMEM, 1);
 				rte_pktmbuf_free(m);
 				continue;
 			}
@@ -1731,7 +1749,7 @@ drop:
 				}
 			}
 			(void)proc;
-			d->n_esp++;
+			w->n_esp++;
 			out[no++] = m;
 		}
 		i = j;
@@ -1770,15 +1788,16 @@ is_tunnel_peer(struct dpdk_priv *d, uint32_t ip)
 }
 
 static void
-worker_outer(struct dpdk_priv *d, int port)
+worker_outer(struct dp_worker *w, int port)
 {
+	struct dpdk_priv *d = w->d;
 	struct rte_mbuf *bufs[BURST_SZ];
 	struct rte_mbuf *esp[BURST_SZ], *exc[BURST_SZ];
-	uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
+	uint16_t nr = rte_eth_rx_burst(port, w->qid, bufs, BURST_SZ);
 
 	if (nr == 0)
 		return;
-	d->n_rx += nr;
+	w->n_rx += nr;
 	if (d->verbose) {
 		/* Dump the first raw frame as the tap delivered it, BEFORE any L2
 		 * strip, so we can compare it byte-for-byte against what was
@@ -1807,7 +1826,7 @@ worker_outer(struct dpdk_priv *d, int port)
 			if (r2dp_nh_frame_ike_esp(rte_pktmbuf_mtod(bufs[i],
 			    const uint8_t *), rte_pktmbuf_data_len(bufs[i]),
 			    &sip, &smac) && is_tunnel_peer(d, sip)) {
-				int lr = r2dp_nh_learn(&d->nh, sip, smac,
+				int lr = r2dp_nh_learn(&w->nh, sip, smac,
 				    rte_get_tsc_cycles());
 				if (lr > 0 && d->verbose)
 					fprintf(stderr, "r2dp-fwd: %s next hop for "
@@ -1818,7 +1837,7 @@ worker_outer(struct dpdk_priv *d, int port)
 			}
 		}
 		if (is_esp(bufs[i]) || is_nat_esp(d, bufs[i])) {
-			d->n_esp++;
+			w->n_esp++;
 			esp[nesp++] = bufs[i];
 		} else {
 			exc[nex++] = bufs[i];
@@ -1828,7 +1847,7 @@ worker_outer(struct dpdk_priv *d, int port)
 	if (nesp) {
 		struct rte_mbuf *dec[BURST_SZ];
 		uint16_t ndec = 0;
-		esp_inbound(d, esp, nesp, dec, &ndec);
+		esp_inbound(w, esp, nesp, dec, &ndec);
 		if (ndec) {
 			/* rte_ipsec_pkt_process leaves the decrypted INNER packet as
 			 * bare IP (l2_len=0, no Ethernet header).  net_tap transmits
@@ -1843,7 +1862,7 @@ worker_outer(struct dpdk_priv *d, int port)
 				char *h = rte_pktmbuf_prepend(dec[i],
 				    RTE_ETHER_HDR_LEN);
 				if (h == NULL) {   /* no headroom: drop */
-					DROP(d, DR_NOMEM, 1);
+					DROP(w, DR_NOMEM, 1);
 					rte_pktmbuf_free(dec[i]);
 					dec[i] = NULL;
 					continue;
@@ -1860,10 +1879,10 @@ worker_outer(struct dpdk_priv *d, int port)
 				{
 					memset(eh->dst_addr.addr_bytes, 0,
 					    RTE_ETHER_ADDR_LEN);
-					memcpy(eh->dst_addr.addr_bytes, d->our_inner_mac, 6);
+					memcpy(eh->dst_addr.addr_bytes, w->our_inner_mac, 6);
 					memset(eh->src_addr.addr_bytes, 0,
 					    RTE_ETHER_ADDR_LEN);
-					memcpy(eh->src_addr.addr_bytes, d->our_inner_mac, 6);
+					memcpy(eh->src_addr.addr_bytes, w->our_inner_mac, 6);
 				}
 				eh->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 				dec[i]->l2_len = RTE_ETHER_HDR_LEN;
@@ -1889,9 +1908,9 @@ worker_outer(struct dpdk_priv *d, int port)
 			for (uint16_t i = 0; i < ndec; i++)
 				if (dec[i])
 					txq[ntx++] = dec[i];
-			uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
-			d->n_tx += sent;
-			DROP(d, DR_TX_FULL, ntx - sent);
+			uint16_t sent = rte_eth_tx_burst(to, w->qid, txq, ntx);
+			w->n_tx += sent;
+			DROP(w, DR_TX_FULL, ntx - sent);
 			if (d->verbose)
 				fprintf(stderr, "r2dp-fwd: esp-tx ndec=%u ntx=%u sent=%u\n",
 				    ndec, ntx, sent);
@@ -1911,14 +1930,14 @@ worker_outer(struct dpdk_priv *d, int port)
 			if (is_ike_arp(exc[i]))
 				fwd[nf++] = exc[i];
 			else
-				DROP(d, DR_CLEAR_OUTER, 1);
+				DROP(w, DR_CLEAR_OUTER, 1);
 		}
 		if (nf) {
 			if (is_udp(fwd[0]))
-				d->n_ike += nf;   /* IKE */
-			uint16_t sent = rte_eth_tx_burst(to, 0, fwd, nf);
-			d->n_tx += sent;
-			DROP(d, DR_TX_FULL, nf - sent);
+				w->n_ike += nf;   /* IKE */
+			uint16_t sent = rte_eth_tx_burst(to, w->qid, fwd, nf);
+			w->n_tx += sent;
+			DROP(w, DR_TX_FULL, nf - sent);
 			for (uint16_t i = sent; i < nf; i++)
 				rte_pktmbuf_free(fwd[i]);
 		}
@@ -1934,14 +1953,15 @@ worker_outer(struct dpdk_priv *d, int port)
  * tap as ESP; non-protected (IKE/ARP, or no OUT policy -> bypass) crosses to
  * the outer (peer) tap on the exception path.  ESP arriving here is dropped. */
 static void
-worker_inner(struct dpdk_priv *d, int port)
+worker_inner(struct dp_worker *w, int port)
 {
+	struct dpdk_priv *d = w->d;
 	struct rte_mbuf *bufs[BURST_SZ];
-	uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
+	uint16_t nr = rte_eth_rx_burst(port, w->qid, bufs, BURST_SZ);
 
 	if (nr == 0)
 		return;
-	d->n_rx += nr;
+	w->n_rx += nr;
 
 	/* 1. classify: ESP here is anomalous -> drop; non-ESP may be protected
 	 *    (encrypt) or unprotected (IKE/ARP -> exception path). */
@@ -1949,7 +1969,7 @@ worker_inner(struct dpdk_priv *d, int port)
 	uint16_t nnon = 0;
 	for (uint16_t i = 0; i < nr; i++) {
 		if (is_esp(bufs[i])) {
-			DROP(d, DR_ESP_ON_INNER, 1);
+			DROP(w, DR_ESP_ON_INNER, 1);
 			rte_pktmbuf_free(bufs[i]);
 		}
 		else
@@ -1963,7 +1983,7 @@ worker_inner(struct dpdk_priv *d, int port)
 	 *    leaves the unmatched ones (nby) untouched in nonesp[]. */
 	struct rte_mbuf *esp_out[BURST_SZ];
 	uint16_t nout = 0, nby = 0;
-	esp_outbound(d, nonesp, nnon, esp_out, &nout, &nby);
+	esp_outbound(w, nonesp, nnon, esp_out, &nout, &nby);
 
 	/* 3. prepend L2 to the ESP datagrams and tx to the outer (peer) tap */
 	if (nout) {
@@ -1973,7 +1993,7 @@ worker_inner(struct dpdk_priv *d, int port)
 		for (uint16_t i = 0; i < nout; i++) {
 			struct rte_ether_hdr *eh;
 			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
-			if (!h) { DROP(d, DR_NOMEM, 1); rte_pktmbuf_free(esp_out[i]); continue; }
+			if (!h) { DROP(w, DR_NOMEM, 1); rte_pktmbuf_free(esp_out[i]); continue; }
 			eh = rte_pktmbuf_mtod(esp_out[i], struct rte_ether_hdr *);
 			/* Egress ESP is unicast to the tunnel peer's learned
 			 * next hop (keyed by the outer destination IP).  With
@@ -1985,14 +2005,14 @@ worker_inner(struct dpdk_priv *d, int port)
 				uint32_t odst;
 				const uint8_t *nmac;
 				memcpy(&odst, &oip->dst_addr, 4);
-				nmac = r2dp_nh_lookup(&d->nh, odst);
+				nmac = r2dp_nh_lookup(&w->nh, odst);
 				if (nmac == NULL) {
-					DROP(d, DR_NO_NEXTHOP, 1);
+					DROP(w, DR_NO_NEXTHOP, 1);
 					rte_pktmbuf_free(esp_out[i]);
 					continue;
 				}
 				memcpy(eh->dst_addr.addr_bytes, nmac, 6);
-				memcpy(eh->src_addr.addr_bytes, d->our_mac, 6);
+				memcpy(eh->src_addr.addr_bytes, w->our_mac, 6);
 			}
 			eh->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 			esp_out[i]->l2_len = RTE_ETHER_HDR_LEN;
@@ -2007,9 +2027,9 @@ worker_inner(struct dpdk_priv *d, int port)
 			}
 			txq[ntx++] = esp_out[i];
 		}
-		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
-		d->n_tx += sent;
-		DROP(d, DR_TX_FULL, ntx - sent);
+		uint16_t sent = rte_eth_tx_burst(to, w->qid, txq, ntx);
+		w->n_tx += sent;
+		DROP(w, DR_TX_FULL, ntx - sent);
 		if (d->verbose)
 			fprintf(stderr, "r2dp-fwd: egress-tx nout=%u ntx=%u sent=%u\n",
 			    nout, ntx, sent);
@@ -2030,10 +2050,10 @@ worker_inner(struct dpdk_priv *d, int port)
 			if (nonesp[i] != NULL)
 				txq[ntx++] = nonesp[i];
 		if (ntx && is_udp(txq[0]))
-			d->n_ike += ntx;
-		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
-		d->n_tx += sent;
-		DROP(d, DR_TX_FULL, ntx - sent);
+			w->n_ike += ntx;
+		uint16_t sent = rte_eth_tx_burst(to, w->qid, txq, ntx);
+		w->n_tx += sent;
+		DROP(w, DR_TX_FULL, ntx - sent);
 		for (uint16_t i = sent; i < ntx; i++)
 			rte_pktmbuf_free(txq[i]);
 	}
@@ -2047,15 +2067,26 @@ __attribute__((weak)) volatile sig_atomic_t fwd_stats_req;
 static void
 dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 {
+	/* M3: aggregate the per-worker counters into one total (the SIGUSR1
+	 * stats request may be answered by any worker). */
+	uint64_t rx = 0, tx = 0, esp = 0, ike = 0, drop = 0;
+	uint64_t dr[DR_NUM];
+	memset(dr, 0, sizeof(dr));
+	for (int i = 0; d->w && i < d->nworkers; i++) {
+		struct dp_worker *w = &d->w[i];
+		rx += w->n_rx; tx += w->n_tx; esp += w->n_esp;
+		ike += w->n_ike; drop += w->n_drop;
+		for (int r = 0; r < DR_NUM; r++)
+			dr[r] += w->n_dropr[r];
+	}
 	fprintf(f, "r2dp-fwd: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu "
-	    "spd_fail=%llu\n", (unsigned long long)d->n_rx,
-	    (unsigned long long)d->n_tx, (unsigned long long)d->n_esp,
-	    (unsigned long long)d->n_ike, (unsigned long long)d->n_drop,
-	    (unsigned long long)d->n_spd_fail);
+	    "spd_fail=%llu\n", (unsigned long long)rx, (unsigned long long)tx,
+	    (unsigned long long)esp, (unsigned long long)ike,
+	    (unsigned long long)drop, (unsigned long long)d->n_spd_fail);
 	fprintf(f, "r2dp-fwd: drops");
 	for (int r = 0; r < DR_NUM; r++)
 		fprintf(f, " %s=%llu", dp_drop_name[r],
-		    (unsigned long long)d->n_dropr[r]);
+		    (unsigned long long)dr[r]);
 	fprintf(f, "\n");
 	fflush(f);
 }
@@ -2063,36 +2094,37 @@ dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 static int
 worker_main(void *arg)
 {
-	struct dpdk_priv *d = arg;
+	struct dp_worker *w = arg;
+	struct dpdk_priv *d = w->d;
 	uint16_t port = d->port_id;
 	uint64_t last_t = 0;
 
-	fprintf(stderr, "r2dp-fwd: worker on lcore %u, outer=%u inner=%d\n",
-	    rte_lcore_id(), port, d->inner_port);
+	fprintf(stderr, "r2dp-fwd: worker on lcore %u qid %u cqp %u, "
+	    "outer=%u inner=%d\n", w->lcore, w->qid, w->cqp, port, d->inner_port);
 	/* H5: register this worker as a QSBR reader so ctl can synchronize
 	 * before freeing SA/SP memory.  tid = its lcore id (< RTE_MAX_LCORE). */
 	{
 		struct rte_ether_addr ea;
 		if (rte_eth_macaddr_get(port, &ea) == 0)
-			memcpy(d->our_mac, ea.addr_bytes, 6);
+			memcpy(w->our_mac, ea.addr_bytes, 6);
 		if (d->inner_port >= 0 &&
 		    rte_eth_macaddr_get(d->inner_port, &ea) == 0)
-			memcpy(d->our_inner_mac, ea.addr_bytes, 6);
+			memcpy(w->our_inner_mac, ea.addr_bytes, 6);
 	}
 	if (d->rcu) {
-		rte_rcu_qsbr_thread_register(d->rcu, d->worker_lcore);
-		rte_rcu_qsbr_thread_online(d->rcu, d->worker_lcore);
+		rte_rcu_qsbr_thread_register(d->rcu, w->lcore);
+		rte_rcu_qsbr_thread_online(d->rcu, w->lcore);
 	}
 	while (d->running) {
 		uint64_t now = rte_rdtsc();
 
-		worker_outer(d, port);
+		worker_outer(w, port);
 		if (d->inner_port >= 0)
-			worker_inner(d, d->inner_port);
+			worker_inner(w, d->inner_port);
 
 		/* report quiescent: ctl may now free anything read this iteration */
 		if (d->rcu)
-			rte_rcu_qsbr_quiescent(d->rcu, d->worker_lcore);
+			rte_rcu_qsbr_quiescent(d->rcu, w->lcore);
 
 		if (fwd_stats_req) {
 			fwd_stats_req = 0;
@@ -2102,17 +2134,18 @@ worker_main(void *arg)
 			last_t = now;
 		else if (now - last_t >= rte_get_timer_hz()) {  /* ~1s */
 			fprintf(stderr,
-			    "r2dp-fwd: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu\n",
-			    (unsigned long long)d->n_rx,
-			    (unsigned long long)d->n_tx,
-			    (unsigned long long)d->n_esp,
-			    (unsigned long long)d->n_ike,
-			    (unsigned long long)d->n_drop);
+			    "r2dp-fwd[%u]: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu\n",
+			    w->lcore,
+			    (unsigned long long)w->n_rx,
+			    (unsigned long long)w->n_tx,
+			    (unsigned long long)w->n_esp,
+			    (unsigned long long)w->n_ike,
+			    (unsigned long long)w->n_drop);
 			last_t = now;
 		}
 	}
 	if (d->rcu)
-		rte_rcu_qsbr_thread_offline(d->rcu, d->worker_lcore);
+		rte_rcu_qsbr_thread_offline(d->rcu, w->lcore);
 	return 0;
 }
 
@@ -2121,40 +2154,73 @@ dpd_start(struct fwd_dp *dp)
 {
 	struct dpdk_priv *d = dp->priv;
 	unsigned lcore;
+	int nw, i;
 
 	if (d->port_id < 0)
 		return -ENODEV;
-	/* pick a slave lcore, skipping the main (calling) lcore */
-	lcore = rte_get_next_lcore(-1, 1, 1);
-	if (lcore >= RTE_MAX_LCORE) {
-		fprintf(stderr, "r2dp-fwd: no spare lcore for the worker "
-		    "(run with -l 0,<n>, e.g. -l 0-1)\n");
-		return -EAGAIN;
+	/* M3: one run-to-completion worker per slave lcore, each with its own
+	 * RX/TX queue on both tap ports and its own cryptodev queue pair.
+	 * -n clamps to RTE_MAX_LCORE-1 and to the lcores actually enabled. */
+	nw = d->nworkers;
+	if (nw < 1) nw = 1;
+	if (nw > (int)RTE_MAX_LCORE - 1) nw = (int)RTE_MAX_LCORE - 1;
+	{
+		unsigned av = 0;
+		for (unsigned x = rte_get_next_lcore(-1, 1, 1); x < RTE_MAX_LCORE;
+		     x = rte_get_next_lcore(x, 1, 1)) av++;
+		if (av == 0) {
+			fprintf(stderr, "r2dp-fwd: no spare lcore for a worker "
+			    "(run with -l 0,<n>, e.g. -l 0-1)\n");
+			return -EAGAIN;
+		}
+		if (nw > (int)av) nw = (int)av;
 	}
-	if (port_init(d, d->port_id) < 0)
+	d->nworkers = (uint16_t)nw;
+
+	d->w = calloc((size_t)nw, sizeof(*d->w));
+	if (!d->w)
+		return -ENOMEM;
+
+	lcore = rte_get_next_lcore(-1, 1, 1);
+	for (i = 0; i < nw; i++) {
+		if (lcore >= RTE_MAX_LCORE) {
+			fprintf(stderr, "r2dp-fwd: need %d slave lcores but fewer "
+			    "are enabled (run with -l 0,<n>)\n", nw);
+			free(d->w); d->w = NULL; d->nworkers = 0;
+			return -EAGAIN;
+		}
+		d->w[i].d = d;
+		d->w[i].lcore = lcore;
+		d->w[i].qid = (uint16_t)i;   /* its rx/tx queue on both ports */
+		d->w[i].cqp = (uint16_t)i;   /* its cryptodev queue pair */
+		/* w[i].nh is zeroed by calloc: no peer learned until it is */
+		lcore = rte_get_next_lcore(lcore, 1, 1);
+	}
+
+	if (port_init(d, d->port_id, (uint16_t)nw) < 0)
 		return -rte_errno;
 	/* inner (plaintext) tap is optional: single-tap mode (interop lab,
 	 * control-only) has only the outer port */
 	if (d->inner_port >= 0)
-		if (port_init(d, d->inner_port) < 0)
+		if (port_init(d, d->inner_port, (uint16_t)nw) < 0)
 			fprintf(stderr, "r2dp-fwd: inner tap init failed\n");
 	/* H5: QSBR so the ctl (main) thread can free SA/SP memory only after the
-	 * worker has passed a grace period -- the worker reads sa_tab/sp_tab and
-	 * holds session pointers across its crypto path with no lock, so a
-	 * synchronize here prevents a UAF when ctl deletes/rekeys under load.
+	 * workers have passed a grace period -- each worker reads sa_tab/sp_tab
+	 * and holds session pointers across its crypto path with no lock.
 	 * This DPDK has no rte_rcu_qsbr_alloc: size it, then rte_zmalloc. */
 	{
 		size_t rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
 		d->rcu = rte_zmalloc("r2dp-rcu", rsz, RTE_CACHE_LINE_SIZE);
 		if (!d->rcu) {
 			fprintf(stderr, "r2dp-fwd: rte_rcu_qsbr alloc failed\n");
+			free(d->w); d->w = NULL; d->nworkers = 0;
 			return -ENOMEM;
 		}
 		rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
 	}
 	d->running = 1;
-	d->worker_lcore = lcore;
-	rte_eal_remote_launch(worker_main, d, lcore);
+	for (i = 0; i < nw; i++)
+		rte_eal_remote_launch(worker_main, &d->w[i], d->w[i].lcore);
 	return 0;
 }
 
@@ -2164,13 +2230,18 @@ dpd_stop(struct fwd_dp *dp)
 	struct dpdk_priv *d = dp->priv;
 
 	d->running = 0;
-	if (d->worker_lcore < RTE_MAX_LCORE)
-		rte_eal_wait_lcore(d->worker_lcore);
+	for (int i = 0; d->w && i < d->nworkers; i++)
+		if (d->w[i].lcore < RTE_MAX_LCORE)
+			rte_eal_wait_lcore(d->w[i].lcore);
 	if (d->rcu) {
-		rte_rcu_qsbr_thread_unregister(d->rcu, d->worker_lcore);
+		for (int i = 0; d->w && i < d->nworkers; i++)
+			rte_rcu_qsbr_thread_unregister(d->rcu, d->w[i].lcore);
 		rte_free(d->rcu);
 		d->rcu = NULL;
 	}
+	free(d->w);
+	d->w = NULL;
+	d->nworkers = 0;
 	spd_teardown(d);
 }
 
@@ -2205,6 +2276,21 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	}
 	*argc -= ret;
 	*argv += ret;
+
+	/* M3: worker count (from ctl.dp.nworkers, set by -n), default 1,
+	 * clamped to the slave lcores actually enabled and to RTE_MAX_LCORE-1.
+	 * This sizes the NIC and crypto queue-pair counts below; dpd_start
+	 * re-derives the same clamp on the way to launching the workers. */
+	{
+		int nw = dp->nworkers;
+		if (nw < 1) nw = 1;
+		if (nw > (int)RTE_MAX_LCORE - 1) nw = (int)RTE_MAX_LCORE - 1;
+		unsigned av = 0;
+		for (unsigned x = rte_get_next_lcore(-1, 1, 1); x < RTE_MAX_LCORE;
+		     x = rte_get_next_lcore(x, 1, 1)) av++;
+		if (av && nw > (int)av) nw = (int)av;
+		d->nworkers = (uint16_t)nw;
+	}
 
 	d->pool = rte_pktmbuf_pool_create("r2dp_pool", MEMPOOL_SIZE, MEMPOOL_CACHE,
 	    0, RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
@@ -2249,7 +2335,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		struct rte_cryptodev_qp_conf qconf;
 		memset(&cconf, 0, sizeof(cconf));
 		cconf.socket_id = SOCKET_ID_ANY;
-		cconf.nb_queue_pairs = 1;
+		cconf.nb_queue_pairs = d->nworkers;   /* M3: one qp per worker */
 		cconf.ff_disable = 0;
 		if (rte_cryptodev_configure(d->cdev_id, &cconf) < 0) {
 			fprintf(stderr, "r2dp-fwd: cryptodev configure failed\n");
@@ -2257,10 +2343,15 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		} else {
 			memset(&qconf, 0, sizeof(qconf));
 			qconf.nb_descriptors = 2048;
-			if (rte_cryptodev_queue_pair_setup(d->cdev_id, 0, &qconf,
-			    SOCKET_ID_ANY) < 0)
-				fprintf(stderr, "r2dp-fwd: cryptodev qp setup failed\n");
-			else if (rte_cryptodev_start(d->cdev_id) < 0)
+			int qok = 1;
+			for (uint16_t q = 0; q < d->nworkers && qok; q++)
+				if (rte_cryptodev_queue_pair_setup(d->cdev_id, q,
+				    &qconf, SOCKET_ID_ANY) < 0) {
+					fprintf(stderr,
+					    "r2dp-fwd: cryptodev qp %u setup failed\n", q);
+					qok = 0;
+				}
+			if (qok && rte_cryptodev_start(d->cdev_id) < 0)
 				fprintf(stderr, "r2dp-fwd: cryptodev start failed\n");
 		}
 		if (d->have_cdev) {

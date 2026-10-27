@@ -58,6 +58,11 @@ struct fwd_dp {
 	void *priv;             /* backend private state */
 	uint32_t flags;
 
+	/* Number of run-to-completion worker lcores (DPDK dataplane, M3);
+	 * set via the -n option, 0/1 = single worker.  Ignored by other
+	 * backends. */
+	int nworkers;
+
 	/* Capability bitmaps the dataplane actually supports. */
 	uint32_t caps_bits_enc[8];
 	uint32_t caps_bits_integ[8];

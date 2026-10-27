@@ -65,7 +65,10 @@ main(int argc, char **argv)
 		} else if (strcmp(a, "--dp-cleanup") == 0) {
 			dp_cleanup = 1;
 		} else if (strcmp(a, "-n") == 0 && i + 1 < argc) {
-			i++;               /* processing lcores; probe claims it */
+			/* processing/running lcores: count of run-to-completion DPDK
+			 * workers (default 1).  Probe clamps it to what the EAL lcore
+			 * mask + the NIC/crypto queue-pair limits actually allow. */
+			ctl.dp.nworkers = atoi(argv[++i]);
 		} else {
 			eal_argv[eal_argc++] = argv[i];
 		}
