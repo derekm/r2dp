@@ -136,14 +136,16 @@ inner_frame(const char *src, const char *dst, uint8_t proto, uint16_t dport,
  * B (copied to `got`), 0 if dropped; *encrypted says whether A emitted ESP. */
 static int tamper_at = -1;   /* >= 0: flip this byte of the ESP datagram */
 
+static struct dp_worker wa, wb;   /* per-side data-path worker (queue/qp 0) */
+
 static int
-run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
+run_len(struct dp_worker *wa_, struct dp_worker *wb_, struct rte_mbuf *m,
     int *encrypted, uint8_t *got, uint16_t len)
 {
 	struct rte_mbuf *in[1] = { m }, *esp[1] = { NULL }, *dec[BURST_SZ];
 	uint16_t nout = 0, nb = 0, ndec = 0;
 
-	esp_outbound(a, in, 1, esp, &nout, &nb);
+	esp_outbound(wa_, in, 1, esp, &nout, &nb);
 	*encrypted = nout == 1;
 	if (nb && in[0])
 		rte_pktmbuf_free(in[0]);          /* bypass: caller would forward */
@@ -156,7 +158,7 @@ run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
 		if (tamper_at >= 0 && (uint32_t)tamper_at + 14 < rte_pktmbuf_data_len(esp[0]))
 			f[14 + tamper_at] ^= 0x01;
 	}
-	esp_inbound(b, esp, 1, dec, &ndec);
+	esp_inbound(wb_, esp, 1, dec, &ndec);
 	if (ndec != 1)
 		return 0;
 	memcpy(got, rte_pktmbuf_mtod(dec[0], uint8_t *),
@@ -167,10 +169,10 @@ run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
 }
 
 static int
-run(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
+run(struct dp_worker *wa_, struct dp_worker *wb_, struct rte_mbuf *m,
     int *encrypted, uint8_t *got)
 {
-	return run_len(a, b, m, encrypted, got, 64);
+	return run_len(wa_, wb_, m, encrypted, got, 64);
 }
 
 int
@@ -199,6 +201,8 @@ main(void)
 	mp = rte_pktmbuf_pool_create("dp_path_mb", 256, 0, 0,
 	    RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
 	a = mk_priv("A"); b = mk_priv("B");
+	memset(&wa, 0, sizeof(wa)); memset(&wb, 0, sizeof(wb));
+	wa.d = a; wb.d = b; wa.qid = 0; wb.qid = 0; wa.cqp = 0; wb.cqp = 0;
 	if (!mp || !a || !b) { puts("setup FAILED"); return 1; }
 
 	/* A: wide OUT PROTECT 10.0.0.0/16 -> 10.0.0.0/16 + EGRESS SA */
@@ -211,7 +215,7 @@ main(void)
 	/* PROTECT with no SA yet: dropped, never sent in clear */
 	{
 		struct rte_mbuf *m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, want);
-		CHECK(!run(a, b, m, &enc, got) && !enc, "PROTECT without SA -> drop");
+		CHECK(!run(&wa, &wb, m, &enc, got) && !enc, "PROTECT without SA -> drop");
 	}
 
 	mk_sa(&r, 0x5001); r.dir = R2DP_DIR_OUT;
@@ -221,7 +225,7 @@ main(void)
 
 	{
 		struct rte_mbuf *m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, want);
-		int ok = run(a, b, m, &enc, got);
+		int ok = run(&wa, &wb, m, &enc, got);
 		CHECK(enc, "A encrypts the matching flow");
 		CHECK(ok && memcmp(got, want, 64) == 0,
 		    "B decrypts it byte-identical (outbound -> inbound round trip)");
@@ -229,7 +233,7 @@ main(void)
 	{
 		/* matches A's wide OUT policy, but not B's IN selectors */
 		struct rte_mbuf *m = inner_frame("10.0.9.5", "10.0.2.5", 1, 0, want);
-		int ok = run(a, b, m, &enc, got);
+		int ok = run(&wa, &wb, m, &enc, got);
 		CHECK(enc && !ok, "inner packet outside B's IN selector dropped after decrypt");
 	}
 
@@ -240,10 +244,10 @@ main(void)
 		struct rte_mbuf *m;
 		tamper_at = 20 + 8 + 8 + 4;
 		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
-		CHECK(!run(a, b, m, &enc, g) && enc, "tampered ciphertext -> dropped (auth failure honoured)");
+		CHECK(!run(&wa, &wb, m, &enc, g) && enc, "tampered ciphertext -> dropped (auth failure honoured)");
 		tamper_at = 20 + 8 + 8 + 64 + 2 + 2 + 15;   /* inside the 16-B ICV */
 		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
-		CHECK(!run(a, b, m, &enc, g) && enc, "tampered ICV -> dropped");
+		CHECK(!run(&wa, &wb, m, &enc, g) && enc, "tampered ICV -> dropped");
 		tamper_at = -1;
 	}
 
@@ -255,7 +259,7 @@ main(void)
 		int allok = 1;
 		for (unsigned k = 0; k < RTE_DIM(lens); k++) {
 			struct rte_mbuf *m = inner_frame_len("10.0.1.5", "10.0.2.5", 1, 0, w, lens[k]);
-			int ok = m && run_len(a, b, m, &enc, g, lens[k]) && memcmp(g, w, lens[k]) == 0;
+			int ok = m && run_len(&wa, &wb, m, &enc, g, lens[k]) && memcmp(g, w, lens[k]) == 0;
 			if (!ok) { printf("     len %u failed\n", lens[k]); allok = 0; }
 		}
 		CHECK(allok, "inner lengths 255..1400 incl. 256/512/513 round-trip");
@@ -276,7 +280,7 @@ main(void)
 			in[k] = inner_frame(src, "10.0.2.5", 17, 1000 + k, w[k]);
 			nprot += k % 8 != 7;
 		}
-		esp_outbound(a, in, N, esp, &nout, &nb);
+		esp_outbound(&wa, in, N, esp, &nout, &nb);
 		CHECK(nout == nprot && nb == N - nprot, "burst: one batched encrypt, bypass left alone");
 		for (int k = 0; k < N; k++)
 			if (in[k]) rte_pktmbuf_free(in[k]);
@@ -285,7 +289,7 @@ main(void)
 			memset(f, 0, 14); f[12] = 0x08;
 			if (k == 5) f[14 + 40] ^= 1;
 		}
-		esp_inbound(b, esp, nout, dec, &ndec);
+		esp_inbound(&wb, esp, nout, dec, &ndec);
 		CHECK(ndec == nout - 1, "burst: forged packet dropped, the rest decrypt");
 		for (uint16_t k = 0, src = 0; k < ndec; k++, src++) {
 			while (src % 8 == 7 || src == 5) src++;   /* skip bypass + forged */
@@ -300,9 +304,9 @@ main(void)
 	    6, 23);
 	{
 		struct rte_mbuf *m = inner_frame("10.0.1.5", "10.0.2.5", 6, 23, want);
-		CHECK(!run(a, b, m, &enc, got) && !enc, "TCP/23 DISCARD honoured (port selector)");
+		CHECK(!run(&wa, &wb, m, &enc, got) && !enc, "TCP/23 DISCARD honoured (port selector)");
 		m = inner_frame("10.0.1.5", "10.0.2.5", 6, 22, want);
-		CHECK(run(a, b, m, &enc, got) && enc, "TCP/22 still protected end to end");
+		CHECK(run(&wa, &wb, m, &enc, got) && enc, "TCP/22 still protected end to end");
 	}
 
 	/* anti-replay: the same ESP datagram delivered twice is accepted once;
@@ -314,19 +318,19 @@ main(void)
 		uint64_t rej = b->n_dropr[DR_REPLAY];
 		in[0] = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
 		in[1] = inner_frame("10.0.1.6", "10.0.2.5", 1, 0, w);
-		esp_outbound(a, in, 2, esp, &nout, &nb);
+		esp_outbound(&wa, in, 2, esp, &nout, &nb);
 		for (int k = 0; k < 2; k++) {
 			uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(esp[k], 14);
 			memset(f, 0, 14); f[12] = 0x08;
 			dup[k] = rte_pktmbuf_copy(esp[k], mp, 0, UINT32_MAX);
 		}
-		esp_inbound(b, &esp[1], 1, dec, &n1);           /* seq N+1 */
+		esp_inbound(&wb, &esp[1], 1, dec, &n1);           /* seq N+1 */
 		for (uint16_t k = 0; k < n1; k++) rte_pktmbuf_free(dec[k]);
-		esp_inbound(b, &esp[0], 1, dec, &n2);           /* seq N, older */
+		esp_inbound(&wb, &esp[0], 1, dec, &n2);           /* seq N, older */
 		for (uint16_t k = 0; k < n2; k++) rte_pktmbuf_free(dec[k]);
-		esp_inbound(b, &dup[0], 1, dec, &n3);           /* replay N */
+		esp_inbound(&wb, &dup[0], 1, dec, &n3);           /* replay N */
 		for (uint16_t k = 0; k < n3; k++) rte_pktmbuf_free(dec[k]);
-		esp_inbound(b, &dup[1], 1, dec, &n4);           /* replay N+1 */
+		esp_inbound(&wb, &dup[1], 1, dec, &n4);           /* replay N+1 */
 		for (uint16_t k = 0; k < n4; k++) rte_pktmbuf_free(dec[k]);
 		printf("     replay: n1=%u n2=%u n3=%u n4=%u\n", n1, n2, n3, n4);
 		CHECK(nout == 2 && n1 == 1 && n2 == 1, "replay: in-window reordering accepted");
