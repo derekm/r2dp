@@ -42,7 +42,7 @@ scratch clone). Run the daemons against a forwarder with `R2DP_SOCK=<path>`
 
 ## Provenance / reconstruction
 
-This repo was stood up from Mark Wilcox's `r2dp-claude.zip` (Telegram,
+This repo was stood up from the upstream prototype's `r2dp-claude.zip` (Telegram,
 2026-10-24), which shipped `proto.h`, `mockfwd.c`, and the racoon2 backend
 patch but **not** `client.h`, `libr2dp/`, or `tests/` (those were listed in
 his README as empty dirs). The missing pieces were **reconstructed from the

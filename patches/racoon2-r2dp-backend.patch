@@ -12,7 +12,7 @@ index 5511998..d85dc1c 100644
 +
 +	./configure --with-km-backend=r2dp --with-r2dp=PREFIX
 +
-+That is Mark Wilcox's r2dp M0: iked/spmd drive a forwarder instead of
++That is the upstream prototype's r2dp M0: iked/spmd drive a forwarder instead of
 +the kernel. Wire values are IANA IKEv2 transform IDs; GETSPI is
 +allocated by the forwarder. Needs an installed `libr2dp` from the
 +stand-alone project: **https://github.com/derekm/r2dp** (proto.h,

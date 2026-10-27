@@ -1,6 +1,6 @@
 # Provenance
 
-Landed from Mark Wilcox's `r2dp-claude.zip` (Telegram, 2026-10-24).
+Landed from the upstream prototype's `r2dp-claude.zip` (Telegram, 2026-10-24).
 
 The zip had **no git history** (no `.git`, no commits to preserve).
 

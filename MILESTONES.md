@@ -113,8 +113,12 @@ r2dp contract; earlier milestones are the baseline, not a fork):
   must be idempotent; `SP_DUMP` is called at spmd startup and must be cheap.
 - Bind SA ↔ policy by tunnel endpoints/selector + (SPI+dst inbound); never by
   `reqid` alone (finding 1).
-- AEAD key blob = cipher key ‖ 4-byte salt (`enclen=20` AES-128-GCM), matching
-  `librte_ipsec` (finding 3).
+- AEAD key blob = cipher key ‖ salt, matching `librte_ipsec` and XFRM
+  (finding 3).  The salt is 4 bytes for GCM (RFC 4106, `enclen=20` for
+  AES-128-GCM) and ChaCha20-Poly1305 (RFC 7634, `enclen=36`), but **3 bytes
+  for CCM** (RFC 4309: `enclen=19` for AES-128-CCM).
+  A 4-byte-salt CCM blob is silently a different key, so backends must
+  size the salt per transform, not assume 4.
 - Datapath must honor the ~16 UDP IKE bypass SPs or route IKE via the
   exception path (finding 4).
 - Unknown transforms / XFRM-native `mark`/`if_id` are refused (`EOPNOTSUPP`),
@@ -153,3 +157,27 @@ into per-backend protocol forks.
 - **Next hops**: the 64-entry MAC table evicts least-recently-seen entries.
 - **CI**: `dp_path` runs outbound encrypt → inbound decrypt through the
   production code in the DPDK lanes.
+- **Benchmark gate**: `bench/fwd_bench` measures `esp_outbound`/`esp_inbound`
+  cycles/pkt (64B, 32-packet bursts) at 1, 65 and 201 tunnels; CI's DPDK
+  lane runs it via `meson test --benchmark` and fails if the 201-tunnel cost
+  exceeds 1.5x the 1-tunnel cost or 8000 cycles/pkt
+  (`R2DP_BENCH_MAX_SCALE`, `R2DP_BENCH_MAX_CYC`).
+
+## Backends: kernel XFRM vs DPDK
+
+Both implement the same `fwd_dp` ops behind `r2dp-fwd --dp {dpdk,kernel}`
+and pass the same scapy e2e suite (`tests/e2e/fwd_e2e.sh`, `BACKEND=`).
+
+| | DPDK (`fwd/dp_dpdk.c`) | kernel (`fwd/dp_xfrm.c`) |
+|---|---|---|
+| Datapath | userspace poll-mode, `rte_ipsec` lookaside, `crypto_openssl` | Linux XFRM via NETLINK_XFRM |
+| Transforms | AES-GCM-16 only (others `EOPNOTSUPP`) | GCM, CCM (3-byte salt), ChaCha20-Poly1305, CBC/CTR + HMAC |
+| SPD | `rte_acl` + per-SA inbound index, QSBR-retired snapshots | kernel SPD, priority from `r2dp_sel_score` |
+| Anti-replay | own 256-bit ESN window (DPDK's drops bits 32-63 per bucket) | ESN bitmap (`XFRMA_REPLAY_ESN_VAL`), window 64 if 0 |
+| Drop accounting | per-reason counters (`SIGUSR1` dump) | kernel `XfrmIn*`/`XfrmOut*` MIB |
+| Needs | hugepages or `--no-huge`, a NIC/tap, a core per worker | `CAP_NET_ADMIN` (netns ok), `xfrm_user` module |
+| Use when | throughput, dedicated cores, CI without root | small sites, no spare cores, widest transform set |
+
+The kernel backend is the oracle for transform interop; the DPDK backend is
+the performance path.  `--dp-cleanup` removes the kernel backend's SAs/SPs
+on exit.
