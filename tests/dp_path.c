@@ -315,7 +315,7 @@ main(void)
 		static uint8_t w[64];
 		struct rte_mbuf *in[2], *esp[2], *dup[2], *dec[BURST_SZ];
 		uint16_t nout = 0, nb = 0, n1 = 0, n2 = 0, n3 = 0, n4 = 0;
-		uint64_t rej = b->n_dropr[DR_REPLAY];
+		uint64_t rej = wb.n_dropr[DR_REPLAY];
 		in[0] = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
 		in[1] = inner_frame("10.0.1.6", "10.0.2.5", 1, 0, w);
 		esp_outbound(&wa, in, 2, esp, &nout, &nb);
@@ -334,7 +334,7 @@ main(void)
 		for (uint16_t k = 0; k < n4; k++) rte_pktmbuf_free(dec[k]);
 		printf("     replay: n1=%u n2=%u n3=%u n4=%u\n", n1, n2, n3, n4);
 		CHECK(nout == 2 && n1 == 1 && n2 == 1, "replay: in-window reordering accepted");
-		CHECK(n3 == 0 && n4 == 0 && b->n_dropr[DR_REPLAY] == rej + 2,
+		CHECK(n3 == 0 && n4 == 0 && wb.n_dropr[DR_REPLAY] == rej + 2,
 		    "replay: duplicates dropped (replay)");
 	}
 

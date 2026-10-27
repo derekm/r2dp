@@ -90,9 +90,10 @@ static int
 reader(void *arg)
 {
 	struct dpdk_priv *d = arg;
+	unsigned tid = rte_lcore_id();   /* reader's own lcore == worker tid */
 
-	rte_rcu_qsbr_thread_register(d->rcu, d->worker_lcore);
-	rte_rcu_qsbr_thread_online(d->rcu, d->worker_lcore);
+	rte_rcu_qsbr_thread_register(d->rcu, tid);
+	rte_rcu_qsbr_thread_online(d->rcu, tid);
 	while (!rd_stop) {
 		for (int i = 0; i < 8; i++) {
 			const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
@@ -120,10 +121,10 @@ reader(void *arg)
 			}
 		}
 		rd_iters++;
-		rte_rcu_qsbr_quiescent(d->rcu, d->worker_lcore);
+		rte_rcu_qsbr_quiescent(d->rcu, tid);
 	}
-	rte_rcu_qsbr_thread_offline(d->rcu, d->worker_lcore);
-	rte_rcu_qsbr_thread_unregister(d->rcu, d->worker_lcore);
+	rte_rcu_qsbr_thread_offline(d->rcu, tid);
+	rte_rcu_qsbr_thread_unregister(d->rcu, tid);
 	return 0;
 }
 
@@ -136,7 +137,6 @@ t_sp_concurrency(struct dpdk_priv *d)
 	size_t rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
 
 	if (lc >= RTE_MAX_LCORE) { CHECK(0, "need a worker lcore (-l 0-1)"); return; }
-	d->worker_lcore = lc;      /* same tid convention as dpd_start */
 	d->rcu = rte_zmalloc("t_rcu", rsz, RTE_CACHE_LINE_SIZE);
 	if (!d->rcu) { CHECK(0, "rcu alloc"); return; }
 	rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
@@ -471,8 +471,10 @@ main(void)
 	struct dpdk_priv *d;
 	struct r2dp_sa r;
 	struct r2dp_sp sp;
-	struct rte_rcu_qsbr *canary_rcu = (struct rte_rcu_qsbr *)(uintptr_t)0;
-	const unsigned canary_tid = 0xC1C1C1C1u;
+	/* rcu sits immediately before sa_tab in dpdk_priv: use it as the canary
+	 * so a buggy sa_tab[-1] write is caught (the old rcu_tid canary moved
+	 * into the per-worker struct). */
+	struct rte_rcu_qsbr *canary_rcu = (struct rte_rcu_qsbr *)(uintptr_t)0xC1C1C1C1ULL;
 	union rte_ipsec_sad_key k;
 	const union rte_ipsec_sad_key *kp[1] = { &k };
 	void *val[1];
@@ -483,14 +485,13 @@ main(void)
 	}
 
 	/* --- 1. C1: fresh inbound install must not write before sa_tab --- */
-	d->rcu = canary_rcu;            /* NULL: no worker, no synchronize */
-	d->rcu_tid = canary_tid;
+	d->rcu = canary_rcu;            /* marked canary: any write = bug */
 	{
 		rte_spinlock_t lk = d->lock;
 		uint8_t have = (uint8_t)d->have_cdev;
 		mk_sa(&r, 0x1001, "192.0.2.2", "192.0.2.1");
 		CHECK(sa_install(d, &r, key, 20, 0, 1) == 0, "fresh inbound sa_install");
-		CHECK(d->rcu_tid == canary_tid && d->rcu == canary_rcu &&
+		CHECK(d->rcu == canary_rcu &&
 		    memcmp(&lk, &d->lock, sizeof(lk)) == 0 &&
 		    d->have_cdev == have,
 		    "fields before sa_tab untouched (no sa_tab[-1] write)");
@@ -503,7 +504,7 @@ main(void)
 
 		/* upsert (same SPI/DIP): the old slot is retired, new one live */
 		CHECK(sa_install(d, &r, key, 20, 0, 1) == 0, "inbound upsert");
-		CHECK(d->rcu_tid == canary_tid, "upsert leaves canary intact");
+		CHECK(d->rcu == canary_rcu, "upsert leaves canary intact");
 		CHECK(rte_ipsec_sad_lookup(d->sad, kp, val, 1) == 1 && val[0] != NULL,
 		    "SAD resolves the upserted SA");
 		CHECK(sa_install(d, &r, NULL, 0, 1, 1) == 0, "inbound delete");
