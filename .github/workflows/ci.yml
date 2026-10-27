@@ -67,6 +67,10 @@ jobs:
       - name: Test (gcm_kat must not skip)
         run: |
           R2DP_REQUIRE_DPDK=1 meson test -C build-dpdk --print-errorlogs
+      - name: Data-path benchmark regression (cycles/pkt, 1/65/201 tunnels)
+        run: |
+          # fails if 201-tunnel cost > 1.5x 1-tunnel cost, or > 8000 cyc/pkt
+          R2DP_REQUIRE_DPDK=1 meson test -C build-dpdk --benchmark --print-errorlogs -v
       - name: ASan+UBSan data plane
         run: |
           meson setup build-dpkasan --buildtype=debug -Denable_dpdk=enabled \

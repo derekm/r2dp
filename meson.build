@@ -45,6 +45,7 @@ r2dp_ctl_probe = executable('r2dp-ctl-probe',
 subdir('fwd')
 
 subdir('tests')
+subdir('bench')
 
 # Install headers + pkg-config so racoon2's --with-r2dp=PREFIX can find it.
 install_headers('include/r2dp/proto.h',
