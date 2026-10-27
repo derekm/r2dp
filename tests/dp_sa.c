@@ -290,6 +290,90 @@ t_binding(struct dpdk_priv *d)
 	spd_teardown(d);
 }
 
+/* Differential test: the rte_acl SPD must pick exactly the policy a full
+ * scan picks (r2dp_sel_match, highest r2dp_sel_score, lowest slot on a tie)
+ * for random policies and packets, incl. ports, protocols, fragments,
+ * truncated L4, IP options and unmatchable (non-IPv4 / pref > 32) rules. */
+static uint32_t rnd_state = 0x12345678;
+static uint32_t rnd(void) { rnd_state ^= rnd_state << 13; rnd_state ^= rnd_state >> 17; rnd_state ^= rnd_state << 5; return rnd_state; }
+
+static const struct r2dp_sp *
+ref_match(struct dpdk_priv *d, const uint8_t *ip, size_t avail)
+{
+	const struct r2dp_sp *best = NULL;
+	int bs = -1;
+
+	for (int i = 0; i < MAX_SA; i++) {
+		const struct r2dp_sp *sp = d->sp_tab[i].sp;
+		int sc;
+		if (!sp || sp->dir != R2DP_DIR_OUT || !r2dp_sel_match(sp, ip, avail))
+			continue;
+		sc = r2dp_sel_score(sp);
+		if (sc > bs) { bs = sc; best = sp; }
+	}
+	return best;
+}
+
+static void
+t_acl_diff(struct dpdk_priv *d)
+{
+	struct fwd_dp dp = { .priv = d };
+	static const uint8_t protos[] = { R2DP_PROTO_ANY, 6, 17, 1, 132 };
+	static const uint16_t ports[] = { 0, 53, 80, 443 };
+	unsigned mism = 0, matched = 0, npk = 30000;
+
+	for (int i = 0; i < 300; i++) {
+		struct r2dp_sp sp;
+		memset(&sp, 0, sizeof(sp));
+		sp.slid = 5000 + (rnd() % 260);           /* some upserts */
+		sp.dir = (rnd() % 5) ? R2DP_DIR_OUT : R2DP_DIR_IN;
+		sp.action = 1 + rnd() % 3;
+		sp.ul_proto = protos[rnd() % 5];
+		sp.sel_src.family = (rnd() % 40) ? R2DP_AF_INET4 : R2DP_AF_INET6;
+		sp.sel_dst.family = R2DP_AF_INET4;
+		sp.sel_src.addr[0] = sp.sel_dst.addr[0] = 10;
+		sp.sel_src.addr[1] = rnd() % 4; sp.sel_src.addr[2] = rnd() % 4; sp.sel_src.addr[3] = rnd() % 4;
+		sp.sel_dst.addr[1] = rnd() % 4; sp.sel_dst.addr[2] = rnd() % 4; sp.sel_dst.addr[3] = rnd() % 4;
+		sp.pref_src = (uint8_t)(rnd() % 34);       /* 33: unmatchable */
+		sp.pref_dst = (uint8_t)(rnd() % 33);
+		sp.sel_src.port = htons(ports[rnd() % 4] * (rnd() % 3 == 0));
+		sp.sel_dst.port = htons(ports[rnd() % 4] * (rnd() % 2));
+		sp.tun_src.family = sp.tun_dst.family = R2DP_AF_INET4;
+		if (dpd_sp_add(&dp, &sp) != 0) { CHECK(0, "acl-diff: sp_add"); return; }
+		if (rnd() % 10 == 0) { sp.slid = 5000 + (rnd() % 260); dpd_sp_del(&dp, &sp); }
+	}
+	for (unsigned n = 0; n < npk; n++) {
+		uint8_t ip[64];
+		size_t ihl = (rnd() % 8) ? 20 : 24, avail;
+		const struct r2dp_sp *want, *got;
+		struct dp_sa *ds;
+		uint16_t sp_, dp_;
+
+		memset(ip, 0, sizeof(ip));
+		ip[0] = 0x40 | (uint8_t)(ihl / 4);
+		ip[9] = protos[1 + rnd() % 4];
+		if (rnd() % 6 == 0) { ip[6] = 0x00; ip[7] = (uint8_t)(1 + rnd() % 8); }  /* non-first frag */
+		if (rnd() % 9 == 0) ip[6] = 0x20;                                      /* MF, first frag */
+		ip[12] = ip[16] = 10;
+		for (int k = 1; k < 4; k++) { ip[12 + k] = rnd() % 4; ip[16 + k] = rnd() % 4; }
+		sp_ = htons(ports[rnd() % 4] ? ports[rnd() % 4] : 1234);
+		dp_ = htons(ports[rnd() % 4] ? ports[rnd() % 4] : 4321);
+		memcpy(ip + ihl, &sp_, 2); memcpy(ip + ihl + 2, &dp_, 2);
+		avail = (rnd() % 10) ? ihl + 8 : ihl + 2;                    /* truncated L4 */
+		want = ref_match(d, ip, avail);
+		got = sp_match_out(d, (const struct rte_ipv4_hdr *)ip, avail, &ds);
+		if (want) matched++;
+		if (want != got) {
+			if (mism++ < 5)
+				printf("     mismatch pkt %u: want slid %u got slid %u\n", n,
+				    want ? want->slid : 0, got ? got->slid : 0);
+		}
+	}
+	printf("     acl-diff: %u packets, %u matched a policy\n", npk, matched);
+	CHECK(mism == 0 && matched > npk / 4, "acl-diff: rte_acl SPD == full scan on random policies/packets");
+	spd_teardown(d);
+}
+
 int
 main(void)
 {
@@ -381,6 +465,7 @@ main(void)
 	t_sp_concurrency(d);
 	t_inbound_policy(d);
 	t_binding(d);
+	t_acl_diff(d);
 
 	/* teardown: free every session (no leaks under LSan) */
 	for (int i = 0; i < MAX_SA; i++)
