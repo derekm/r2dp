@@ -343,12 +343,12 @@ main(void)
 		uint64_t sa = 0, sb = 0;
 		char buf[1024] = "";
 		FILE *f = tmpfile();
-		for (int r = 0; r < DR_NUM; r++) { sa += a->n_dropr[r]; sb += b->n_dropr[r]; }
-		CHECK(sa == a->n_drop && sb == b->n_drop, "drops: reasons sum to n_drop");
-		CHECK(a->n_dropr[DR_NO_SA_OUT] == 1, "drops: PROTECT without SA -> no_sa_out");
-		CHECK(a->n_dropr[DR_POLICY_DISCARD] == 1, "drops: TCP/23 -> policy_discard");
-		CHECK(b->n_dropr[DR_CRYPTO_FAIL] == 3, "drops: 3 forged datagrams -> crypto_fail");
-		CHECK(b->n_dropr[DR_INNER_SEL] == 1, "drops: off-selector inner -> inner_sel");
+		for (int r = 0; r < DR_NUM; r++) { sa += wa.n_dropr[r]; sb += wb.n_dropr[r]; }
+		CHECK(sa == wa.n_drop && sb == wb.n_drop, "drops: reasons sum to n_drop");
+		CHECK(wa.n_dropr[DR_NO_SA_OUT] == 1, "drops: PROTECT without SA -> no_sa_out");
+		CHECK(wa.n_dropr[DR_POLICY_DISCARD] == 1, "drops: TCP/23 -> policy_discard");
+		CHECK(wb.n_dropr[DR_CRYPTO_FAIL] == 3, "drops: 3 forged datagrams -> crypto_fail");
+		CHECK(wb.n_dropr[DR_INNER_SEL] == 1, "drops: off-selector inner -> inner_sel");
 		if (f) {
 			size_t n;
 			dpd_stats_dump(b, f);
