@@ -220,6 +220,7 @@ struct dpdk_priv {
 	struct rte_ipsec_sad *sad;
 	struct rte_cryptodev_info cdev_info;
 	uint8_t             cdev_id;
+	const char          *cdev_name_sel; /* PMD actually selected (diagnostics) */
 	int                 have_cdev;
 	rte_spinlock_t      lock;
 	struct rte_rcu_qsbr *rcu;   /* H5: QSBR for the ctl<->worker SA/SP handoff */
@@ -2213,9 +2214,32 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		return -ENOMEM;
 	}
 
-	ret = rte_cryptodev_get_dev_id("crypto_openssl0");
-	if (ret < 0)
-		ret = rte_cryptodev_get_dev_id("crypto_openssl");
+	/* Prefer the AES-NI IPSec-MB pipe PMD (the same AES-NI instructions the
+	 * kernel XFRM dataplane uses, at multi-Gbps/core for AES-GCM), falling
+	 * back to crypto_openssl when the MB PMD isn't present.  The PMD name is
+	 * also overridable (R2DP_CRYPTO_DEV) for testing/other devices. */
+	{
+		const char *want = getenv("R2DP_CRYPTO_DEV") ? getenv("R2DP_CRYPTO_DEV")
+		    : "crypto_aesni_mb0";
+		ret = rte_cryptodev_get_dev_id(want);
+		if (ret >= 0) {
+			d->cdev_name_sel = want;
+		} else {
+			ret = rte_cryptodev_get_dev_id("crypto_aesni_mb");
+			if (ret >= 0)
+				d->cdev_name_sel = "crypto_aesni_mb";
+		}
+		if (ret < 0) {
+			ret = rte_cryptodev_get_dev_id("crypto_openssl0");
+			if (ret >= 0)
+				d->cdev_name_sel = "crypto_openssl0";
+		}
+		if (ret < 0) {
+			ret = rte_cryptodev_get_dev_id("crypto_openssl");
+			if (ret >= 0)
+				d->cdev_name_sel = "crypto_openssl";
+		}
+	}
 	if (ret >= 0) {
 		d->cdev_id = (uint8_t)ret;
 		rte_cryptodev_info_get(d->cdev_id, &d->cdev_info);
@@ -2315,8 +2339,9 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		dp->ops->caps(dp);
 	if (dp->ops->start)
 		dp->ops->start(dp);   /* bring up the worker + port */
-	fprintf(stderr, "r2dp-fwd: DPDK dataplane ready (port=%d cdev=%d sad=%p)\n",
-	    d->port_id, d->cdev_id, (void *)d->sad);
+	fprintf(stderr, "r2dp-fwd: DPDK dataplane ready (port=%d cdev=%d cdev_name=%s sad=%p)\n",
+	    d->port_id, d->cdev_id, d->cdev_name_sel ? d->cdev_name_sel : "none",
+	    (void *)d->sad);
 	return 0;
 }
 
