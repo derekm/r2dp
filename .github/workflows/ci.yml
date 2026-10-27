@@ -73,3 +73,36 @@ jobs:
             -Db_sanitize=address,undefined -Db_lundef=false -Db_staticpic=false
           meson compile -C build-dpkasan
           R2DP_REQUIRE_DPDK=1 meson test -C build-dpkasan --print-errorlogs
+
+  # Data-plane interop: r2dp-fwd (DPDK net_tap + crypto_openssl) against an
+  # independent scapy ESP peer, in a throwaway user+net+mount namespace
+  # (no root, no ip netns).  Every phase must pass and every packet must
+  # land on its exact counter (tests/e2e/fwd_e2e.sh).
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build meson pkg-config libdpdk-dev libssl-dev iproute2 python3-venv
+          # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Python venv (scapy + cryptography)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q scapy cryptography
+      - name: Build (DPDK, ASan+UBSan)
+        run: |
+          meson setup build-e2e --buildtype=debug -Denable_dpdk=enabled \
+            -Db_sanitize=address,undefined -Db_lundef=false
+          meson compile -C build-e2e
+      - name: fwd_e2e (unshare -Urnm)
+        run: |
+          unshare -Urnm --propagation private bash -c '
+            mount -t tmpfs none /run &&
+            PYTHON="$RUNNER_TEMP/venv/bin/python" R2DP_E2E_DIR="$RUNNER_TEMP/e2e" \
+              tests/e2e/fwd_e2e.sh build-e2e/fwd/r2dp-fwd build-e2e/r2dpctl'
+      - name: Forwarder log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/e2e/fwd.out" || true
