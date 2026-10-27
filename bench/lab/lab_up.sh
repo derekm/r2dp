@@ -41,7 +41,7 @@ sudo ip netns add nsB
 sudo ip netns exec nsB ip link set lo up
 sudo ip netns exec nsB ip link add br0 type bridge
 sudo ip netns exec nsB ip link set br0 up
-$SRC/bench_spawn3.sh "$SESS" sudo ip netns exec nsB env $FWDLD bash -c "$FWD -n $NW -v -s /tmp/r2dp-dpdk.sock --no-pci -l 0-$((NW)) --vdev=crypto_aesni_mb0 --vdev=net_tap0,iface=r2dp-tap --vdev=net_tap1,iface=r2dp-tap-inner > /tmp/fwd_i.log 2>&1"
+$SRC/bench_spawn3.sh "$SESS" sudo ip netns exec nsB env $FWDLD bash -c "$FWD -n $NW -v -s /tmp/r2dp-dpdk.sock --no-pci -l 0-$((NW+1)) --vdev=crypto_aesni_mb0 --vdev=net_tap0,iface=r2dp-tap --vdev=net_tap1,iface=r2dp-tap-inner > /tmp/fwd_i.log 2>&1"
 sleep 8
 sudo ip netns exec nsB ip link set r2dp-tap master br0 2>/dev/null
 sudo ip netns exec nsB ip link set r2dp-tap up 2>/dev/null

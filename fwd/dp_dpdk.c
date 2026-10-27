@@ -1797,22 +1797,30 @@ pkt_flow_hash(const struct rte_mbuf *mb)
 	/* Stable per-flow key so one SA stays on one worker (anti-replay and
 	 * the rte_ipsec session are per-SA, NOT safe to touch concurrently).
 	 * ESP -> (outer dst IP, SPI).  Everything else (IKE, inner/plaintext)
-	 * -> (src ^ dst ^ proto).  CRC32 the key for a flat distribution. */
+	 * -> (src ^ dst ^ proto).  Hash to a FNV-1a then avalanche so the low
+	 * bits used by '% nw' are well-mixed (a raw sum made 8 flows collapse
+	 * to 2 of 4 buckets because the low 2 bits barely changed). */
 	const uint8_t *p = rte_pktmbuf_mtod(mb, const uint8_t *);
 	uint32_t pl = rte_pktmbuf_pkt_len(mb);
-	uint32_t h = 0x9e3779b9;
 	const struct rte_ipv4_hdr *ip;
+	uint32_t h = 2166136261u;
 	if (pl < RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
 		return 0;
 	ip = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
 	if (((ip->version_ihl >> 4) != 4))
 		return 0;
-	h += ip->src_addr ^ ip->dst_addr ^ (uint32_t)ip->next_proto_id;
+	h = (h ^ ip->src_addr) * 16777619u;
+	h = (h ^ ip->dst_addr) * 16777619u;
+	h = (h ^ (uint32_t)ip->next_proto_id) * 16777619u;
 	if (ip->next_proto_id == IPPROTO_ESP && pl >= RTE_ETHER_HDR_LEN + 20 + 8) {
 		const struct rte_esp_hdr *es = (const struct rte_esp_hdr *)
 		    (p + RTE_ETHER_HDR_LEN + 20);
-		h = (h << 5) + h + ntohl(es->spi);
+		h = (h ^ ntohl(es->spi)) * 16777619u;
 	}
+	/* avalanche: mix the high bits down into the low bits that '% nw' uses */
+	h ^= h >> 16; h *= 0x7feb352du;
+	h ^= h >> 15; h *= 0x846ca68bu;
+	h ^= h >> 16;
 	return h;
 }
 
