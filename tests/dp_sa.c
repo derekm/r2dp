@@ -320,7 +320,7 @@ t_acl_diff(struct dpdk_priv *d)
 	struct fwd_dp dp = { .priv = d };
 	static const uint8_t protos[] = { R2DP_PROTO_ANY, 6, 17, 1, 132 };
 	static const uint16_t ports[] = { 0, 53, 80, 443 };
-	unsigned mism = 0, matched = 0, npk = 30000;
+	unsigned mism = 0, matched = 0, nomatch = 0, npk = 30000;
 
 	for (int i = 0; i < 300; i++) {
 		struct r2dp_sp sp;
@@ -334,8 +334,8 @@ t_acl_diff(struct dpdk_priv *d)
 		sp.sel_src.addr[0] = sp.sel_dst.addr[0] = 10;
 		sp.sel_src.addr[1] = rnd() % 4; sp.sel_src.addr[2] = rnd() % 4; sp.sel_src.addr[3] = rnd() % 4;
 		sp.sel_dst.addr[1] = rnd() % 4; sp.sel_dst.addr[2] = rnd() % 4; sp.sel_dst.addr[3] = rnd() % 4;
-		sp.pref_src = (uint8_t)(rnd() % 34);       /* 33: unmatchable */
-		sp.pref_dst = (uint8_t)(rnd() % 33);
+		sp.pref_src = (uint8_t)(8 + rnd() % 26);   /* 33: unmatchable; >= 8 so */
+		sp.pref_dst = (uint8_t)(8 + rnd() % 25);   /* 11/8 packets miss */
 		sp.sel_src.port = htons(ports[rnd() % 4] * (rnd() % 3 == 0));
 		sp.sel_dst.port = htons(ports[rnd() % 4] * (rnd() % 2));
 		sp.tun_src.family = sp.tun_dst.family = R2DP_AF_INET4;
@@ -355,6 +355,7 @@ t_acl_diff(struct dpdk_priv *d)
 		if (rnd() % 6 == 0) { ip[6] = 0x00; ip[7] = (uint8_t)(1 + rnd() % 8); }  /* non-first frag */
 		if (rnd() % 9 == 0) ip[6] = 0x20;                                      /* MF, first frag */
 		ip[12] = ip[16] = 10;
+		if (rnd() % 6 == 0) ip[12 + 4 * (rnd() % 2)] = 11;  /* no-match share */
 		for (int k = 1; k < 4; k++) { ip[12 + k] = rnd() % 4; ip[16 + k] = rnd() % 4; }
 		sp_ = htons(ports[rnd() % 4] ? ports[rnd() % 4] : 1234);
 		dp_ = htons(ports[rnd() % 4] ? ports[rnd() % 4] : 4321);
@@ -362,15 +363,15 @@ t_acl_diff(struct dpdk_priv *d)
 		avail = (rnd() % 10) ? ihl + 8 : ihl + 2;                    /* truncated L4 */
 		want = ref_match(d, ip, avail);
 		got = sp_match_out(d, (const struct rte_ipv4_hdr *)ip, avail, &ds);
-		if (want) matched++;
+		if (want) matched++; else nomatch++;
 		if (want != got) {
 			if (mism++ < 5)
 				printf("     mismatch pkt %u: want slid %u got slid %u\n", n,
 				    want ? want->slid : 0, got ? got->slid : 0);
 		}
 	}
-	printf("     acl-diff: %u packets, %u matched a policy\n", npk, matched);
-	CHECK(mism == 0 && matched > npk / 4, "acl-diff: rte_acl SPD == full scan on random policies/packets");
+	printf("     acl-diff: %u packets, %u matched, %u matched none\n", npk, matched, nomatch);
+	CHECK(mism == 0 && matched > npk / 4 && nomatch > npk / 20, "acl-diff: rte_acl SPD == full scan on random policies/packets");
 	spd_teardown(d);
 }
 
