@@ -2015,20 +2015,16 @@ worker_outer(struct dp_worker *w, int port,
  * tap as ESP; non-protected (IKE/ARP, or no OUT policy -> bypass) crosses to
  * the outer (peer) tap on the exception path.  ESP arriving here is dropped. */
 static void
-worker_inner(struct dp_worker *w, int port)
+worker_inner(struct dp_worker *w, int port,
+    struct rte_mbuf *bufs[], uint16_t nr)
 {
 	struct dpdk_priv *d = w->d;
-	struct rte_mbuf *bufs[BURST_SZ];
-	uint16_t nr = rte_eth_rx_burst(port, w->qid, bufs, BURST_SZ);
+	struct rte_mbuf *nonesp[BURST_SZ];
+	uint16_t nnon = 0;
 
 	if (nr == 0)
 		return;
 	w->n_rx += nr;
-
-	/* 1. classify: ESP here is anomalous -> drop; non-ESP may be protected
-	 *    (encrypt) or unprotected (IKE/ARP -> exception path). */
-	struct rte_mbuf *nonesp[BURST_SZ];
-	uint16_t nnon = 0;
 	for (uint16_t i = 0; i < nr; i++) {
 		if (is_esp(bufs[i])) {
 			DROP(w, DR_ESP_ON_INNER, 1);
@@ -2180,9 +2176,37 @@ worker_main(void *arg)
 	while (d->running) {
 		uint64_t now = rte_rdtsc();
 
-		worker_outer(w, port);
-		if (d->inner_port >= 0)
-			worker_inner(w, d->inner_port);
+		if (d->have_dist) {
+			/* Pull this worker's share from its SPSC ring.  The ring
+			 * mixes both ports; dispatch each mbuf by its source port
+			 * (rx_burst sets m->port). */
+			struct rte_mbuf *b[BURST_SZ];
+			struct rte_mbuf *ob[BURST_SZ], *ib[BURST_SZ];
+			uint16_t no = 0, ni = 0;
+			uint16_t nd = rte_ring_sc_dequeue_burst(w->rxq,
+			    (void **)b, BURST_SZ);
+			for (uint16_t k = 0; k < nd; k++) {
+				if (d->inner_port >= 0 &&
+				    (int)b[k]->port == d->inner_port)
+					ib[ni++] = b[k];
+				else
+					ob[no++] = b[k];
+			}
+			if (no) worker_outer(w, port, ob, no);
+			if (ni) worker_inner(w, d->inner_port, ib, ni);
+		} else {
+			/* legacy path (no distributor lcore available) */
+			struct rte_mbuf *b[BURST_SZ];
+			uint16_t nr2 = rte_eth_rx_burst(port, w->qid, b, BURST_SZ);
+			if (nr2)
+				worker_outer(w, port, b, nr2);
+			if (d->inner_port >= 0) {
+				nr2 = rte_eth_rx_burst(d->inner_port, w->qid,
+				    b, BURST_SZ);
+				if (nr2)
+					worker_inner(w, d->inner_port, b, nr2);
+			}
+		}
 
 		/* report quiescent: ctl may now free anything read this iteration */
 		if (d->rcu)
@@ -2221,11 +2245,16 @@ dpd_start(struct fwd_dp *dp)
 	if (d->port_id < 0)
 		return -ENODEV;
 	/* M3: one run-to-completion worker per slave lcore, each with its own
-	 * RX/TX queue on both tap ports and its own cryptodev queue pair.
-	 * -n clamps to RTE_MAX_LCORE-1 and to the lcores actually enabled. */
+	 * TX queue + cryptodev queue pair.  When a slave lcore is spare beyond
+	 * the workers, run a software DISTRIBUTOR on it: it drains every tap RX
+	 * queue on both ports and fans each packet to the owning worker's SPSC
+	 * ring (worker = pkt_flow_hash % nw), decoupling worker assignment from
+	 * the kernel/PMD RSS hash.  -n clamps to RTE_MAX_LCORE-1 and lcores. */
 	nw = d->nworkers;
 	if (nw < 1) nw = 1;
-	if (nw > (int)RTE_MAX_LCORE - 1) nw = (int)RTE_MAX_LCORE - 1;
+	if (nw > (int)RTE_MAX_LCORE - 2) nw = (int)RTE_MAX_LCORE - 2;
+	d->dist_lcore = RTE_MAX_LCORE;
+	d->have_dist = 0;
 	{
 		unsigned av = 0;
 		for (unsigned x = rte_get_next_lcore(-1, 1, 0); x < RTE_MAX_LCORE;
@@ -2235,15 +2264,28 @@ dpd_start(struct fwd_dp *dp)
 			    "(run with -l 0,<n>, e.g. -l 0-1)\n");
 			return -EAGAIN;
 		}
-		if (nw > (int)av) nw = (int)av;
+		/* want nw workers + 1 distributor; if not enough lcores, drop the
+		 * distributor (legacy each-worker-polls-own-queue) before the
+		 * workers themselves. */
+		if ((unsigned)nw + 1 > av) {
+			if (av == 1) nw = 1;           /* worker only, no dist */
+			else nw = (int)av - 1;         /* drop the distributor */
+			d->nworkers = (uint16_t)nw;
+		} else {
+			d->nworkers = (uint16_t)nw;
+			d->have_dist = 1;
+		}
 	}
-	d->nworkers = (uint16_t)nw;
 
 	d->w = calloc((size_t)nw, sizeof(*d->w));
 	if (!d->w)
 		return -ENOMEM;
 
 	lcore = rte_get_next_lcore(-1, 1, 1);
+	if (d->have_dist) {
+		d->dist_lcore = lcore;                 /* first slave = distributor */
+		lcore = rte_get_next_lcore(lcore, 1, 1);
+	}
 	for (i = 0; i < nw; i++) {
 		if (lcore >= RTE_MAX_LCORE) {
 			fprintf(stderr, "r2dp-fwd: need %d slave lcores but fewer "
@@ -2253,10 +2295,26 @@ dpd_start(struct fwd_dp *dp)
 		}
 		d->w[i].d = d;
 		d->w[i].lcore = lcore;
-		d->w[i].qid = (uint16_t)i;   /* its rx/tx queue on both ports */
+		d->w[i].qid = (uint16_t)i;   /* its tx queue on both ports */
 		d->w[i].cqp = (uint16_t)i;   /* its cryptodev queue pair */
 		/* w[i].nh is zeroed by calloc: no peer learned until it is */
 		lcore = rte_get_next_lcore(lcore, 1, 1);
+	}
+
+	/* per-worker SPSC ring (distributor is the single producer; the worker
+	 * the single consumer).  Sized to a good fraction of a mempool burst. */
+	if (d->have_dist) {
+		for (i = 0; i < nw; i++) {
+			char nm[16];
+			snprintf(nm, sizeof(nm), "r2q%d", i);
+			d->w[i].rxq = rte_ring_create(nm, 4096, SOCKET_ID_ANY,
+			    RING_F_SC_DEQ);
+			if (!d->w[i].rxq) {
+				fprintf(stderr, "r2dp-fwd: ring create failed\n");
+				free(d->w); d->w = NULL; d->nworkers = 0;
+				return -ENOMEM;
+			}
+		}
 	}
 
 	if (port_init(d, d->port_id, (uint16_t)nw) < 0)
@@ -2281,6 +2339,8 @@ dpd_start(struct fwd_dp *dp)
 		rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
 	}
 	d->running = 1;
+	if (d->have_dist)
+		rte_eal_remote_launch(distributor_main, d, d->dist_lcore);
 	for (i = 0; i < nw; i++)
 		rte_eal_remote_launch(worker_main, &d->w[i], d->w[i].lcore);
 	return 0;
@@ -2292,6 +2352,8 @@ dpd_stop(struct fwd_dp *dp)
 	struct dpdk_priv *d = dp->priv;
 
 	d->running = 0;
+	if (d->have_dist && d->dist_lcore < RTE_MAX_LCORE)
+		rte_eal_wait_lcore(d->dist_lcore);
 	for (int i = 0; d->w && i < d->nworkers; i++)
 		if (d->w[i].lcore < RTE_MAX_LCORE)
 			rte_eal_wait_lcore(d->w[i].lcore);
@@ -2300,6 +2362,11 @@ dpd_stop(struct fwd_dp *dp)
 			rte_rcu_qsbr_thread_unregister(d->rcu, d->w[i].lcore);
 		rte_free(d->rcu);
 		d->rcu = NULL;
+	}
+	if (d->w) {
+		for (int i = 0; i < d->nworkers; i++)
+			if (d->w[i].rxq)
+				rte_ring_free(d->w[i].rxq);
 	}
 	free(d->w);
 	d->w = NULL;
