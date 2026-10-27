@@ -798,7 +798,13 @@ bad:
 		/* Packet i is the one due back from crypto.  rte_ipsec_pkt_process
 		 * on dq (==1 here) leaves the DECRYPTED inner packet in pm[i];
 		 * forward it.  On any failure drop it. */
-		if (dq >= 1) {
+		if (dq >= 1 && cop[0]->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
+			/* AUTH_FAILED (forged/corrupted ICV) or any crypto error:
+			 * librte_ipsec's process step does not look at the op, so
+			 * this packet must never reach it -- drop (fail closed). */
+			d->n_drop++;
+			rte_pktmbuf_free(pm[i]);
+		} else if (dq >= 1) {
 			uint16_t proc = rte_ipsec_pkt_process(ss, &pm[i], 1);
 			if (d->verbose) {
 				uint8_t *bb = rte_pktmbuf_mtod(pm[i], uint8_t *);
@@ -1158,6 +1164,10 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 			fprintf(stderr, "r2dp-fwd: egress crypto np=%u enq=%u dq=%u st=%u\n",
 			    np, enq, dq, (dq && cop->status) ? cop->status : 0);
 		if (dq == 0) { rte_crypto_op_free(cop); goto drop; }
+		if (cop->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
+			rte_crypto_op_free(cop);   /* never emit a failed encrypt */
+			goto drop;
+		}
 		proc = rte_ipsec_pkt_process(&ds->sess, &bufs[i], dq);
 		rte_crypto_op_free(cop);
 		if (proc == 1 && out && no < BURST_SZ) {

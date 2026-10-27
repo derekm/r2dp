@@ -134,6 +134,8 @@ inner_frame(const char *src, const char *dst, uint8_t proto, uint16_t dport,
 
 /* A -> encrypt -> B -> decrypt.  Returns 1 if an inner packet came out of
  * B (copied to `got`), 0 if dropped; *encrypted says whether A emitted ESP. */
+static int tamper_at = -1;   /* >= 0: flip this byte of the ESP datagram */
+
 static int
 run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
     int *encrypted, uint8_t *got, uint16_t len)
@@ -151,6 +153,8 @@ run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
 	{
 		uint8_t *f = rte_pktmbuf_mtod(esp[0], uint8_t *);
 		memset(f, 0, 14); f[12] = 0x08;
+		if (tamper_at >= 0 && (uint32_t)tamper_at + 14 < rte_pktmbuf_data_len(esp[0]))
+			f[14 + tamper_at] ^= 0x01;
 	}
 	esp_inbound(b, esp, 1, dec, &ndec);
 	if (ndec != 1)
@@ -227,6 +231,20 @@ main(void)
 		struct rte_mbuf *m = inner_frame("10.0.9.5", "10.0.2.5", 1, 0, want);
 		int ok = run(a, b, m, &enc, got);
 		CHECK(enc && !ok, "inner packet outside B's IN selector dropped after decrypt");
+	}
+
+	/* A forged datagram must never decrypt to cleartext: flip a ciphertext
+	 * byte (after outer IP 20 + ESP hdr 8 + IV 8) and the ICV's last byte. */
+	{
+		static uint8_t w[64], g[64];
+		struct rte_mbuf *m;
+		tamper_at = 20 + 8 + 8 + 4;
+		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		CHECK(!run(a, b, m, &enc, g) && enc, "tampered ciphertext -> dropped (auth failure honoured)");
+		tamper_at = 20 + 8 + 8 + 64 + 2 + 2 + 15;   /* inside the 16-B ICV */
+		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		CHECK(!run(a, b, m, &enc, g) && enc, "tampered ICV -> dropped");
+		tamper_at = -1;
 	}
 
 	/* Inner lengths whose low byte is < 20 (256, 512, 513, 270...) were
