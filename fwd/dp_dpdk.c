@@ -709,8 +709,25 @@ port_init(struct dpdk_priv *d, uint16_t port, uint16_t nq)
 		if (rte_eth_tx_queue_setup(port, q, 1024, rte_eth_dev_socket_id(port),
 		    NULL) < 0)
 			return -rte_errno;
-	if (rte_eth_dev_start(port) < 0)
-		return -rte_errno;
+	if (rte_eth_dev_start(port) < 0) {
+		/* vhost/VDUSE goes up when the kernel peer connects (vdpa dev
+		 * add).  rte_eth_dev_start fails at probe if no peer yet, so
+		 * retry briefly to absorb the kernel add racing the probe. */
+		struct rte_eth_dev_info di0;
+		if (rte_eth_dev_info_get(port, &di0) == 0 &&
+		    strstr(di0.driver_name, "vhost")) {
+			int rtry;
+			for (rtry = 0; rtry < 50; rtry++) {
+				usleep(200000);   /* 200 ms */
+				if (rte_eth_dev_start(port) == 0)
+					break;
+			}
+			if (rtry >= 50)
+				return -rte_errno;
+		} else {
+			return -rte_errno;
+		}
+	}
 	rte_eth_promiscuous_enable(port);
 	return 0;
 }
