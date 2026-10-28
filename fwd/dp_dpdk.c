@@ -2596,7 +2596,8 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		struct rte_eth_dev_info di;
 		if (rte_eth_dev_info_get(port, &di) == 0 &&
 		    (strstr(di.driver_name, "tap") ||
-		     strstr(di.driver_name, "memif"))) {
+		     strstr(di.driver_name, "memif") ||
+		     strstr(di.driver_name, "vhost"))) {
 			if (d->port_id < 0) {
 				d->port_id = port;                /* outer = ESP side */
 			} else if (d->inner_port < 0) {
