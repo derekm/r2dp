@@ -914,8 +914,12 @@ esp_inbound(struct dp_worker *w, struct rte_mbuf *bufs[], uint16_t nr,
 			 * marker(4) + ESP.  rte_pktmbuf_adj would strip from the FRONT
 			 * (the IP header), which is wrong.  Instead move the ESP payload
 			 * down so it sits immediately after the IP header (bare IP + ESP
-			 * for librte), then trim the now-empty UDP+marker tail. */
-			int payload = rte_pktmbuf_pkt_len(bufs[i]) - ihl - natlen;
+			 * for librte), then trim the now-empty UDP+marker tail.
+			 * memmove works within segment 1, so size the copy by
+			 * data_len (first segment), never pkt_len (could cross
+			 * segments and copy past segment 1's buffer). */
+			int payload = (int)rte_pktmbuf_data_len(bufs[i]) -
+			    ihl - natlen;
 			uint8_t *base = rte_pktmbuf_mtod(bufs[i], uint8_t *);
 			if (payload > 0)
 				memmove(base + ihl, base + ihl + natlen,
@@ -1050,14 +1054,18 @@ static int
 is_nat_esp(struct dpdk_priv *d, struct rte_mbuf *mb)
 {
 	uint8_t *p = rte_pktmbuf_mtod(mb, uint8_t *);
-	uint32_t pl = rte_pktmbuf_pkt_len(mb);
+	/* Bound against the FIRST segment (data_len), not the whole packet:
+	 * this routine pointer-walks segment 1 (the file-wide convention --
+	 * esp_inbound does the same).  A multi-segment / crafted frame must
+	 * never let us read past the segment we walk. */
+	uint32_t dl = rte_pktmbuf_data_len(mb);
 	struct rte_ipv4_hdr *ip;
 	struct rte_esp_hdr *es;
 	uint8_t ihl;
 	uint16_t dport;
 	int i;
 
-	if (pl < RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
+	if (dl < RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
 		return 0;
 	ip = (struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
 	if ((ip->version_ihl >> 4) != 4 || ip->next_proto_id != IPPROTO_UDP)
@@ -1065,7 +1073,9 @@ is_nat_esp(struct dpdk_priv *d, struct rte_mbuf *mb)
 	ihl = (ip->version_ihl & 0x0f) * 4;
 	if (ihl < sizeof(struct rte_ipv4_hdr))
 		return 0;
-	if (pl < RTE_ETHER_HDR_LEN + ihl + 8u + 4u)
+	/* UDP(8) + non-ESP marker(4) + the ESP SPI we read next must all fit
+	 * in this segment. */
+	if (dl < RTE_ETHER_HDR_LEN + ihl + 8u + 4u + 4u)
 		return 0;
 	dport = ((uint16_t)p[RTE_ETHER_HDR_LEN + ihl + 2] << 8) |
 	    p[RTE_ETHER_HDR_LEN + ihl + 3];
