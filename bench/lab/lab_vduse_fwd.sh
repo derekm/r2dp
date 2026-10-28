@@ -35,6 +35,9 @@ sudo pkill -9 -f dpdk-testpmd 2>/dev/null
 sudo ip netns add nsB
 sudo ip netns exec nsB ip link set lo up
 $SRC/bench_spawn3.sh "$SESS" sudo ip netns exec nsB env $FWDLD bash -c "$FWD -n $NW -v -s /tmp/r2dp-dpdk.sock --no-pci -l 0-$((NW+2)) --vdev=crypto_aesni_mb0 --vdev=net_vhost0,iface=/dev/vduse/outer,queues=1 --vdev=net_tap0,iface=r2dp-tap-inner > /tmp/fwd_vd.log 2>&1"
+# register the kernel vdpa device NOW while the forwarder retries its start
+sleep 3
+sudo vdpa dev add name outer mgmtdev vduse 2>&1 | head -2
 sleep 8
 echo "=== /dev/vduse/outer created by forwarder? ==="
 ls -la /dev/vduse/ 2>/dev/null
