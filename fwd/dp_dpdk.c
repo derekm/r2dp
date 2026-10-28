@@ -63,6 +63,9 @@
 #define MEMPOOL_SIZE  16384
 #define MAX_SA        FWD_MAXSA
 #define BURST_SZ      128
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 #define TAP_IF_DEFAULT "r2dp-tap"
 
 #define RP_BITS  256              /* >= the largest window (wsize is a u8) */
@@ -213,6 +216,12 @@ sa_live(const struct dp_sa *ds)
 struct dpdk_priv {
 	int                 port_id;      /* outer tap (ESP side) */
 	int                 inner_port;   /* inner tap (plaintext side) */
+	/* A (fan-out): each worker TXes decrypted inner to its OWN inner tap
+	 * when >1 inner tap port is present, so the inner leg parallelizes
+	 * across taps/cores instead of funnelling through one shared TUN.
+	 * inner_ports[i] is worker i's inner TX port (= -1 => shared
+	 * inner_port).  Discovered from additional net_tap vdevs. */
+	int                 inner_ports[64];
 	struct rte_mempool *pool;
 	struct rte_mempool *sess_mp;   /* crypto session mempool */
 	struct rte_mempool *cop_mp;    /* crypto operation mempool */
@@ -1844,17 +1853,19 @@ static int
 distributor_main(void *arg)
 {
 	struct dpdk_priv *d = arg;
-	uint16_t ports[2]; int np = 0;
+	uint16_t ports[65]; int np = 0;
 	struct rte_mbuf *bufs[BURST_SZ];
 
 	if (d->port_id >= 0) ports[np++] = (uint16_t)d->port_id;
 	if (d->inner_port >= 0) ports[np++] = (uint16_t)d->inner_port;
+	for (size_t i = 0; i < ARRAY_SIZE(d->inner_ports); i++)
+		if (d->inner_ports[i] >= 0)
+			ports[np++] = (uint16_t)d->inner_ports[i];
 	if (np == 0) return 0;
 	while (d->running) {
 		for (int pi = 0; pi < np; pi++) {
 			uint16_t p = ports[pi];
-			uint16_t nq = (pi == 0) ? d->nworkers : d->nworkers;
-			for (uint16_t q = 0; q < nq; q++) {
+			for (uint16_t q = 0; q < d->nworkers; q++) {
 				uint16_t nr = rte_eth_rx_burst(p, q, bufs, BURST_SZ);
 				for (uint16_t i = 0; i < nr; i++) {
 					struct dp_worker *w = &d->w[
@@ -1865,6 +1876,32 @@ distributor_main(void *arg)
 			}
 		}
 	}
+	return 0;
+}
+
+/* A (fan-out): the inner TX port for worker id `i`.  When per-worker inner
+ * taps are configured, each worker delivers decrypted inner on its own tap;
+ * otherwise all share the single inner_port. */
+static inline int
+worker_inner_tx(struct dpdk_priv *d, int i)
+{
+	if (i >= 0 && i < (int)ARRAY_SIZE(d->inner_ports) &&
+	    d->inner_ports[i] >= 0)
+		return d->inner_ports[i];
+	return d->inner_port;
+}
+
+/* Is `port` one of our inner (plaintext) taps -- the shared inner_port or a
+ * per-worker fan-out tap?  Used to route a distributor-dequeued mbuf to the
+ * inner (encrypt/B->A) path. */
+static inline int
+is_inner_port(struct dpdk_priv *d, int port)
+{
+	if (port == d->inner_port)
+		return 1;
+	for (size_t i = 0; i < ARRAY_SIZE(d->inner_ports); i++)
+		if (d->inner_ports[i] == port)
+			return 1;
 	return 0;
 }
 
@@ -1982,7 +2019,7 @@ worker_outer(struct dp_worker *w, int port,
 					}
 				}
 			}
-			uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
+			uint16_t to = worker_inner_tx(d, w->qid);
 			uint16_t ntx = 0;
 			struct rte_mbuf *txq[BURST_SZ];
 			for (uint16_t i = 0; i < ndec; i++)
@@ -2003,7 +2040,7 @@ worker_outer(struct dp_worker *w, int port,
 	 * only IKE (UDP 500/4500) and ARP cross; other cleartext from the network
 	 * (which should have arrived under an IN PROTECT SA) is dropped. */
 	if (nex) {
-		uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
+		uint16_t to = worker_inner_tx(d, w->qid);
 		uint16_t nf = 0;
 		struct rte_mbuf *fwd[BURST_SZ];
 		for (uint16_t i = 0; i < nex; i++) {
@@ -2205,14 +2242,13 @@ worker_main(void *arg)
 			uint16_t nd = rte_ring_sc_dequeue_burst(w->rxq,
 			    (void **)b, BURST_SZ, &avail);
 			for (uint16_t k = 0; k < nd; k++) {
-				if (d->inner_port >= 0 &&
-				    (int)b[k]->port == d->inner_port)
+				if (is_inner_port(d, (int)b[k]->port))
 					ib[ni++] = b[k];
 				else
 					ob[no++] = b[k];
 			}
 			if (no) worker_outer(w, port, ob, no);
-			if (ni) worker_inner(w, d->inner_port, ib, ni);
+			if (ni) worker_inner(w, (int)ib[ni-1]->port, ib, ni);
 		} else {
 			/* legacy path (no distributor lcore available) */
 			struct rte_mbuf *b[BURST_SZ];
@@ -2339,10 +2375,17 @@ dpd_start(struct fwd_dp *dp)
 	if (port_init(d, d->port_id, (uint16_t)nw) < 0)
 		return -rte_errno;
 	/* inner (plaintext) tap is optional: single-tap mode (interop lab,
-	 * control-only) has only the outer port */
+	 * control-only) has only the outer port.  Also init any per-worker
+	 * fan-out inner taps (A): each such tap carries one worker's stateful
+	 * TX on its own RX/TX queue, so give it nw queues for symmetry. */
 	if (d->inner_port >= 0)
 		if (port_init(d, d->inner_port, (uint16_t)nw) < 0)
 			fprintf(stderr, "r2dp-fwd: inner tap init failed\n");
+	for (size_t fi = 0; fi < ARRAY_SIZE(d->inner_ports); fi++)
+		if (d->inner_ports[fi] >= 0)
+			if (port_init(d, d->inner_ports[fi], (uint16_t)nw) < 0)
+				fprintf(stderr, "r2dp-fwd: fan-out inner tap %zu init failed\n",
+				    fi);
 	/* H5: QSBR so the ctl (main) thread can free SA/SP memory only after the
 	 * workers have passed a grace period -- each worker reads sa_tab/sp_tab
 	 * and holds session pointers across its crypto path with no lock.
@@ -2547,6 +2590,8 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 
 	d->port_id = -1;
 	d->inner_port = -1;
+	for (size_t i = 0; i < ARRAY_SIZE(d->inner_ports); i++)
+		d->inner_ports[i] = -1;
 	RTE_ETH_FOREACH_DEV(port) {
 		struct rte_eth_dev_info di;
 		if (rte_eth_dev_info_get(port, &di) == 0 &&
@@ -2555,6 +2600,14 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 				d->port_id = port;                /* outer = ESP side */
 			} else if (d->inner_port < 0) {
 				d->inner_port = port;             /* inner = plaintext side */
+			} else {
+				/* A (fan-out): any further tap devices become
+				 * per-worker inner taps (workers own them by qid). */
+				for (size_t i = 0; i < ARRAY_SIZE(d->inner_ports); i++)
+					if (d->inner_ports[i] < 0) {
+						d->inner_ports[i] = (int)port;
+						break;
+					}
 			}
 		}
 	}
