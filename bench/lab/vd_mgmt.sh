@@ -54,6 +54,15 @@ up() {
   down
   ensure_ctrl
   sudo modprobe vduse virtio_vdpa vhost_vdpa 2>/dev/null || true
+  sleep 2
+  # CRITICAL: ensure virtio_vdpa is ACTUALLY loaded -- it is what binds the
+  # VDUSE device into a usable (eth) netdev.  If absent, the device registers
+  # but no netdev ever materializes (the multi-session blocker: dmesg silent,
+  # virtio_vdpa missing from lsmod, vdpa device 'driver' symlink dangling).
+  if ! lsmod | grep -qw virtio_vdpa; then
+    sudo modprobe virtio_vdpa 2>/dev/null; sleep 2
+  fi
+  lsmod | grep -qw virtio_vdpa && echo "virtio_vdpa: loaded" || echo "WARN: virtio_vdpa not loaded"
   sudo ip netns add nsB 2>/dev/null; sudo ip netns exec nsB ip link set lo up 2>/dev/null
   sudo ip netns add nsA 2>/dev/null; sudo ip netns exec nsA ip link set lo up 2>/dev/null
   echo "VDUSE: name=$VDNAME char=$VDEV_CHAR"
