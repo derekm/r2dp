@@ -95,17 +95,35 @@ config() {
   sudo env LD_LIBRARY_PATH=/home/yescorp/r2dp-prefix/lib64 $CTL /tmp/r2dp-dpdk.sock sp-add dir=in action=protect src=$INNER_A dst=$INNER_B tsrc=$OUTER_A tdst=$OUTER_B 2>&1|tail -1
   sudo env LD_LIBRARY_PATH=/home/yescorp/r2dp-prefix/lib64 $CTL /tmp/r2dp-dpdk.sock sa-add dir=out spi=$SPI_BA src=$OUTER_B dst=$OUTER_A enc=aes-gcm-16 key=$KEY 2>&1|tail -1
   sudo env LD_LIBRARY_PATH=/home/yescorp/r2dp-prefix/lib64 $CTL /tmp/r2dp-dpdk.sock sp-add dir=out action=protect src=$INNER_B dst=$INNER_A tsrc=$OUTER_B tdst=$OUTER_A 2>&1|tail -1
+  # A route to inner B subnet via eth0 + neighbor pin to B's inner-tap MAC.
+  # Without the route, route-get on 10.0.2.1 is 'Network is unreachable';
+  # without the pin, ARP reply does not traverse the forwarder so ESP never
+  # transmits (clear_outer drop, esp=0).
+  sudo ip netns exec nsA ip route add $INNER_B dev eth0 2>/dev/null
+  INMAC=$(sudo ip netns exec nsB ip link show r2dp-tap-inner 2>/dev/null | grep -oE "([0-9a-f]{2}:){5}[0-9a-f]{2}" | head -1)
+  sudo ip netns exec nsA ip neigh replace $OUTER_B dev eth0 lladdr "$INMAC" 2>/dev/null
+  echo "A route: $(sudo ip netns exec nsA ip route get $RESP_ADDR 2>/dev/null | head -1)"
+  echo "A neigh: $(sudo ip netns exec nsA ip neigh show dev eth0 2>/dev/null | grep $OUTER_B | head -1)"
   echo "=== fwd SAD ==="; sudo env LD_LIBRARY_PATH=/home/yescorp/r2dp-prefix/lib64 $CTL /tmp/r2dp-dpdk.sock dump-sa 2>&1|tail -2
 }
 
 bench() {
-  # iperf3 server on B (nsB)
-  sudo ip netns exec nsB timeout 40 iperf3 -s -D -p 5201 --forceflush 2>&1|tail -1
+  # persistent iperf3 server on B (nsB)
+  sudo ip netns exec nsB pkill -f "iperf3 -s" 2>/dev/null; sleep 1
+  sudo ip netns exec nsB iperf3 -s -D -p 5201 --forceflush 2>&1|tail -1
   sleep 2
-  echo "iperf3 server: $(sudo ip netns exec nsB ss -ulpn 2>/dev/null | grep 5201 | wc -l) UDP listeners"
-  # client from A
-  echo "=== iperf3 UDP 2000M, 15s, from A ==="
-  sudo ip netns exec nsA timeout 20 iperf3 -B $INIT_ADDR -c $RESP_ADDR -u -b 2000M -t 12 --forceflush 2>&1 | tail -14
+  echo "=== tap-free VDUSE offered-load sweep ==="
+  for R in 100 1000 2000 3000 4000; do
+    O=$(sudo ip netns exec nsA timeout 24 iperf3 -B $INIT_ADDR -c $RESP_ADDR -u -b ${R}M -t 15 --forceflush 2>&1)
+    sendv=$(echo "$O" | grep -m1 -oE "[0-9.]+ (G|M)bits/sec")
+    recvv=$(echo "$O" | grep "receiver" | grep -oE "[0-9.]+ (G|M)bits/sec" | tail -1)
+    recvl=$(echo "$O" | grep "receiver"| grep -oE "[0-9]+/[0-9]+ \([0-9]+%\)" | tail -1)
+    F=$(fwdpid >/dev/null 2>&1; echo -n)
+    FP=$(pgrep -af "r2mc-fresh.*r2dp-fwd"|grep -v bash|awk '{print $1}'|head -1)
+    sudo kill -USR1 $FP 2>/dev/null; sleep 1
+    F=$(sudo grep -a "stats rx=" $LOG | tail -1)
+    echo "${R}M  send=${sendv} recv=${recvv} recvloss=${recvl}  ${F}"
+  done
 }
 
 case "${1:-}" in
