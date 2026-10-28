@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Flood unique-seq ESP AES-GCM frames on the VDUSE outer netdev.  Each frame
-seq increments so anti-replay accepts them; the forwarder decrypts each and
-delivers inner to the tap.  Count what we send."""
+"""Flood unique-seq ESP AES-GCM frames on the VDUSE outer netdev with an
+explicit SPI.  seq starts fresh so a freshly-installed SA's replay window
+accepts them.  Reuses gcm_kat-verified framing."""
 import socket, struct, sys, time
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 ENCKEY = bytes.fromhex("000102030405060708090a0b0c0d0e0f10111213")
 KEY16, SALT = ENCKEY[:16], ENCKEY[16:20]
-SPI = 0xBABE0001
 iface = sys.argv[1] if len(sys.argv) > 1 else "eth0"
-DUR = float(sys.argv[2]) if len(sys.argv) > 2 else 6
-RATE = int(sys.argv[3]) if len(sys.argv) > 3 else 40000
+SPI = int(sys.argv[2], 0) if len(sys.argv) > 2 else 0xBABE0001
+DUR = float(sys.argv[3]) if len(sys.argv) > 3 else 6
+RATE = int(sys.argv[4]) if len(sys.argv) > 4 else 2000
 
 def cks(b):
     if len(b) % 2: b += b"\x00"
@@ -20,12 +20,12 @@ def cks(b):
 
 def make(seq):
     inner = bytearray()
-    inner += struct.pack(">BBHHHBBH4s4s", 0x45, 0, 28, 0, seq % 1000, 64, 1, 0,
+    inner += struct.pack(">BBHHHBBH4s4s", 0x45, 0, 28, 0, seq & 0xffff, 64, 1, 0,
                          socket.inet_aton("10.0.1.1"), socket.inet_aton("10.0.2.1"))
     inner += b"\x08\x00\x00\x00" + struct.pack(">HH", 0x1234, seq & 0xffff)
     inner[10:12] = struct.pack(">H", cks(bytes(inner)))
-    trailer = b"\x00\x00\x00\x01"
-    iv8 = struct.pack(">Q", (seq << 16) | 0x01020304)[-8:]
+    trailer = b"\x00\x00\x00\x04"   # padlen=0, next_hdr=4 (IPIP) tunnel
+    iv8 = struct.pack(">Q", seq)[-8:]
     nonce = SALT + iv8
     aad = struct.pack(">II", SPI, seq & 0xffffffff)
     ct_icv = AESGCM(KEY16).encrypt(nonce, bytes(inner) + trailer, aad)
@@ -39,8 +39,8 @@ def make(seq):
 
 s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind((iface, 0))
 end = time.time() + DUR
-n = 0
+n = 1
 while time.time() < end:
     for _ in range(RATE):
         s.sendall(make(n)); n += 1
-print(f"sent {n} frames in {DUR}s on {iface}")
+print(f"sent {n-1} frames SPI={SPI:#x} in {DUR}s on {iface}")

@@ -1902,10 +1902,20 @@ distributor_main(void *arg)
 static inline int
 worker_inner_tx(struct dpdk_priv *d, int i)
 {
+	int p;
 	if (i >= 0 && i < (int)ARRAY_SIZE(d->inner_ports) &&
 	    d->inner_ports[i] >= 0)
-		return d->inner_ports[i];
-	return d->inner_port;
+		p = d->inner_ports[i];
+	else
+		p = d->inner_port;
+	/* Never hand a caller an invalid port_id (the RTE_MAX_ETHPORTS
+	 * sentinel or -1): rte_eth_tx_burst on it dereferences out-of-range
+	 * ETH dev metadata and faults.  A forwarder with no inner device
+	 * configured must drop, not crash, on a decrypted packet. */
+	if (p < 0 || p >= (int)RTE_MAX_ETHPORTS ||
+	    !rte_eth_dev_is_valid_port((uint16_t)p))
+		return RTE_MAX_ETHPORTS;
+	return p;
 }
 
 /* Is `port` one of our inner (plaintext) taps -- the shared inner_port or a
@@ -2042,6 +2052,14 @@ worker_outer(struct dp_worker *w, int port,
 			for (uint16_t i = 0; i < ndec; i++)
 				if (dec[i])
 					txq[ntx++] = dec[i];
+			if (to >= RTE_MAX_ETHPORTS) {
+				/* no inner device configured -- drop, don't
+				 * crash on an invalid TX port */
+				for (uint16_t i = 0; i < ntx; i++)
+					rte_pktmbuf_free(txq[i]);
+				w->n_tx += 0;
+				DROP(w, DR_TX_FULL, ntx);
+			} else {
 			uint16_t sent = rte_eth_tx_burst(to, w->qid, txq, ntx);
 			w->n_tx += sent;
 			DROP(w, DR_TX_FULL, ntx - sent);
@@ -2050,6 +2068,7 @@ worker_outer(struct dp_worker *w, int port,
 				    ndec, ntx, sent);
 			for (uint16_t i = sent; i < ntx; i++)
 				rte_pktmbuf_free(txq[i]);
+			}
 		}
 		/* esp_inbound owns and frees every ESP mbuf (matched or not). */
 	}
@@ -2069,11 +2088,17 @@ worker_outer(struct dp_worker *w, int port,
 		if (nf) {
 			if (is_udp(fwd[0]))
 				w->n_ike += nf;   /* IKE */
+			if (to >= RTE_MAX_ETHPORTS) {
+				for (uint16_t i = 0; i < nf; i++)
+					rte_pktmbuf_free(fwd[i]);
+				DROP(w, DR_TX_FULL, nf);
+			} else {
 			uint16_t sent = rte_eth_tx_burst(to, w->qid, fwd, nf);
 			w->n_tx += sent;
 			DROP(w, DR_TX_FULL, nf - sent);
 			for (uint16_t i = sent; i < nf; i++)
 				rte_pktmbuf_free(fwd[i]);
+			}
 		}
 		/* dropped-exception mbufs are freed here */
 		for (uint16_t i = 0; i < nex; i++)
