@@ -1872,7 +1872,22 @@ pkt_flow_hash(const struct rte_mbuf *mb)
  * 8 flows landed on 2 workers) and hands it to the forwarder: worker =
  * pkt_flow_hash % nworkers.  The mbuf's .port (set by rx_burst) is preserved
  * so the worker knows which side to process it on. */
-static int
+static inline int
+dist_port_nq(struct dpdk_priv *d, int port)
+{
+	/* number of RX queues configured for this port: a vhost/VDUSE port is
+	 * clamped to 1, everything else gets one queue per worker.  The
+	 * distributor must only drain queues that actually exist (draining
+	 * q = 1..nw on a 1-queue VDUSE port segfaults). */
+	struct rte_eth_dev_info di;
+	if (rte_eth_dev_info_get((uint16_t)port, &di) == 0 &&
+	    strstr(di.driver_name, "vhost"))
+		return 1;
+	return d->nworkers;
+}
+
+/* Software distributor: one lcore drains EVERY tap RX queue on both ports
+ * ... (keep) */
 distributor_main(void *arg)
 {
 	struct dpdk_priv *d = arg;
@@ -1888,7 +1903,10 @@ distributor_main(void *arg)
 	while (d->running) {
 		for (int pi = 0; pi < np; pi++) {
 			uint16_t p = ports[pi];
-			for (uint16_t q = 0; q < d->nworkers; q++) {
+			/* only drain queues that exist on this port (vhost/VDUSE
+			 * ports are clamped to 1) */
+			int nq = dist_port_nq(d, p);
+			for (uint16_t q = 0; q < (uint16_t)nq; q++) {
 				uint16_t nr = rte_eth_rx_burst(p, q, bufs, BURST_SZ);
 				for (uint16_t i = 0; i < nr; i++) {
 					struct dp_worker *w = &d->w[

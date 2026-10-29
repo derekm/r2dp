@@ -29,6 +29,7 @@ INIT_ADDR=10.0.1.1    # A inner
 
 fwd_pid() { pgrep -af "r2mc-fresh.*r2dp-fwd" | grep -v bash | awk '{print $1}' | head -1; }
 
+NW="${NWORKERS:-1}"
 teardown() {
   [ -f "$SESS" ] && sudo bash "$SRC/bench_teardown3.sh" "$SESS" >/dev/null 2>&1
   for p in $(pgrep -af "r2mc-fresh.*r2dp-fwd|dpdk-testpmd|iperf3"|grep -v bash|awk '{print $1}'); do sudo kill -9 $p 2>/dev/null; done
@@ -49,7 +50,7 @@ bringup() {
   sudo ip netns add nsA 2>/dev/null; sudo ip netns exec nsA ip link set lo up 2>/dev/null
   # forwarder in nsB: outer=VDUSE, inner=tap
   sudo bash "$SRC/bench_spawn3.sh" "$SESS" sudo ip netns exec nsB env LD_LIBRARY_PATH=$MB/lib64 bash -c \
-    "$FWD -n 1 -v -s /tmp/r2dp-dpdk.sock --no-pci -l 0-2 --vdev=crypto_aesni_mb0 --vdev=net_vhost0,iface=$VDEV_CHAR,queues=1 --vdev=net_tap1,iface=r2dp-tap-inner > $LOG 2>&1"
+    "$FWD -n $NW -v -s /tmp/r2dp-dpdk.sock --no-pci -l 0-$((NW)) --vdev=crypto_aesni_mb0 --vdev=net_vhost0,iface=$VDEV_CHAR,queues=1 --vdev=net_tap1,iface=r2dp-tap-inner > $LOG 2>&1"
   V=0; for i in $(seq 1 25); do [ -e "$VDEV_CHAR" ] && V=1 && break; sleep 1; done
   echo "VDUSE char created: $V"
   [ "$V" = 1 ] && sudo vdpa dev add name "$VDN" mgmtdev vduse 2>&1|head -2
