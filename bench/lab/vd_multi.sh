@@ -57,12 +57,17 @@ up() {
     [ "$V" = 1 ] && sudo vdpa dev add name "${VDNAME[$i]}" mgmtdev vduse 2>&1|head -1
     sleep 3
   done
-  # find each netdev by its vduse uevent name and put it in its netns
+  # find each netdev and put it in its netns.  Auto-named eth*, one per vdpa
+  # device.
+  ETHS=""
+  for n in $(ip -br link 2>/dev/null | awk '{print $1}'); do
+    if [ -e /sys/class/net/$n/device/uevent ] && grep -qi vduse /sys/class/net/$n/device/uevent 2>/dev/null; then
+      ETHS="$ETHS $n"
+    fi
+  done
+  ETHS_ARR=($ETHS)
   for i in $(seq 0 $((NS-1))); do
-    DEV=""
-    for n in $(ls /sys/class/net 2>/dev/null); do
-      [ -e "/sys/class/net/$n/device/uevent" ] && grep -qi "${VDNAME[$i]}" /sys/class/net/$n/device/uevent 2>/dev/null && DEV="$n" && break
-    done
+    DEV=${ETHS_ARR[$i]:-}
     if [ -n "$DEV" ]; then
       sudo ip link set "$DEV" netns vdi$i 2>&1|head -1
       sudo ip netns exec vdi$i ip addr add 192.0.2.$((i+2))/24 dev "$DEV" 2>/dev/null

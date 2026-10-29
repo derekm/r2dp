@@ -2180,11 +2180,18 @@ worker_inner(struct dp_worker *w, int port,
 	uint16_t nout = 0, nby = 0;
 	esp_outbound(w, nonesp, nnon, esp_out, &nout, &nby);
 
-	/* 3. prepend L2 to the ESP datagrams and tx to the outer (peer) tap */
+	/* 3. prepend L2 to the ESP datagrams and tx to the outer (peer) tap.
+	 *    Multi-initiator: worker i's inbound flows came in on outer_ports[i]
+	 *    (distributor assigns worker = flow_hash % nw), so its B->A egress
+	 *    goes back out that same outer port, not a single shared one. */
 	if (nout) {
 		uint16_t ntx = 0;
 		struct rte_mbuf *txq[BURST_SZ];
-		uint16_t to = (d->port_id >= 0) ? d->port_id : port;
+		int eport = d->port_id;
+		if (d->n_outer > 1 && w->qid < (int)ARRAY_SIZE(d->outer_ports) &&
+		    d->outer_ports[w->qid] >= 0)
+			eport = d->outer_ports[w->qid];
+		uint16_t to = (eport >= 0) ? (uint16_t)eport : (uint16_t)port;
 		for (uint16_t i = 0; i < nout; i++) {
 			struct rte_ether_hdr *eh;
 			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
@@ -2238,7 +2245,11 @@ worker_inner(struct dp_worker *w, int port,
 	if (nby) {
 		uint16_t ntx = 0;
 		struct rte_mbuf *txq[BURST_SZ];
-		uint16_t to = (d->port_id >= 0) ? d->port_id : port;
+		int eport = d->port_id;
+		if (d->n_outer > 1 && w->qid < (int)ARRAY_SIZE(d->outer_ports) &&
+		    d->outer_ports[w->qid] >= 0)
+			eport = d->outer_ports[w->qid];
+		uint16_t to = (eport >= 0) ? (uint16_t)eport : (uint16_t)port;
 		/* esp_outbound NULLs every slot it consumed or dropped, so
 		 * the survivors are exactly the bypass set (O(n), was O(n^2)) */
 		for (uint16_t i = 0; i < nnon; i++)
