@@ -697,8 +697,14 @@ port_init(struct dpdk_priv *d, uint16_t port, uint16_t nq)
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
-	/* M3: one RX/TX queue per worker (worker i polls queue i). */
+	/* M3: one RX/TX queue per worker (worker i polls queue i).  Except a
+	 * vhost/VDUSE port, which may expose only a single queue used by the
+	 * distributor (RX) and the workers on queue 0 (TX).  Clamp to the port's
+	 * real queue count so configure() doesn't fail on a 1-queue VDUSE port. */
 	uint16_t nrxq = nq, ntxq = nq;
+	if (strstr(dev_info.driver_name, "vhost")) {
+		nrxq = 1; ntxq = 1;
+	}
 	if (rte_eth_dev_configure(port, nrxq, ntxq, &conf) < 0)
 		return -rte_errno;
 	for (uint16_t q = 0; q < nrxq; q++)
@@ -1921,6 +1927,15 @@ worker_inner_tx(struct dpdk_priv *d, int i)
 /* Is `port` one of our inner (plaintext) taps -- the shared inner_port or a
  * per-worker fan-out tap?  Used to route a distributor-dequeued mbuf to the
  * inner (encrypt/B->A) path. */
+static inline int worker_txq(struct dpdk_priv *d, int port, int qid)
+{
+	/* vhost/VDUSE ports expose one queue; keep all TX on queue 0 there. */
+	struct rte_eth_dev_info di;
+	if (rte_eth_dev_info_get((uint16_t)port, &di) == 0 &&
+	    strstr(di.driver_name, "vhost"))
+		return 0;
+	return qid;
+}
 static inline int
 is_inner_port(struct dpdk_priv *d, int port)
 {
@@ -2182,7 +2197,7 @@ worker_inner(struct dp_worker *w, int port,
 			}
 			txq[ntx++] = esp_out[i];
 		}
-		uint16_t sent = rte_eth_tx_burst(to, w->qid, txq, ntx);
+		uint16_t sent = rte_eth_tx_burst(to, worker_txq(d, to, w->qid), txq, ntx);
 		w->n_tx += sent;
 		DROP(w, DR_TX_FULL, ntx - sent);
 		if (d->verbose)
@@ -2206,7 +2221,7 @@ worker_inner(struct dp_worker *w, int port,
 				txq[ntx++] = nonesp[i];
 		if (ntx && is_udp(txq[0]))
 			w->n_ike += ntx;
-		uint16_t sent = rte_eth_tx_burst(to, w->qid, txq, ntx);
+		uint16_t sent = rte_eth_tx_burst(to, worker_txq(d, to, w->qid), txq, ntx);
 		w->n_tx += sent;
 		DROP(w, DR_TX_FULL, ntx - sent);
 		for (uint16_t i = sent; i < ntx; i++)
