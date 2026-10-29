@@ -2334,7 +2334,12 @@ worker_main(void *arg)
 		} else {
 			/* legacy path (no distributor lcore available) */
 			struct rte_mbuf *b[BURST_SZ];
-			uint16_t nr2 = rte_eth_rx_burst(port, w->qid, b, BURST_SZ);
+			/* only poll a queue that exists on this port (a vhost/VDUSE
+			 * port is single-queue); multiple workers share it in the
+			 * legacy fallback rather than deref a missing queue */
+			int nq_on_port = dist_port_nq(d, port);
+			uint16_t q = (uint16_t)((w->qid < nq_on_port) ? w->qid : 0);
+			uint16_t nr2 = rte_eth_rx_burst(port, q, b, BURST_SZ);
 			if (nr2)
 				worker_outer(w, port, b, nr2);
 			if (d->inner_port >= 0) {
