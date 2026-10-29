@@ -252,6 +252,20 @@ struct dpdk_priv {
 	uint64_t            n_spd_fail; /* snapshot rebuilds that failed (ENOMEM) */
 	int                 verbose;
 	uint64_t            sa_gen;       /* last dp_sa.gen handed out */
+	/* Fair flow->worker distribution (distributor).  Can't hash to a worker:
+	 * a hash clusters flows onto a subset of workers (measured: 4 flows
+	 * collapsed to 2 of 4).  Instead track each distinct flow's assigned
+	 * worker so a flow stays on ONE worker (an rte_ipsec session / anti-replay
+	 * window is per-SA, not safe concurrently) while NEW flows are assigned
+	 * round-robin, giving fair balance.  key = 64-bit (outer dst ^ SPI for
+	 * ESP, src^dst^port/proto for inner). */
+	struct {
+		uint64_t   key;
+		uint8_t    worker;    /* index into d->w[] */
+		uint8_t    valid;
+	}               flow_tab[2048];
+	uint8_t         rr;         /* round-robin cursor for new flows */
+	uint8_t         n_flowtab;
 	char                tap_if[IFNAMSIZ];
 	volatile int        running;
 };
@@ -1886,12 +1900,61 @@ dist_port_nq(struct dpdk_priv *d, int port)
 	return d->nworkers;
 }
 
+/* Compute a stable on-wire flow key: ESP -> (outer dst, SPI) so one SA stays
+ * on one worker; inner -> (src^dst^proto) so each inner flow is distinct.
+ * Mirrors pkt_flow_hash's keying sans the % nw that clusters. */
+static uint64_t
+flow_key(const struct rte_mbuf *mb)
+{
+	const uint8_t *p = rte_pktmbuf_mtod(mb, const uint8_t *);
+	uint32_t pl = rte_pktmbuf_pkt_len(mb);
+	const struct rte_ipv4_hdr *ip;
+	uint64_t k;
+	if (pl < RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
+		return 0;
+	ip = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
+	k = ((uint64_t)ip->src_addr << 32) ^ ip->dst_addr ^ ip->next_proto_id;
+	if (ip->next_proto_id == IPPROTO_ESP && pl >= RTE_ETHER_HDR_LEN + 20 + 8) {
+		const struct rte_esp_hdr *es = (const struct rte_esp_hdr *)
+		    (p + RTE_ETHER_HDR_LEN + 20);
+		k = ((uint64_t)ntohl(es->spi) << 32) ^ ip->dst_addr;
+	}
+	return k;
+}
+
+/* Fair worker assignment for `key`: return the worker a flow already mapped to
+ * (keeping per-SA affinity), else assign round-robin and record it.  d->rr is
+ * the single-producer cursor (only the distributor calls this). */
+static struct dp_worker *
+dist_worker_for(struct dpdk_priv *d, uint64_t key)
+{
+	uint32_t nw = (uint32_t)d->nworkers;
+	if (nw == 0) nw = 1;
+	if (key != 0) {
+		for (uint32_t i = 0; i < (uint32_t)d->n_flowtab; i++) {
+			if (d->flow_tab[i].valid && d->flow_tab[i].key == key)
+				return &d->w[d->flow_tab[i].worker];
+		}
+	}
+	/* new flow: round-robin across workers (fair, no clustering) */
+	uint8_t w = d->rr;
+	d->rr = (uint8_t)((d->rr + 1) % nw);
+	if (key != 0 && d->n_flowtab < (int)ARRAY_SIZE(d->flow_tab)) {
+		d->flow_tab[d->n_flowtab].key = key;
+		d->flow_tab[d->n_flowtab].worker = w;
+		d->flow_tab[d->n_flowtab].valid = 1;
+		d->n_flowtab++;
+	}
+	return &d->w[w];
+}
+
 /* Software distributor: one lcore drains EVERY RX queue on both ports and
  * fans each packet out to the owning worker's SPSC ring.  This decouples
  * worker assignment from the PMD/kernel RSS hash (which is uneven -- e.g.
- * 8 flows landed on 2 workers) and hands it to the forwarder: worker =
- * pkt_flow_hash % nworkers.  The mbuf's .port (set by rx_burst) is preserved
- * so the worker knows which side to process it on. */
+ * 8 flows landed on 2 workers) and hands it to the forwarder: worker = a
+ * FAIR per-flow assignment (round-robin for new flows, affinity kept for
+ * existing ones).  The mbuf's .port (set by rx_burst) is preserved so the
+ * worker knows which side to process it on. */
 static int
 distributor_main(void *arg)
 {
@@ -1916,8 +1979,8 @@ distributor_main(void *arg)
 			for (uint16_t q = 0; q < (uint16_t)nq; q++) {
 				uint16_t nr = rte_eth_rx_burst(p, q, bufs, BURST_SZ);
 				for (uint16_t i = 0; i < nr; i++) {
-					struct dp_worker *w = &d->w[
-					    pkt_flow_hash(bufs[i]) % d->nworkers];
+					struct dp_worker *w =
+					    dist_worker_for(d, flow_key(bufs[i]));
 					if (rte_ring_sp_enqueue(w->rxq, bufs[i]) != 0)
 						rte_pktmbuf_free(bufs[i]);
 				}
