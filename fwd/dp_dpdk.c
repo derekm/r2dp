@@ -214,8 +214,14 @@ sa_live(const struct dp_sa *ds)
 }
 
 struct dpdk_priv {
-	int                 port_id;      /* outer tap (ESP side) */
+	int                 port_id;      /* first outer (ESP side) */
 	int                 inner_port;   /* inner tap (plaintext side) */
+	/* Multi-initiator: every vhost/VDUSE device is an OUTER (ESP ingress)
+	 * port, one per initiator.  outer_ports[] holds them all (port_id is
+	 * outer_ports[0]); the tap is the single INNER.  The distributor drains
+	 * every outer port and fans each initiator's flows to the workers. */
+	int                 outer_ports[64];
+	int                 n_outer;
 	/* A (fan-out): each worker TXes decrypted inner to its OWN inner tap
 	 * when >1 inner tap port is present, so the inner leg parallelizes
 	 * across taps/cores instead of funnelling through one shared TUN.
@@ -1866,19 +1872,13 @@ pkt_flow_hash(const struct rte_mbuf *mb)
 	return h;
 }
 
-/* Software distributor: one lcore drains EVERY tap RX queue on both ports
- * and fans each packet out to the owning worker's SPSC ring.  This decouples
- * worker assignment from the PMD/kernel RSS hash (which is uneven -- e.g.
- * 8 flows landed on 2 workers) and hands it to the forwarder: worker =
- * pkt_flow_hash % nworkers.  The mbuf's .port (set by rx_burst) is preserved
- * so the worker knows which side to process it on. */
+/* Dist number of RX queues actually configured on this port: vhost/VDUSE
+ * ports are clamped to 1 (see port_init), everything else one per worker.
+ * The distributor must only drain queues that exist -- draining q in
+ * 0..nworkers on a 1-queue VDUSE port segfaults. */
 static inline int
 dist_port_nq(struct dpdk_priv *d, int port)
 {
-	/* number of RX queues configured for this port: a vhost/VDUSE port is
-	 * clamped to 1, everything else gets one queue per worker.  The
-	 * distributor must only drain queues that actually exist (draining
-	 * q = 1..nw on a 1-queue VDUSE port segfaults). */
 	struct rte_eth_dev_info di;
 	if (rte_eth_dev_info_get((uint16_t)port, &di) == 0 &&
 	    strstr(di.driver_name, "vhost"))
@@ -1886,15 +1886,22 @@ dist_port_nq(struct dpdk_priv *d, int port)
 	return d->nworkers;
 }
 
-/* Software distributor: one lcore drains EVERY tap RX queue on both ports
- * ... (keep) */
+/* Software distributor: one lcore drains EVERY RX queue on both ports and
+ * fans each packet out to the owning worker's SPSC ring.  This decouples
+ * worker assignment from the PMD/kernel RSS hash (which is uneven -- e.g.
+ * 8 flows landed on 2 workers) and hands it to the forwarder: worker =
+ * pkt_flow_hash % nworkers.  The mbuf's .port (set by rx_burst) is preserved
+ * so the worker knows which side to process it on. */
+static int
 distributor_main(void *arg)
 {
 	struct dpdk_priv *d = arg;
 	uint16_t ports[65]; int np = 0;
 	struct rte_mbuf *bufs[BURST_SZ];
 
-	if (d->port_id >= 0) ports[np++] = (uint16_t)d->port_id;
+	for (size_t o = 0; o < (size_t)d->n_outer; o++)
+		if (d->outer_ports[o] >= 0)
+			ports[np++] = (uint16_t)d->outer_ports[o];
 	if (d->inner_port >= 0) ports[np++] = (uint16_t)d->inner_port;
 	for (size_t i = 0; i < ARRAY_SIZE(d->inner_ports); i++)
 		if (d->inner_ports[i] >= 0)
@@ -2447,8 +2454,10 @@ dpd_start(struct fwd_dp *dp)
 		}
 	}
 
-	if (port_init(d, d->port_id, (uint16_t)nw) < 0)
-		return -rte_errno;
+	for (size_t o = 0; o < (size_t)d->n_outer; o++)
+		if (d->outer_ports[o] >= 0)
+			if (port_init(d, d->outer_ports[o], (uint16_t)nw) < 0)
+				return -rte_errno;
 	/* inner (plaintext) tap is optional: single-tap mode (interop lab,
 	 * control-only) has only the outer port.  Also init any per-worker
 	 * fan-out inner taps (A): each such tap carries one worker's stateful
@@ -2665,32 +2674,60 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 
 	d->port_id = -1;
 	d->inner_port = -1;
+	d->n_outer = 0;
+	for (size_t i = 0; i < ARRAY_SIZE(d->outer_ports); i++)
+		d->outer_ports[i] = -1;
 	for (size_t i = 0; i < ARRAY_SIZE(d->inner_ports); i++)
 		d->inner_ports[i] = -1;
 	RTE_ETH_FOREACH_DEV(port) {
 		struct rte_eth_dev_info di;
-		if (rte_eth_dev_info_get(port, &di) == 0 &&
-		    (strstr(di.driver_name, "tap") ||
-		     strstr(di.driver_name, "memif") ||
-		     strstr(di.driver_name, "vhost"))) {
-			if (d->port_id < 0) {
-				d->port_id = port;                /* outer = ESP side */
-			} else if (d->inner_port < 0) {
-				d->inner_port = port;             /* inner = plaintext side */
-			} else {
-				/* A (fan-out): any further tap devices become
-				 * per-worker inner taps (workers own them by qid). */
-				for (size_t i = 0; i < ARRAY_SIZE(d->inner_ports); i++)
-					if (d->inner_ports[i] < 0) {
-						d->inner_ports[i] = (int)port;
-						break;
-					}
+		if (rte_eth_dev_info_get(port, &di) < 0)
+			continue;
+		int is_vhost = strstr(di.driver_name, "vhost") != NULL;
+		int is_tapr  = strstr(di.driver_name, "tap") != NULL ||
+		               strstr(di.driver_name, "memif") != NULL;
+		if (!is_vhost && !is_tapr)
+			continue;
+		if (is_vhost) {
+			/* every vhost/VDUSE device is an OUTER (ESP ingress) port,
+			 * one per initiator */
+			if (d->n_outer < (int)ARRAY_SIZE(d->outer_ports))
+				d->outer_ports[d->n_outer++] = (int)port;
+		} else if (d->port_id < 0 && d->n_outer == 0) {
+			d->port_id = port;              /* legacy: first tap = outer */
+		} else if (d->inner_port < 0) {
+			d->inner_port = port;         /* inner = plaintext side */
+		} else {
+			/* A (fan-out): further tap devices become per-worker
+			 * inner taps (workers own them by qid). */
+			for (size_t i = 0; i < ARRAY_SIZE(d->inner_ports); i++)
+				if (d->inner_ports[i] < 0) {
+					d->inner_ports[i] = (int)port;
+					break;
+				}
+		}
+	}
+	/* vhost present: port_id = first outer (ESP side); a vhost always wins
+	 * the outer role over any tap that was seen first in enumeration */
+	if (d->n_outer > 0) {
+		d->port_id = d->outer_ports[0];
+		/* if only vhost + one tap, the tap is the inner */
+		if (d->inner_port < 0) {
+			RTE_ETH_FOREACH_DEV(port) {
+				struct rte_eth_dev_info di;
+				int is_tapr;
+				if (rte_eth_dev_info_get(port, &di) < 0) continue;
+				is_tapr = strstr(di.driver_name, "tap") != NULL;
+				if (is_tapr && port != d->port_id) {
+					d->inner_port = (int)port;
+					break;
+				}
 			}
 		}
 	}
-	if (d->port_id < 0) {
-		fprintf(stderr, "r2dp-fwd: no tap port found "
-		    "(add --vdev=net_tap0,iface=r2dp-tap)\n");
+	if (d->port_id < 0 && d->inner_port < 0) {
+		fprintf(stderr, "r2dp-fwd: no tap/vhost port found "
+		    "(add --vdev=net_tap0,iface=r2dp-tap or net_vhost)\n");
 		return -ENODEV;
 	}
 
