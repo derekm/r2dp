@@ -32,7 +32,7 @@ test('r2dpctl-vs-mock', find_program('sh'), args: [files('ctl_test.sh'), mockfwd
 if ms >= 1 and dpdk.found()
   test('fwd-interop', find_program('bash'),
        args: [files('e2e/fwd_e2e.sh'), fwd_exe, r2dpctl_exe],
-       depends: [fwd_exe, r2dpctl_exe], timeout: 240, suite: ['e2e'])
+       depends: [fwd_exe, r2dpctl_exe], timeout: 600, suite: ['e2e'])   # ~3 min: 11 phases, ~110 packets, each sniffed
   if get_option('racoon2_prefix') != ''
     test('iked-fwd-e2e', find_program('bash'),
          args: [files('e2e/ike_fwd_e2e.sh'), get_option('racoon2_prefix'), fwd_exe],

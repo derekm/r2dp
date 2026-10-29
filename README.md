@@ -8,11 +8,18 @@ a separate project that speaks a PF_KEY-shaped protocol over a unix socket.
     iked / spmd ──(rcpfk_* ABI)── if_r2dp.c ──(r2dp, SOCK_SEQPACKET)── forwarder (DPDK)
 
 ## Status
-**M0, M1 and M1.5 done** (M1.5 = kernel reference backend, only partly verifiable where it was written — see `docs/MILESTONES.md`): protocol, client/server lib, racoon2 backend, and a working
-single-core DPDK forwarder (IPv4 ESP tunnel, AES-GCM) that real `iked`/`spmd`
-drive end to end. **M2+ not started.** No performance numbers exist yet — all
-testing ran on `--no-huge` virtual devices.
-See `docs/MILESTONES.md` for the full plan, exit gates, and findings.
+**M0, M1, M1.5 and M2 are done; M3+ is not started.** M2 is complete *except IPv6*, which is
+deliberately deferred (the development kernel has no IPv6 stack to test it against).
+
+- `r2dp-fwd`: a single-core DPDK forwarder — IPv4 ESP tunnel; AES-GCM and AES-CBC+HMAC-SHA1/2;
+  ESN; NAT-T; SA lifetimes with soft/hard expiry events — driven end to end by real `iked`/`spmd`,
+  including rekeying under load with zero packet loss.
+- `r2dp-kfwd` (M1.5): a reference backend that programs the Linux kernel's XFRM instead. Only
+  partly verifiable where it was written (that kernel has no ESP) — see `docs/MILESTONES.md`.
+- **No performance numbers exist.** Everything ran on `--no-huge` virtual devices on one CPU.
+
+`docs/MILESTONES.md` has the evidence, the deviations from the plan, and — just as important —
+what is *not* covered.
 
 ## Layout
 | path | what |

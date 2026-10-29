@@ -12,8 +12,9 @@
 #define MAXSP  1024
 #define MAXCLI 16
 
-struct sa_ent { int used, larval; struct r2dp_sa sa;
-                uint8_t enc[R2DP_MAX_KEY], auth[R2DP_MAX_KEY]; };
+struct sa_ent { int used, larval, soft_sent; struct r2dp_sa sa;
+                uint8_t enc[R2DP_MAX_KEY], auth[R2DP_MAX_KEY];
+                uint64_t added_mono, added_wall; };
 struct sp_ent { int used; struct r2dp_sp sp; };
 
 struct r2dp_cp {
@@ -25,7 +26,17 @@ struct r2dp_cp {
 	uint32_t next_spi, next_slid;
 	struct sa_ent sad[MAXSA];
 	struct sp_ent spd[MAXSP];
+	struct { int fd; uint32_t role; } cli[MAXCLI];   /* clients that completed HELLO */
+	unsigned ncli;
+	uint64_t ev_sent, ev_dropped;
 };
+
+static uint64_t mono_s(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec;
+}
 
 #define LOG(cp, ...) do { if ((cp)->o.verbose) { fprintf(stderr, "%s: ", (cp)->name); \
 	fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -137,6 +148,11 @@ static void do_hello(struct r2dp_cp *cp, int fd, const struct r2dp_msg *m)
 	memcpy(a.enc_caps, cp->caps.enc_caps, sizeof(a.enc_caps));
 	memcpy(a.integ_caps, cp->caps.integ_caps, sizeof(a.integ_caps));
 	LOG(cp, "HELLO role=%u pid=%u", h->role, h->pid);
+	{
+		unsigned i;
+		for (i = 0; i < cp->ncli; i++) if (cp->cli[i].fd == fd) break;
+		if (i < MAXCLI) { cp->cli[i].fd = fd; cp->cli[i].role = h->role; if (i == cp->ncli) cp->ncli++; }
+	}
 	r2dp_send(fd, R2DP_HELLO_ACK, m->h.seq, 0, 0, &a, sizeof(a), NULL, 0);
 }
 
@@ -172,6 +188,9 @@ static int sa_commit(struct r2dp_cp *cp, struct sa_ent *e, const struct r2dp_msg
 	int r = 0;
 
 	sa_store(e, m);
+	if (e->larval || !e->added_mono) {            /* lifetimes run from the first install, not from refreshes */
+		e->added_mono = mono_s(); e->added_wall = (uint64_t)time(NULL); e->soft_sent = 0;
+	}
 	e->larval = 0;
 	if (cp->h.sa_set)
 		r = cp->h.sa_set(cp->h.ctx, &e->sa, e->enc, e->auth);
@@ -290,6 +309,61 @@ void r2dp_cp_handle(struct r2dp_cp *cp, int fd, const struct r2dp_msg *m)
 	}
 }
 
+void r2dp_cp_client_gone(struct r2dp_cp *cp, int fd)
+{
+	for (unsigned i = 0; i < cp->ncli; i++)
+		if (cp->cli[i].fd == fd) { cp->cli[i] = cp->cli[--cp->ncli]; return; }
+}
+
+int r2dp_cp_sa_expired(struct r2dp_cp *cp, const struct r2dp_sa *key, int kind,
+                       const struct r2dp_sa_counters *ctr)
+{
+	struct sa_ent *e = sa_find(cp, key);
+	struct r2dp_sa ev;
+	int sent = 0;
+
+	if (!e || e->larval) return -ENOENT;
+	ev = e->sa;
+	ev.expired = (uint8_t)kind;
+	ev.cur_alloc = ctr ? ctr->alloc : 1;
+	ev.cur_add = e->added_wall;
+	ev.cur_use = ctr ? ctr->use : 0;
+	ev.cur_bytes = ctr ? ctr->bytes : 0;
+	log_sa(cp, kind == R2DP_EXPIRE_HARD ? "EXPIRE(hard)" : "EXPIRE(soft)", &ev);
+	for (unsigned i = 0; i < cp->ncli; i++) {
+		if (cp->cli[i].role == R2DP_ROLE_SPMD || cp->cli[i].role == R2DP_ROLE_CTL) continue;
+		if (r2dp_send_nowait(cp->cli[i].fd, R2DP_EXPIRE, 0, 0, R2DP_HF_NOKEYS, &ev, sizeof(ev), NULL, 0) == 0) {
+			sent++; cp->ev_sent++;
+		} else {
+			cp->ev_dropped++;
+			LOG(cp, "EXPIRE not delivered to fd=%d (client stalled or gone)", cp->cli[i].fd);
+		}
+	}
+	if (kind == R2DP_EXPIRE_HARD) memset(e, 0, sizeof(*e));
+	return sent;
+}
+
+void r2dp_cp_tick(struct r2dp_cp *cp)
+{
+	uint64_t now = mono_s();
+	if (!cp->o.sw_lifetimes) return;
+	for (int i = 0; i < MAXSA; i++) {
+		struct sa_ent *e = &cp->sad[i];
+		uint64_t age;
+		if (!e->used || e->larval) continue;
+		age = now - e->added_mono;
+		if (e->sa.lft_hard_time && age >= e->sa.lft_hard_time) {
+			struct r2dp_sa key = e->sa;
+			if (cp->h.sa_del) cp->h.sa_del(cp->h.ctx, &key);   /* stop using it first, then announce */
+			r2dp_cp_sa_expired(cp, &key, R2DP_EXPIRE_HARD, NULL);
+		} else if (e->sa.lft_soft_time && !e->soft_sent && age >= e->sa.lft_soft_time) {
+			struct r2dp_sa key = e->sa;
+			e->soft_sent = 1;
+			r2dp_cp_sa_expired(cp, &key, R2DP_EXPIRE_SOFT, NULL);
+		}
+	}
+}
+
 int r2dp_cp_dispatch(struct r2dp_cp *cp, int fd, const struct r2dp_msg *m, size_t n)
 {
 	int r = r2dp_validate(m, n);
@@ -350,6 +424,7 @@ int r2dp_srv_poll(struct r2dp_srv *s, struct r2dp_cp *cp, int timeout_ms)
 			continue;
 		}
 		LOG(cp, "drop client fd=%d: %s", pf[i + 1].fd, strerror(-r));
+		r2dp_cp_client_gone(cp, pf[i + 1].fd);
 		close(pf[i + 1].fd);
 		for (int j = 0; j < s->ncli; j++)
 			if (s->cli[j] == pf[i + 1].fd) { s->cli[j] = s->cli[--s->ncli]; break; }

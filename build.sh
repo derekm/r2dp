@@ -151,6 +151,13 @@ cmd_e2e() { # clean clone -> patch -> build racoon2 -> two-peer IKEv2 over veth 
     run "$ROOT/tests/e2e/fwd_e2e.sh" "$W/prefix/bin/r2dp-fwd" "$W/prefix/bin/r2dpctl"
     info "M1: iked + spmd + r2dp-fwd on both sides, IKEv2 over the exception path"
     run "$ROOT/tests/e2e/ike_fwd_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-fwd"
+    if [ "$MILESTONE" -ge 2 ] && [ -z "${E2E_QUICK:-}" ]; then
+      # Each variant is a full IKEv2 negotiation + traffic; E2E_QUICK=1 skips them (~5 min saved).
+      info "M2: ESN + forced NAT-T, rekeys driven only by the forwarder's byte-limit EXPIRE events, ping flood"
+      run env ESN=1 NATT=1 SA_BYTES=30000 FLOOD_COUNT=600 "$ROOT/tests/e2e/ike_fwd_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-fwd"
+      info "M2: AES-CBC + HMAC-SHA2-256 negotiated by iked, rekeys under flood"
+      run env ALG=cbc SA_BYTES=30000 FLOOD_COUNT=400 "$ROOT/tests/e2e/ike_fwd_e2e.sh" "$W/r2inst" "$W/prefix/bin/r2dp-fwd"
+    fi
   fi
 }
 
@@ -180,7 +187,8 @@ Commands:
   help         this text
 
 Options:
-  -m, --milestone N   highest milestone to build, 0-4 (default 0; M0 needs no DPDK)
+  -m, --milestone N   highest milestone to build, 0-4 (default 0; M0 needs no DPDK; M1+ builds the DPDK forwarder,
+                      and the M2 e2e variants run when N >= 2)
       --racoon2 PATH  racoon2 checkout for shim build (adds its build deps)
       --test-deps     also install netns/pcap test tooling
       --dpdk-min VER  minimum DPDK version (default $DPDK_MIN)

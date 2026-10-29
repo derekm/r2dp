@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <rte_acl.h>
@@ -35,6 +37,7 @@
 #include <rte_ethdev.h>
 #include <rte_hash.h>
 #include <rte_ip.h>
+#include <rte_udp.h>
 #include <rte_jhash.h>
 #include <rte_lcore.h>
 #include <rte_lpm.h>
@@ -50,23 +53,26 @@
 #define MAX_RT      64
 #define ETH_LEN     sizeof(struct rte_ether_hdr)
 #define ESP_HLEN    8                    /* SPI + SEQ */
-#define ESP_IV_LEN  8                    /* explicit IV (RFC 4106) */
-#define ESP_OVH     (sizeof(struct rte_ipv4_hdr) + ESP_HLEN + ESP_IV_LEN)
-#define ICV_LEN     16                   /* AES-GCM-16 */
 #define GCM_NONCE   12
 #define IV_OFFSET   (sizeof(struct rte_crypto_op) + sizeof(struct rte_crypto_sym_op))
 #define AAD_OFFSET  (IV_OFFSET + 16)
 #define META_OFFSET (AAD_OFFSET + 16)
 #define OP_PRIV     48
+#define NATT_PORT   4500                 /* RFC 3948 ESP-in-UDP / IKE floating port */
+#define UDP_HLEN    8
 #define PORT_BLACK  0
 #define PORT_RED    1
 #define PORT_TAP    2                    /* optional exception path to the kernel (IKE, ARP, ICMP) */
 
 /* ------------------------------------------------------------------ state */
 struct fwd_sa {
-	int used, inbound;
+	int used, inbound, dead, soft_sent, esn, natt;
+	uint16_t natt_sport, natt_dport;     /* network order; used for the UDP header we send */
+	struct r2dp_sa meta;                 /* what the control plane installed (key + lifetimes) */
+	uint64_t add_s, use_wall;            /* install time (monotonic s), last use (wall s) */
 	uint32_t src, dst, spi;              /* network order, as on the wire */
 	uint8_t salt[4];
+	uint8_t aead, icv, ivl, blk;         /* GCM: 1/16/8/4   CBC+HMAC: 0/icv/16/16 (ICV is the truncated HMAC) */
 	struct rte_cryptodev_sym_session *sess;
 	uint64_t gen;                        /* install order: newest wins on rekey */
 	uint64_t seq;                        /* outbound: last sequence used */
@@ -88,7 +94,8 @@ struct fwd_stats {
 	uint64_t esp_out, esp_in, bypass, discard;
 	uint64_t drop_not_us, drop_non_ip, drop_bad_ip, drop_ttl, drop_no_route;
 	uint64_t drop_no_sa, drop_no_sp_sa, drop_auth, drop_replay, drop_bad_esp;
-	uint64_t drop_policy, drop_local, drop_too_big, drop_seq, drop_nobuf, drop_crypto;
+	uint64_t drop_policy, drop_local, drop_too_big, drop_seq, drop_nobuf, drop_crypto, drop_expired;
+	uint64_t exp_soft, exp_hard, natt_keepalive;
 };
 
 static struct {
@@ -108,7 +115,34 @@ static struct {
 	struct fwd_route rt[MAX_RT];
 	int nrt;
 	struct fwd_stats st;
+	struct r2dp_cp *cp;
+	int expire_pending;                  /* a byte limit was crossed: scan now, not at the next tick */
 } G;
+
+/* Unpredictable per-packet IVs: bulk getrandom(2), refilled when empty. */
+static void fill_iv(uint8_t *dst, unsigned n)
+{
+	static uint8_t pool[4096];
+	static unsigned left;
+	if (left < n) {
+		size_t got = 0;
+		while (got < sizeof(pool)) {
+			ssize_t r = getrandom(pool + got, sizeof(pool) - got, 0);
+			if (r < 0) { if (errno == EINTR) continue; abort(); }   /* no entropy source: refuse to send predictable IVs */
+			got += (size_t)r;
+		}
+		left = sizeof(pool);
+	}
+	memcpy(dst, pool + (sizeof(pool) - left), n);
+	left -= n;
+}
+
+static uint64_t now_s(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+	return (uint64_t)ts.tv_sec;
+}
 
 static volatile sig_atomic_t g_stop, g_dump;
 
@@ -244,29 +278,60 @@ static int hook_sa_set(void *ctx, const struct r2dp_sa *sa, const uint8_t *enc, 
 	struct fwd_sa *e;
 	struct rte_cryptodev_sym_session *sess;
 	uint32_t src, dst;
-	int pos, inbound;
+	int pos, inbound, esn, aead;
+	uint8_t icv, ivl, blk;
 	unsigned klen;
-	(void)ctx; (void)auth;
+	(void)ctx;
 
 	if (sa->proto != R2DP_PROTO_ESP) return -EOPNOTSUPP;
 	if (sa->mode != R2DP_MODE_TUNNEL) return -EOPNOTSUPP;
-	if (sa->enc != R2DP_ENCR_AES_GCM_16 || sa->integ != R2DP_INTEG_NONE) return -EOPNOTSUPP;
-	if (sa->saflags & R2DP_SAF_ESN) return -EOPNOTSUPP;          /* M2 */
-	if (sa->natt_type != R2DP_NATT_NONE) return -EOPNOTSUPP;     /* M2 */
 	if (sa->src.family != R2DP_AF_INET4 || sa->dst.family != R2DP_AF_INET4) return -EAFNOSUPPORT;
-	if (sa->enckeylen != 20 && sa->enckeylen != 36) return -EINVAL;   /* key || 4-byte salt */
-	klen = sa->enckeylen - 4;
 	memcpy(&src, sa->src.addr, 4); memcpy(&dst, sa->dst.addr, 4);
 	inbound = (dst == G.local_ip);
+	esn = !!(sa->saflags & R2DP_SAF_ESN);
 
-	memset(&xf, 0, sizeof(xf));
-	xf.type = RTE_CRYPTO_SYM_XFORM_AEAD;
-	xf.aead.op = inbound ? RTE_CRYPTO_AEAD_OP_DECRYPT : RTE_CRYPTO_AEAD_OP_ENCRYPT;
-	xf.aead.algo = RTE_CRYPTO_AEAD_AES_GCM;
-	xf.aead.key.data = enc; xf.aead.key.length = klen;
-	xf.aead.iv.offset = IV_OFFSET; xf.aead.iv.length = GCM_NONCE;
-	xf.aead.digest_length = ICV_LEN; xf.aead.aad_length = ESP_HLEN;
-	if (!(sess = rte_cryptodev_sym_session_create(G.cdev, &xf, G.sess_pool))) return -EOPNOTSUPP;
+	if (sa->enc == R2DP_ENCR_AES_GCM_16 && sa->integ == R2DP_INTEG_NONE) {
+		if (sa->enckeylen != 20 && sa->enckeylen != 36) return -EINVAL;   /* key || 4-byte salt */
+		aead = 1; icv = 16; ivl = 8; blk = 4; klen = sa->enckeylen - 4;
+		memset(&xf, 0, sizeof(xf));
+		xf.type = RTE_CRYPTO_SYM_XFORM_AEAD;
+		xf.aead.op = inbound ? RTE_CRYPTO_AEAD_OP_DECRYPT : RTE_CRYPTO_AEAD_OP_ENCRYPT;
+		xf.aead.algo = RTE_CRYPTO_AEAD_AES_GCM;
+		xf.aead.key.data = enc; xf.aead.key.length = klen;
+		xf.aead.iv.offset = IV_OFFSET; xf.aead.iv.length = GCM_NONCE;
+		xf.aead.digest_length = icv; xf.aead.aad_length = esn ? ESP_HLEN + 4 : ESP_HLEN;   /* ESN: SPI|seq_hi|seq_lo */
+		sess = rte_cryptodev_sym_session_create(G.cdev, &xf, G.sess_pool);
+	} else if (sa->enc == R2DP_ENCR_AES_CBC) {
+		struct rte_crypto_sym_xform cx, ax;
+		enum rte_crypto_auth_algorithm aalg;
+		unsigned akey;
+		switch (sa->integ) {
+		case R2DP_INTEG_HMAC_SHA1_96:      aalg = RTE_CRYPTO_AUTH_SHA1_HMAC;   icv = 12; akey = 20; break;
+		case R2DP_INTEG_HMAC_SHA2_256_128: aalg = RTE_CRYPTO_AUTH_SHA256_HMAC; icv = 16; akey = 32; break;
+		case R2DP_INTEG_HMAC_SHA2_384_192: aalg = RTE_CRYPTO_AUTH_SHA384_HMAC; icv = 24; akey = 48; break;
+		case R2DP_INTEG_HMAC_SHA2_512_256: aalg = RTE_CRYPTO_AUTH_SHA512_HMAC; icv = 32; akey = 64; break;
+		default: return -EOPNOTSUPP;
+		}
+		if (esn) return -EOPNOTSUPP;      /* ESN with HMAC needs seq_hi spliced into the authenticated data: AEAD only for now */
+		if (sa->enckeylen != 16 && sa->enckeylen != 24 && sa->enckeylen != 32) return -EINVAL;
+		if (sa->authkeylen != akey) return -EINVAL;
+		aead = 0; ivl = 16; blk = 16; klen = sa->enckeylen;
+		memset(&cx, 0, sizeof(cx)); memset(&ax, 0, sizeof(ax));
+		cx.type = RTE_CRYPTO_SYM_XFORM_CIPHER;
+		cx.cipher.op = inbound ? RTE_CRYPTO_CIPHER_OP_DECRYPT : RTE_CRYPTO_CIPHER_OP_ENCRYPT;
+		cx.cipher.algo = RTE_CRYPTO_CIPHER_AES_CBC;
+		cx.cipher.key.data = enc; cx.cipher.key.length = klen;
+		cx.cipher.iv.offset = IV_OFFSET; cx.cipher.iv.length = 16;
+		ax.type = RTE_CRYPTO_SYM_XFORM_AUTH;
+		ax.auth.op = inbound ? RTE_CRYPTO_AUTH_OP_VERIFY : RTE_CRYPTO_AUTH_OP_GENERATE;
+		ax.auth.algo = aalg; ax.auth.key.data = auth; ax.auth.key.length = akey; ax.auth.digest_length = icv;
+		/* encrypt-then-MAC on send, verify-then-decrypt on receive: the chain order is the processing order */
+		if (inbound) { ax.next = &cx; sess = rte_cryptodev_sym_session_create(G.cdev, &ax, G.sess_pool); }
+		else         { cx.next = &ax; sess = rte_cryptodev_sym_session_create(G.cdev, &cx, G.sess_pool); }
+	} else {
+		return -EOPNOTSUPP;
+	}
+	if (!sess) return -EOPNOTSUPP;
 
 	k.spi = sa->spi; k.dst = dst;
 	pos = rte_hash_lookup(G.sad, &k);
@@ -277,13 +342,29 @@ static int hook_sa_set(void *ctx, const struct r2dp_sa *sa, const uint8_t *enc, 
 		rte_cryptodev_sym_session_free(G.cdev, G.sa[pos].sess);   /* key refresh: keep counters */
 	}
 	e = &G.sa[pos];
-	e->used = 1; e->inbound = inbound; e->src = src; e->dst = dst; e->spi = sa->spi;
-	memcpy(e->salt, enc + klen, 4);
+	e->used = 1; e->inbound = inbound; e->esn = esn; e->src = src; e->dst = dst; e->spi = sa->spi;
+	e->natt = sa->natt_type == R2DP_NATT_ESPINUDP;
+	e->natt_sport = sa->natt_sport ? sa->natt_sport : rte_cpu_to_be_16(NATT_PORT);
+	e->natt_dport = sa->natt_dport ? sa->natt_dport : rte_cpu_to_be_16(NATT_PORT);
+	e->aead = (uint8_t)aead; e->icv = icv; e->ivl = ivl; e->blk = blk;
+	if (aead) memcpy(e->salt, enc + klen, 4); else memset(e->salt, 0, 4);
 	e->sess = sess;
-	if (!e->gen) e->gen = ++G.sa_gen;
+	e->meta = *sa;                                   /* limits may change on refresh; add time never does */
+	e->dead = 0;
+	if (!e->gen) { e->gen = ++G.sa_gen; e->add_s = now_s(); e->soft_sent = 0; }
 	rebind();
 	if (G.verbose) fprintf(stderr, "fwd: SA %s spi=0x%08x installed\n", inbound ? "in" : "out", rte_be_to_cpu_32(sa->spi));
 	return 0;
+}
+
+/* Remove an SA from the datapath (does not touch the control plane). */
+static void dp_sa_remove(int pos)
+{
+	struct hkey k = { .spi = G.sa[pos].spi, .dst = G.sa[pos].dst };
+	if (G.sa[pos].sess) rte_cryptodev_sym_session_free(G.cdev, G.sa[pos].sess);
+	memset(&G.sa[pos], 0, sizeof(G.sa[pos]));
+	rte_hash_del_key(G.sad, &k);
+	rebind();
 }
 
 static void hook_sa_del(void *ctx, const struct r2dp_sa *sa)
@@ -296,10 +377,60 @@ static void hook_sa_del(void *ctx, const struct r2dp_sa *sa)
 	memcpy(&dst, sa->dst.addr, 4);
 	k.spi = sa->spi; k.dst = dst;
 	if ((pos = rte_hash_lookup(G.sad, &k)) < 0) return;
-	if (G.sa[pos].sess) rte_cryptodev_sym_session_free(G.cdev, G.sa[pos].sess);
-	memset(&G.sa[pos], 0, sizeof(G.sa[pos]));
-	rte_hash_del_key(G.sad, &k);
-	rebind();
+	dp_sa_remove(pos);
+}
+
+/*
+ * Lifetimes.  A hard limit takes the SA out of service FIRST and only then tells
+ * iked; a soft limit is reported once, with the real packet count (iked ignores a
+ * soft expiry of an SA that never carried traffic).  Time limits run from install.
+ */
+static void expire_scan(void)
+{
+	uint64_t now = now_s();
+	for (int i = 0; i < SAD_ENTRIES; i++) {
+		struct fwd_sa *a = &G.sa[i];
+		const struct r2dp_sa *m;
+		struct r2dp_sa_counters ctr;
+		uint64_t age;
+		int hard, soft;
+
+		if (!a->used) continue;
+		m = &a->meta; age = now - a->add_s;
+		hard = a->dead || (m->lft_hard_time && age >= m->lft_hard_time) ||
+		       (m->lft_hard_bytes && a->bytes >= m->lft_hard_bytes);
+		soft = !a->soft_sent && ((m->lft_soft_time && age >= m->lft_soft_time) ||
+		       (m->lft_soft_bytes && a->bytes >= m->lft_soft_bytes));
+		if (!hard && !soft) continue;
+		ctr.alloc = a->pkts; ctr.use = a->use_wall; ctr.bytes = a->bytes;
+		if (hard) {
+			struct r2dp_sa key = a->meta;                /* keep a copy: the slot is about to be wiped */
+			if (G.verbose) fprintf(stderr, "fwd: SA %s spi=0x%08x hard lifetime reached (age %lus, %lu bytes)\n",
+			                       a->inbound ? "in" : "out", rte_be_to_cpu_32(a->spi), (unsigned long)age, (unsigned long)a->bytes);
+			dp_sa_remove(i);
+			G.st.exp_hard++;
+			r2dp_cp_sa_expired(G.cp, &key, R2DP_EXPIRE_HARD, &ctr);
+		} else {
+			a->soft_sent = 1; G.st.exp_soft++;
+			if (G.verbose) fprintf(stderr, "fwd: SA %s spi=0x%08x soft lifetime reached (age %lus, %lu bytes, %lu pkts)\n",
+			                       a->inbound ? "in" : "out", rte_be_to_cpu_32(a->spi), (unsigned long)age,
+			                       (unsigned long)a->bytes, (unsigned long)a->pkts);
+			r2dp_cp_sa_expired(G.cp, &a->meta, R2DP_EXPIRE_SOFT, &ctr);
+		}
+	}
+	G.expire_pending = 0;
+}
+
+/* Called per packet after it was processed: account it, and arm an immediate scan on a byte limit. */
+static inline void sa_account(struct fwd_sa *sa, uint32_t plain_len)
+{
+	sa->pkts++; sa->bytes += plain_len;
+	sa->use_wall = (uint64_t)time(NULL);
+	if ((sa->meta.lft_hard_bytes && sa->bytes >= sa->meta.lft_hard_bytes) ||
+	    (!sa->soft_sent && sa->meta.lft_soft_bytes && sa->bytes >= sa->meta.lft_soft_bytes)) {
+		if (sa->meta.lft_hard_bytes && sa->bytes >= sa->meta.lft_hard_bytes) sa->dead = 1;
+		G.expire_pending = 1;
+	}
 }
 
 static int sp_slot(uint32_t slid, int create)
@@ -465,7 +596,7 @@ static const struct fwd_sp *spd_lookup(struct rte_acl_ctx *ctx, const struct key
 }
 
 /* ------------------------------------------------- crypto op batch helper */
-struct opmeta { struct fwd_sa *sa; const struct fwd_route *rt; };
+struct opmeta { struct fwd_sa *sa; const struct fwd_route *rt; uint32_t plain_len; uint64_t seq; };
 
 static struct rte_crypto_op *op_new(struct rte_mbuf *m, struct fwd_sa *sa, const struct fwd_route *rt)
 {
@@ -475,7 +606,7 @@ static struct rte_crypto_op *op_new(struct rte_mbuf *m, struct fwd_sa *sa, const
 	rte_crypto_op_attach_sym_session(op, sa->sess);
 	op->sym->m_src = m; op->sym->m_dst = NULL;
 	meta = rte_crypto_op_ctod_offset(op, struct opmeta *, META_OFFSET);
-	meta->sa = sa; meta->rt = rt;
+	meta->sa = sa; meta->rt = rt; meta->plain_len = 0; meta->seq = 0;
 	return op;
 }
 
@@ -533,43 +664,72 @@ static void handle_red(struct rte_mbuf **pk, unsigned n)
 			struct rte_ipv4_hdr *o;
 			uint8_t *h, *t, *iv, *aad;
 			uint16_t inner = rte_be_to_cpu_16(ip->total_length);
-			unsigned pad = (4u - ((inner + 2u) & 3u)) & 3u, doff = ESP_OVH, dlen = inner + pad + 2u;
+			unsigned pad, dlen;                         /* padding to the cipher block, bytes to encrypt */
+			unsigned eo, ovh, doff;                     /* ESP offset / total encap overhead / start of ciphertext */
 			uint64_t seq;
 
 			if (sp->sa_idx < 0) { rte_pktmbuf_free(m); G.st.drop_no_sp_sa++; continue; }   /* M4: ACQUIRE */
 			sa = &G.sa[sp->sa_idx];
+			if (sa->dead) { rte_pktmbuf_free(m); G.st.drop_expired++; continue; }
 			if (!(rt = route_lookup(sa->dst))) { rte_pktmbuf_free(m); G.st.drop_no_route++; continue; }
-			if (inner + ESP_OVH + pad + 2u + ICV_LEN > RTE_ETHER_MTU) { rte_pktmbuf_free(m); G.st.drop_too_big++; continue; }
-			if ((seq = sa->seq + 1) > 0xffffffffull) { rte_pktmbuf_free(m); G.st.drop_seq++; continue; }
+			eo = sizeof(struct rte_ipv4_hdr) + (sa->natt ? UDP_HLEN : 0);     /* [IP][UDP?][ESP hdr][IV] */
+			ovh = eo + ESP_HLEN + sa->ivl; doff = ovh;
+			pad = (sa->blk - ((inner + 2u) % sa->blk)) % sa->blk; dlen = inner + pad + 2u;
+			if (inner + ovh + pad + 2u + sa->icv > RTE_ETHER_MTU) { rte_pktmbuf_free(m); G.st.drop_too_big++; continue; }
+			if ((seq = sa->seq + 1) > 0xffffffffull && !sa->esn) { rte_pktmbuf_free(m); G.st.drop_seq++; continue; }   /* no ESN: never wrap */
 			ip_fixup_ttl(ip);
-			if (!(t = (uint8_t *)rte_pktmbuf_append(m, pad + 2 + ICV_LEN))) { rte_pktmbuf_free(m); G.st.drop_nobuf++; continue; }
+			if (!(t = (uint8_t *)rte_pktmbuf_append(m, pad + 2 + sa->icv))) { rte_pktmbuf_free(m); G.st.drop_nobuf++; continue; }
 			for (unsigned j = 0; j < pad; j++) t[j] = (uint8_t)(j + 1);
 			t[pad] = (uint8_t)pad; t[pad + 1] = IPPROTO_IPIP;
-			if (!(h = (uint8_t *)rte_pktmbuf_prepend(m, ESP_OVH))) { rte_pktmbuf_free(m); G.st.drop_nobuf++; continue; }
+			if (!(h = (uint8_t *)rte_pktmbuf_prepend(m, ovh))) { rte_pktmbuf_free(m); G.st.drop_nobuf++; continue; }
 			sa->seq = seq;
 			o = (struct rte_ipv4_hdr *)h;
 			memset(o, 0, sizeof(*o));
 			o->version_ihl = 0x45;
-			o->type_of_service = ((struct rte_ipv4_hdr *)(h + ESP_OVH))->type_of_service;
+			o->type_of_service = ((struct rte_ipv4_hdr *)(h + ovh))->type_of_service;
 			o->total_length = rte_cpu_to_be_16((uint16_t)m->pkt_len);
 			o->packet_id = rte_cpu_to_be_16((uint16_t)seq);
-			o->time_to_live = 64; o->next_proto_id = IPPROTO_ESP;
+			o->time_to_live = 64; o->next_proto_id = sa->natt ? IPPROTO_UDP : IPPROTO_ESP;
 			o->src_addr = sa->src; o->dst_addr = sa->dst;
 			o->hdr_checksum = rte_ipv4_cksum(o);
+			if (sa->natt) {                                 /* RFC 3948: checksum 0, ESP follows directly */
+				struct rte_udp_hdr *u = (struct rte_udp_hdr *)(h + sizeof(struct rte_ipv4_hdr));
+				u->src_port = sa->natt_sport; u->dst_port = sa->natt_dport;
+				u->dgram_len = rte_cpu_to_be_16((uint16_t)(m->pkt_len - sizeof(struct rte_ipv4_hdr)));
+				u->dgram_cksum = 0;
+			}
 			{ uint32_t s32 = rte_cpu_to_be_32((uint32_t)seq); uint64_t s64 = rte_cpu_to_be_64(seq);
-			  memcpy(h + 20, &sa->spi, 4); memcpy(h + 24, &s32, 4); memcpy(h + 28, &s64, 8); }
+			  memcpy(h + eo, &sa->spi, 4); memcpy(h + eo + 4, &s32, 4);
+			  if (sa->aead) memcpy(h + eo + 8, &s64, 8);        /* GCM: the counter is a fine unique IV */
+			  else fill_iv(h + eo + 8, 16); }                    /* CBC: must be unpredictable */
 
 			if (!(op = op_new(m, sa, rt))) { rte_pktmbuf_free(m); G.st.drop_nobuf++; continue; }
-			op->sym->aead.data.offset = (uint32_t)doff;
-			op->sym->aead.data.length = dlen;
-			op->sym->aead.digest.data = rte_pktmbuf_mtod_offset(m, uint8_t *, doff + dlen);
-			op->sym->aead.digest.phys_addr = rte_pktmbuf_iova_offset(m, doff + dlen);
+			rte_crypto_op_ctod_offset(op, struct opmeta *, META_OFFSET)->plain_len = inner;
 			iv = rte_crypto_op_ctod_offset(op, uint8_t *, IV_OFFSET);
-			memcpy(iv, sa->salt, 4); memcpy(iv + 4, h + 28, 8);
-			aad = rte_crypto_op_ctod_offset(op, uint8_t *, AAD_OFFSET);
-			memcpy(aad, h + 20, ESP_HLEN);
-			op->sym->aead.aad.data = aad;
-			op->sym->aead.aad.phys_addr = rte_crypto_op_ctophys_offset(op, AAD_OFFSET);
+			if (sa->aead) {
+				op->sym->aead.data.offset = (uint32_t)doff;
+				op->sym->aead.data.length = dlen;
+				op->sym->aead.digest.data = rte_pktmbuf_mtod_offset(m, uint8_t *, doff + dlen);
+				op->sym->aead.digest.phys_addr = rte_pktmbuf_iova_offset(m, doff + dlen);
+				memcpy(iv, sa->salt, 4); memcpy(iv + 4, h + eo + 8, 8);
+				aad = rte_crypto_op_ctod_offset(op, uint8_t *, AAD_OFFSET);
+				if (sa->esn) {                                  /* SPI | seq_hi | seq_lo */
+					uint32_t hi = rte_cpu_to_be_32((uint32_t)(seq >> 32));
+					memcpy(aad, h + eo, 4); memcpy(aad + 4, &hi, 4); memcpy(aad + 8, h + eo + 4, 4);
+				} else {
+					memcpy(aad, h + eo, ESP_HLEN);
+				}
+				op->sym->aead.aad.data = aad;
+				op->sym->aead.aad.phys_addr = rte_crypto_op_ctophys_offset(op, AAD_OFFSET);
+			} else {                                            /* encrypt, then HMAC over ESP hdr | IV | ciphertext */
+				op->sym->cipher.data.offset = (uint32_t)doff;
+				op->sym->cipher.data.length = dlen;
+				op->sym->auth.data.offset = (uint32_t)eo;
+				op->sym->auth.data.length = (doff - eo) + dlen;
+				op->sym->auth.digest.data = rte_pktmbuf_mtod_offset(m, uint8_t *, doff + dlen);
+				op->sym->auth.digest.phys_addr = rte_pktmbuf_iova_offset(m, doff + dlen);
+				memcpy(iv, h + eo + 8, 16);
+			}
 			ops[nops++] = op;
 		}
 	}
@@ -580,13 +740,36 @@ static void handle_red(struct rte_mbuf **pk, unsigned n)
 			struct rte_mbuf *m = op->sym->m_src;
 			struct opmeta *meta = rte_crypto_op_ctod_offset(op, struct opmeta *, META_OFFSET);
 			if (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS) { rte_pktmbuf_free(m); G.st.drop_crypto++; }
-			else { meta->sa->pkts++; meta->sa->bytes += m->pkt_len; G.st.esp_out++; tx_queue(meta->rt, m); }
+			else { sa_account(meta->sa, meta->plain_len); G.st.esp_out++; tx_queue(meta->rt, m); }
 			rte_crypto_op_free(op);
 		}
 	}
 }
 
 /* ------------------------------------------------------------ black -> red */
+#define REPLAY_W 64
+
+/*
+ * ESN: only the low 32 bits travel on the wire.  Recover the high 32 from the
+ * highest authenticated sequence number (RFC 4303 Appendix A2.2).  Returns -1
+ * when the packet can only belong to a subspace before the first one.
+ */
+static int esn_seqh(const struct fwd_sa *sa, uint32_t seql, uint32_t *seqh)
+{
+	uint32_t tl = (uint32_t)sa->rp_top, th = (uint32_t)(sa->rp_top >> 32);
+	uint32_t bl = tl - (REPLAY_W - 1);                    /* wraps by design */
+
+	if (tl >= REPLAY_W - 1) {                             /* case A: window inside one subspace */
+		*seqh = seql >= bl ? th : th + 1;
+	} else if (seql >= bl) {                              /* case B: window straddles two subspaces */
+		if (!th) return -1;
+		*seqh = th - 1;
+	} else {
+		*seqh = th;
+	}
+	return 0;
+}
+
 static int replay_ok(const struct fwd_sa *sa, uint64_t seq)
 {
 	if (!seq) return 0;
@@ -608,13 +791,14 @@ static void replay_update(struct fwd_sa *sa, uint64_t seq)
 static void handle_black(struct rte_mbuf **pk, unsigned n)
 {
 	struct rte_crypto_op *ops[BURST], *done[BURST];
-	uint64_t seqs[BURST];                         /* indexed by op position */
 	unsigned nops = 0;
 
 	for (unsigned i = 0; i < n; i++) {
 		struct rte_mbuf *m = pk[i];
 		struct rte_ether_hdr *eth;
 		struct rte_ipv4_hdr *ip;
+
+		int natt_in = 0;                              /* arrived as ESP-in-UDP on the NAT-T port */
 
 		G.st.rx[PORT_BLACK]++;
 		if (m->data_len < ETH_LEN) { rte_pktmbuf_free(m); G.st.drop_non_ip++; continue; }
@@ -636,7 +820,24 @@ static void handle_black(struct rte_mbuf **pk, unsigned n)
 			if (!mine) { rte_pktmbuf_free(m); G.st.drop_not_us++; continue; }   /* IP broadcast/multicast: not handled */
 			if (m->data_len >= ETH_LEN + sizeof(struct rte_ipv4_hdr)) {
 				const struct rte_ipv4_hdr *pip = (const struct rte_ipv4_hdr *)(eth + 1);
-				if (pip->dst_addr == G.local_ip && pip->next_proto_id != IPPROTO_ESP && G.has_tap) {
+				unsigned phl = (pip->version_ihl & 0x0f) * 4u;
+				if (pip->dst_addr == G.local_ip && pip->next_proto_id == IPPROTO_UDP && phl >= sizeof(*pip) &&
+				    m->data_len >= ETH_LEN + phl + UDP_HLEN) {
+					/* UDP/4500 carries both IKE (4 zero bytes first: the non-ESP marker) and ESP; a lone
+					 * 0xFF is a NAT keepalive and is discarded (RFC 3948 section 2.2). */
+					const struct rte_udp_hdr *u = (const struct rte_udp_hdr *)((const uint8_t *)pip + phl);
+					if (u->dst_port == rte_cpu_to_be_16(NATT_PORT)) {
+						unsigned ulen = rte_be_to_cpu_16(u->dgram_len);
+						const uint8_t *pl = (const uint8_t *)(u + 1);
+						unsigned avail = m->data_len - (ETH_LEN + phl + UDP_HLEN);
+						if (ulen == UDP_HLEN + 1 && avail >= 1 && pl[0] == 0xff) {
+							rte_pktmbuf_free(m); G.st.natt_keepalive++; continue;
+						}
+						if (ulen >= UDP_HLEN + 4 && avail >= 4 && (pl[0] | pl[1] | pl[2] | pl[3]) != 0)
+							natt_in = 1;                    /* non-zero SPI position: ESP-in-UDP, fast path */
+					}
+				}
+				if (pip->dst_addr == G.local_ip && pip->next_proto_id != IPPROTO_ESP && !natt_in && G.has_tap) {
 					G.st.exc_in++; tx_raw(PORT_TAP, m);
 					continue;
 				}
@@ -645,38 +846,69 @@ static void handle_black(struct rte_mbuf **pk, unsigned n)
 		rte_pktmbuf_adj(m, ETH_LEN);
 		if (!(ip = ip_check(m))) { rte_pktmbuf_free(m); G.st.drop_bad_ip++; continue; }
 
-		if (ip->next_proto_id == IPPROTO_ESP && ip->dst_addr == G.local_ip) {
+		if ((ip->next_proto_id == IPPROTO_ESP || natt_in) && ip->dst_addr == G.local_ip) {
 			unsigned hl = (ip->version_ihl & 0x0f) * 4u, tot = rte_be_to_cpu_16(ip->total_length), enc_len;
-			const uint8_t *esp = (const uint8_t *)ip + hl;
+			unsigned eb = hl + (natt_in ? UDP_HLEN : 0);                   /* start of the ESP header */
+			const uint8_t *esp = (const uint8_t *)ip + eb;
 			struct hkey k; int pos;
 			struct fwd_sa *sa;
 			struct rte_crypto_op *op;
 			uint8_t *iv, *aad;
 			uint32_t seq32;
+			uint64_t seq64;
 
-			if (tot < hl + ESP_HLEN + ESP_IV_LEN + ICV_LEN + 4) { rte_pktmbuf_free(m); G.st.drop_bad_esp++; continue; }
+			if (tot < eb + ESP_HLEN + 8) { rte_pktmbuf_free(m); G.st.drop_bad_esp++; continue; }   /* need at least SPI+seq to look the SA up */
 			memcpy(&k.spi, esp, 4); k.dst = ip->dst_addr;
 			if ((pos = rte_hash_lookup(G.sad, &k)) < 0 || !G.sa[pos].inbound) { rte_pktmbuf_free(m); G.st.drop_no_sa++; continue; }
 			sa = &G.sa[pos];
+			if (sa->dead) { rte_pktmbuf_free(m); G.st.drop_expired++; continue; }
+			if (sa->natt != natt_in) { rte_pktmbuf_free(m); G.st.drop_bad_esp++; continue; }   /* wrong encapsulation for this SA */
 			memcpy(&seq32, esp + 4, 4); seq32 = rte_be_to_cpu_32(seq32);
-			if (!replay_ok(sa, seq32)) {
-				DROPLOG("replay(pre) spi=0x%08x seq=%u top=%lu", rte_be_to_cpu_32(sa->spi), seq32, sa->rp_top);
+			if (sa->esn) {
+				uint32_t seqh;
+				if (esn_seqh(sa, seq32, &seqh) < 0) {
+					DROPLOG("replay(esn,pre-origin) spi=0x%08x seql=%u top=%lu", rte_be_to_cpu_32(sa->spi), seq32, sa->rp_top);
+					rte_pktmbuf_free(m); G.st.drop_replay++; continue;
+				}
+				seq64 = ((uint64_t)seqh << 32) | seq32;
+			} else {
+				seq64 = seq32;
+			}
+			if (!replay_ok(sa, seq64)) {
+				DROPLOG("replay(pre) spi=0x%08x seq=%lu top=%lu", rte_be_to_cpu_32(sa->spi), (unsigned long)seq64, sa->rp_top);
 				rte_pktmbuf_free(m); G.st.drop_replay++; continue;
 			}
-			enc_len = tot - hl - ESP_HLEN - ESP_IV_LEN - ICV_LEN;
-			if (enc_len & 3u) { rte_pktmbuf_free(m); G.st.drop_bad_esp++; continue; }
+			/* the geometry depends on the SA's transform, so length checks come after the lookup */
+			if (tot < eb + ESP_HLEN + sa->ivl + sa->icv + sa->blk) { rte_pktmbuf_free(m); G.st.drop_bad_esp++; continue; }
+			enc_len = tot - eb - ESP_HLEN - sa->ivl - sa->icv;
+			if (enc_len % sa->blk) { rte_pktmbuf_free(m); G.st.drop_bad_esp++; continue; }
 			if (!(op = op_new(m, sa, NULL))) { rte_pktmbuf_free(m); G.st.drop_nobuf++; continue; }
-			op->sym->aead.data.offset = hl + ESP_HLEN + ESP_IV_LEN;
-			op->sym->aead.data.length = enc_len;
-			op->sym->aead.digest.data = rte_pktmbuf_mtod_offset(m, uint8_t *, tot - ICV_LEN);
-			op->sym->aead.digest.phys_addr = rte_pktmbuf_iova_offset(m, tot - ICV_LEN);
 			iv = rte_crypto_op_ctod_offset(op, uint8_t *, IV_OFFSET);
-			memcpy(iv, sa->salt, 4); memcpy(iv + 4, esp + ESP_HLEN, ESP_IV_LEN);
-			aad = rte_crypto_op_ctod_offset(op, uint8_t *, AAD_OFFSET);
-			memcpy(aad, esp, ESP_HLEN);
-			op->sym->aead.aad.data = aad;
-			op->sym->aead.aad.phys_addr = rte_crypto_op_ctophys_offset(op, AAD_OFFSET);
-			seqs[nops] = seq32;
+			if (sa->aead) {
+				op->sym->aead.data.offset = eb + ESP_HLEN + sa->ivl;
+				op->sym->aead.data.length = enc_len;
+				op->sym->aead.digest.data = rte_pktmbuf_mtod_offset(m, uint8_t *, tot - sa->icv);
+				op->sym->aead.digest.phys_addr = rte_pktmbuf_iova_offset(m, tot - sa->icv);
+				memcpy(iv, sa->salt, 4); memcpy(iv + 4, esp + ESP_HLEN, sa->ivl);
+				aad = rte_crypto_op_ctod_offset(op, uint8_t *, AAD_OFFSET);
+				if (sa->esn) {                                  /* the inferred high bits are authenticated, not trusted */
+					uint32_t hi = rte_cpu_to_be_32((uint32_t)(seq64 >> 32));
+					memcpy(aad, esp, 4); memcpy(aad + 4, &hi, 4); memcpy(aad + 8, esp + 4, 4);
+				} else {
+					memcpy(aad, esp, ESP_HLEN);
+				}
+				op->sym->aead.aad.data = aad;
+				op->sym->aead.aad.phys_addr = rte_crypto_op_ctophys_offset(op, AAD_OFFSET);
+			} else {                                            /* verify the HMAC over ESP hdr | IV | ciphertext, then decrypt */
+				op->sym->auth.data.offset = eb;
+				op->sym->auth.data.length = tot - eb - sa->icv;
+				op->sym->auth.digest.data = rte_pktmbuf_mtod_offset(m, uint8_t *, tot - sa->icv);
+				op->sym->auth.digest.phys_addr = rte_pktmbuf_iova_offset(m, tot - sa->icv);
+				op->sym->cipher.data.offset = eb + ESP_HLEN + sa->ivl;
+				op->sym->cipher.data.length = enc_len;
+				memcpy(iv, esp + ESP_HLEN, 16);
+			}
+			rte_crypto_op_ctod_offset(op, struct opmeta *, META_OFFSET)->seq = seq64;
 			ops[nops++] = op;
 			continue;
 		}
@@ -705,31 +937,31 @@ static void handle_black(struct rte_mbuf **pk, unsigned n)
 			struct fwd_sa *sa = meta->sa;
 			struct rte_ipv4_hdr *ip = rte_pktmbuf_mtod(m, struct rte_ipv4_hdr *), *in;
 			unsigned hl = (ip->version_ihl & 0x0f) * 4u, tot = rte_be_to_cpu_16(ip->total_length);
-			uint32_t seq32; uint8_t padlen, nxt;
+			unsigned eb = hl + (sa->natt ? UDP_HLEN : 0);
+			uint8_t padlen, nxt;
 			const uint8_t *tr;
 			const struct fwd_route *rt;
 			const struct fwd_sp *sp;
 			struct key4 key;
 
 			if (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
-				DROPLOG("auth spi=0x%08x seq=%u", rte_be_to_cpu_32(sa->spi), rte_be_to_cpu_32(*(uint32_t *)((uint8_t *)ip + hl + 4)));
+				DROPLOG("auth spi=0x%08x seq=%lu", rte_be_to_cpu_32(sa->spi), (unsigned long)meta->seq);
 				rte_pktmbuf_free(m); G.st.drop_auth++; rte_crypto_op_free(op); continue;
 			}
 			rte_crypto_op_free(op);
-			memcpy(&seq32, (const uint8_t *)ip + hl + 4, 4); seq32 = rte_be_to_cpu_32(seq32);
-			if (!replay_ok(sa, seq32)) {                       /* dup within one burst */
-				DROPLOG("replay(post) spi=0x%08x seq=%u top=%lu", rte_be_to_cpu_32(sa->spi), seq32, sa->rp_top);
+			if (!replay_ok(sa, meta->seq)) {                   /* dup within one burst */
+				DROPLOG("replay(post) spi=0x%08x seq=%lu top=%lu", rte_be_to_cpu_32(sa->spi), (unsigned long)meta->seq, sa->rp_top);
 				rte_pktmbuf_free(m); G.st.drop_replay++; continue;
 			}
-			replay_update(sa, seq32);
+			replay_update(sa, meta->seq);
 			/* trailer: ... pad | padlen | nexthdr | ICV */
-			tr = (const uint8_t *)ip + tot - ICV_LEN;
+			tr = (const uint8_t *)ip + tot - sa->icv;
 			padlen = tr[-2]; nxt = tr[-1];
-			if (nxt != IPPROTO_IPIP || tot < hl + ESP_HLEN + ESP_IV_LEN + padlen + 2u + ICV_LEN + sizeof(struct rte_ipv4_hdr)) {
+			if (nxt != IPPROTO_IPIP || tot < eb + ESP_HLEN + sa->ivl + padlen + 2u + sa->icv + sizeof(struct rte_ipv4_hdr)) {
 				rte_pktmbuf_free(m); G.st.drop_bad_esp++; continue;
 			}
-			rte_pktmbuf_trim(m, ICV_LEN + padlen + 2u);
-			rte_pktmbuf_adj(m, hl + ESP_HLEN + ESP_IV_LEN);
+			rte_pktmbuf_trim(m, sa->icv + padlen + 2u);
+			rte_pktmbuf_adj(m, eb + ESP_HLEN + sa->ivl);
 			if (!(in = ip_check(m))) { rte_pktmbuf_free(m); G.st.drop_bad_ip++; continue; }
 			/* inbound policy: the inner packet must match a PROTECT policy for THIS SA's tunnel */
 			fill_key(&key, in, m);
@@ -741,11 +973,10 @@ static void handle_black(struct rte_mbuf **pk, unsigned n)
 			if (in->time_to_live <= 1) { rte_pktmbuf_free(m); G.st.drop_ttl++; continue; }
 			if (!(rt = route_lookup(in->dst_addr))) { rte_pktmbuf_free(m); G.st.drop_no_route++; continue; }
 			ip_fixup_ttl(in);
-			sa->pkts++; sa->bytes += m->pkt_len; G.st.esp_in++;
+			sa_account(sa, m->pkt_len); G.st.esp_in++;
 			tx_queue(rt, m);
 		}
 	}
-	(void)seqs;
 }
 
 /* ------------------------------------------------------------- init / main */
@@ -757,10 +988,12 @@ static void dump_stats(void)
 	       s->rx[0], s->rx[1], s->tx[0], s->tx[1], s->esp_out, s->esp_in, s->bypass, s->discard,
 	       s->exc_in, s->exc_out);
 	printf("drops: not_us=%lu non_ip=%lu bad_ip=%lu ttl=%lu no_route=%lu no_sa=%lu no_sp_sa=%lu auth=%lu replay=%lu "
-	       "bad_esp=%lu policy=%lu local=%lu too_big=%lu seq=%lu nobuf=%lu crypto=%lu\n",
+	       "bad_esp=%lu policy=%lu local=%lu too_big=%lu seq=%lu nobuf=%lu crypto=%lu expired=%lu "
+	       "exp_soft=%lu exp_hard=%lu natt_keepalive=%lu\n",
 	       s->drop_not_us, s->drop_non_ip, s->drop_bad_ip, s->drop_ttl, s->drop_no_route, s->drop_no_sa,
 	       s->drop_no_sp_sa, s->drop_auth, s->drop_replay, s->drop_bad_esp, s->drop_policy, s->drop_local,
-	       s->drop_too_big, s->drop_seq, s->drop_nobuf, s->drop_crypto);
+	       s->drop_too_big, s->drop_seq, s->drop_nobuf, s->drop_crypto, s->drop_expired,
+	       s->exp_soft, s->exp_hard, s->natt_keepalive);
 	fflush(stdout);
 }
 
@@ -858,10 +1091,18 @@ int main(int argc, char **argv)
 	if (!(G.lpm = rte_lpm_create("rt", SOCKET_ID_ANY, &lc))) { fprintf(stderr, "fwd: LPM: %s\n", rte_strerror(rte_errno)); return 1; }
 	for (int i = 0; i < nr; i++) if (add_route(routes[i]) < 0) { fprintf(stderr, "fwd: bad --route %s\n", routes[i]); return 2; }
 
-	memset(&caps, 0, sizeof(caps));          /* M1: no ESN/NAT-T/IPv6/expiry */
+	memset(&caps, 0, sizeof(caps));
+	caps.features = R2DP_FEAT_ESN | R2DP_FEAT_EXPIRE | R2DP_FEAT_NATT;          /* IPv6 is not implemented yet */
 	caps.enc_caps[R2DP_ENCR_AES_GCM_16 >> 5] |= 1u << (R2DP_ENCR_AES_GCM_16 & 31);
 	caps.integ_caps[0] |= 1u;                /* NONE (AEAD) */
+	caps.enc_caps[R2DP_ENCR_AES_CBC >> 5] |= 1u << (R2DP_ENCR_AES_CBC & 31);
+	for (unsigned i = 0; i < 4; i++) {
+		static const unsigned ids[4] = { R2DP_INTEG_HMAC_SHA1_96, R2DP_INTEG_HMAC_SHA2_256_128,
+		                                 R2DP_INTEG_HMAC_SHA2_384_192, R2DP_INTEG_HMAC_SHA2_512_256 };
+		caps.integ_caps[ids[i] >> 5] |= 1u << (ids[i] & 31);
+	}
 	if (!(cp = r2dp_cp_new(&hooks, &caps, &opts))) return 1;
+	G.cp = cp;
 	if (!(srv = r2dp_srv_new(sock))) { perror("fwd: control socket"); return 1; }
 	signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGUSR1, on_sig); signal(SIGPIPE, SIG_IGN);
 	fprintf(stderr, "fwd: exception path %s\n", G.has_tap ? "enabled (port 2)" : "disabled (no third port)");
@@ -889,6 +1130,11 @@ int main(int argc, char **argv)
 			if (G.idle_us) rte_delay_us_sleep(G.idle_us);
 		} else if ((++iter & 63) == 0) {
 			r2dp_srv_poll(srv, cp, 0);
+		}
+		{
+			static uint64_t last;
+			uint64_t t = now_s();
+			if (G.expire_pending || t != last) { last = t; expire_scan(); }
 		}
 		if (g_dump) { g_dump = 0; dump_stats(); }
 	}

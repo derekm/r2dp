@@ -101,6 +101,7 @@ static int serve_uring(const char *path, struct r2dp_cp *cp)
 			if (res > 0 && r2dp_cp_dispatch(cp, c->fd, &c->msg, (size_t)res) == 0) {
 				if (arm_recv(&ring, c) == 0) { io_uring_submit(&ring); continue; }
 			}
+			r2dp_cp_client_gone(cp, c->fd);
 			close(c->fd); free(c);                      /* EOF, error, or protocol violation: drop */
 		}
 		io_uring_submit(&ring);

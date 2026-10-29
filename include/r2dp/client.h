@@ -25,6 +25,12 @@ int r2dp_send(int fd, uint16_t type, uint32_t seq, uint32_t status,
               uint32_t flags, const void *body, size_t blen,
               const void *tail, size_t tlen);
 
+/* Like r2dp_send() but never blocks (MSG_DONTWAIT): for unsolicited events, where a
+ * stalled client must not stall the forwarder.  -EAGAIN means the event was dropped. */
+int r2dp_send_nowait(int fd, uint16_t type, uint32_t seq, uint32_t status,
+                     uint32_t flags, const void *body, size_t blen,
+                     const void *tail, size_t tlen);
+
 /*
  * Receive one message and validate it.
  *   0           ok

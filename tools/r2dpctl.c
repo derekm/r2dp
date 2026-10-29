@@ -2,8 +2,9 @@
  * r2dpctl: talk to any r2dp forwarder (mock or DPDK) from the shell.
  *
  *   r2dpctl [-s sock] hello
- *   r2dpctl [-s sock] sa-add --spi N --src A --dst B --key HEX [--enc gcm8|gcm12|gcm16]
- *                            [--mode tunnel|transport] [--esn] [--reqid N] [--update]
+ *   r2dpctl [-s sock] sa-add --spi N --src A --dst B --key HEX [--enc gcm8|gcm12|gcm16|cbc]
+ *                            [--integ sha1|sha256|sha384|sha512 --akey HEX]   (for --enc cbc)
+ *                            [--mode tunnel|transport] [--esn] [--natt [S:D]] [--reqid N] [--update]
  *   r2dpctl [-s sock] sa-del --spi N --dst B
  *   r2dpctl [-s sock] sp-add --dir in|out|fwd --src CIDR --dst CIDR
  *                            --action protect|bypass|discard [--proto N] [--sport N] [--dport N]
@@ -52,6 +53,23 @@ static int parse_hex(uint8_t *out, size_t max, const char *s)
 	return (int)(n / 2);
 }
 
+static uint8_t enc_by_name(const char *n)
+{
+	static const struct { const char *name; uint8_t id; } t[] = {
+		{ "gcm8", R2DP_ENCR_AES_GCM_8 }, { "gcm12", R2DP_ENCR_AES_GCM_12 },
+		{ "gcm16", R2DP_ENCR_AES_GCM_16 }, { "cbc", R2DP_ENCR_AES_CBC } };
+	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) if (!strcmp(n, t[i].name)) return t[i].id;
+	return 0;
+}
+static uint8_t integ_by_name(const char *n)
+{
+	static const struct { const char *name; uint8_t id; } t[] = {
+		{ "sha1", R2DP_INTEG_HMAC_SHA1_96 }, { "sha256", R2DP_INTEG_HMAC_SHA2_256_128 },
+		{ "sha384", R2DP_INTEG_HMAC_SHA2_384_192 }, { "sha512", R2DP_INTEG_HMAC_SHA2_512_256 } };
+	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) if (!strcmp(n, t[i].name)) return t[i].id;
+	return 0;
+}
+
 static const char *errname(unsigned st) { return st ? strerror((int)st) : "ok"; }
 
 static int xfer(int fd, uint16_t type, uint32_t flags, const void *b, size_t bl,
@@ -85,8 +103,8 @@ int main(int argc, char **argv)
 		{"enc", 1, 0, 'e'}, {"mode", 1, 0, 'm'}, {"esn", 0, 0, 'E'}, {"reqid", 1, 0, 'r'},
 		{"update", 0, 0, 'u'}, {"dir", 1, 0, 'd'}, {"action", 1, 0, 'A'}, {"proto", 1, 0, 'p'},
 		{"sport", 1, 0, 'S'}, {"dport", 1, 0, 'D'}, {"tun-src", 1, 0, 't'}, {"tun-dst", 1, 0, 'T'},
-		{"slid", 1, 0, 'l'}, {0, 0, 0, 0} };
-	struct r2dp_sa sa; struct r2dp_sp sp; uint8_t key[R2DP_MAX_KEY]; int keylen = 0;
+		{"slid", 1, 0, 'l'}, {"natt", 2, 0, 'n'}, {"integ", 1, 0, 'I'}, {"akey", 1, 0, 'K'}, {0, 0, 0, 0} };
+	struct r2dp_sa sa; struct r2dp_sp sp; uint8_t key[R2DP_MAX_KEY], akey[R2DP_MAX_KEY]; int keylen = 0, akeylen = 0;
 	uint32_t spi = 0, slid = 0; int upd = 0, have_src = 0, have_dst = 0, have_tuns = 0, have_tund = 0;
 	const char *dirs = NULL, *acts = NULL;
 	memset(&sa, 0, sizeof(sa)); memset(&sp, 0, sizeof(sp));
@@ -111,8 +129,9 @@ int main(int argc, char **argv)
 			}
 			have_dst = 1; break;
 		case 'k': if ((keylen = parse_hex(key, sizeof(key), optarg)) < 0) return die("bad --key hex"); break;
-		case 'e': sa.enc = !strcmp(optarg, "gcm8") ? R2DP_ENCR_AES_GCM_8 : !strcmp(optarg, "gcm12") ? R2DP_ENCR_AES_GCM_12
-		               : !strcmp(optarg, "gcm16") ? R2DP_ENCR_AES_GCM_16 : 0; if (!sa.enc) return die("bad --enc"); break;
+		case 'e': if (!(sa.enc = enc_by_name(optarg))) return die("bad --enc"); break;
+		case 'I': if (!(sa.integ = integ_by_name(optarg))) return die("bad --integ"); break;
+		case 'K': if ((akeylen = parse_hex(akey, sizeof(akey), optarg)) < 0) return die("bad --akey hex"); break;
 		case 'm': sa.mode = sp.mode = !strcmp(optarg, "transport") ? R2DP_MODE_TRANSPORT : R2DP_MODE_TUNNEL; break;
 		case 'E': sa.saflags |= R2DP_SAF_ESN; break;
 		case 'r': sa.reqid = sp.reqid = (uint32_t)atoi(optarg); break;
@@ -125,6 +144,11 @@ int main(int argc, char **argv)
 		case 't': if (parse_addr(&sp.tun_src, optarg)) return die("bad --tun-src"); have_tuns = 1; break;
 		case 'T': if (parse_addr(&sp.tun_dst, optarg)) return die("bad --tun-dst"); have_tund = 1; break;
 		case 'l': slid = (uint32_t)atoi(optarg); break;
+		case 'n': {                                   /* ESP-in-UDP; optional SPORT:DPORT (default 4500:4500) */
+			unsigned sp = 4500, dp = 4500;
+			if (optarg && sscanf(optarg, "%u:%u", &sp, &dp) != 2) return die("bad --natt, use S:D");
+			sa.natt_type = R2DP_NATT_ESPINUDP; sa.natt_sport = htons((uint16_t)sp); sa.natt_dport = htons((uint16_t)dp);
+			break; }
 		default: return die("bad option");
 		}
 	}
@@ -140,8 +164,13 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(cmd, "sa-add")) {
 		if (!spi || !have_src || !have_dst || keylen <= 0) return die("sa-add needs --spi --src --dst --key");
-		sa.spi = htonl(spi); sa.enckeylen = (uint16_t)keylen;
-		r = xfer(fd, R2DP_SA_ADD, 0, &sa, sizeof(sa), key, keylen, &rep);
+		{
+			uint8_t tail[2 * R2DP_MAX_KEY];
+			if (sa.integ && akeylen <= 0) return die("--integ needs --akey");
+			sa.spi = htonl(spi); sa.enckeylen = (uint16_t)keylen; sa.authkeylen = (uint16_t)(akeylen > 0 ? akeylen : 0);
+			memcpy(tail, key, keylen); if (akeylen > 0) memcpy(tail + keylen, akey, akeylen);
+			r = xfer(fd, R2DP_SA_ADD, 0, &sa, sizeof(sa), tail, keylen + (akeylen > 0 ? akeylen : 0), &rep);
+		}
 	} else if (!strcmp(cmd, "sa-del")) {
 		if (!spi || !have_dst) return die("sa-del needs --spi --dst");
 		sa.spi = htonl(spi);

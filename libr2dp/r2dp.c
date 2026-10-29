@@ -76,9 +76,9 @@ int r2dp_accept(int lfd)
 	return fd < 0 ? -errno : fd;
 }
 
-int r2dp_send(int fd, uint16_t type, uint32_t seq, uint32_t status,
-              uint32_t flags, const void *body, size_t blen,
-              const void *tail, size_t tlen)
+static int send_msg(int fd, int msgflags, uint16_t type, uint32_t seq, uint32_t status,
+                    uint32_t flags, const void *body, size_t blen,
+                    const void *tail, size_t tlen)
 {
 	struct r2dp_hdr h;
 	struct iovec iov[3];
@@ -98,10 +98,18 @@ int r2dp_send(int fd, uint16_t type, uint32_t seq, uint32_t status,
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
-	do n = sendmsg(fd, &mh, MSG_NOSIGNAL); while (n < 0 && errno == EINTR);
+	do n = sendmsg(fd, &mh, MSG_NOSIGNAL | msgflags); while (n < 0 && errno == EINTR);
 	if (n < 0) return -errno;
 	return (size_t)n == total ? 0 : -EIO;
 }
+
+int r2dp_send(int fd, uint16_t type, uint32_t seq, uint32_t status, uint32_t flags,
+              const void *body, size_t blen, const void *tail, size_t tlen)
+{ return send_msg(fd, 0, type, seq, status, flags, body, blen, tail, tlen); }
+
+int r2dp_send_nowait(int fd, uint16_t type, uint32_t seq, uint32_t status, uint32_t flags,
+                     const void *body, size_t blen, const void *tail, size_t tlen)
+{ return send_msg(fd, MSG_DONTWAIT, type, seq, status, flags, body, blen, tail, tlen); }
 
 /* ----------------------------------------------------------- validation */
 static int body_size(unsigned type, size_t *min)

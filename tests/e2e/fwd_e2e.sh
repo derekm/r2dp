@@ -23,6 +23,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 D=/tmp/r2dp-fwd-e2e; NSP=r2fp; NSF=r2ff; NSH=r2fh
 K1=000102030405060708090a0b0c0d0e0f10111213     # peer->fwd (AES-128 key + 4B salt)
 K2=a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3     # fwd->peer
+K3=3031323334353637383940414243444546474849     # ESN pair, peer->fwd  (keep in sync with fwd_peer.py)
+K4=b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3     # ESN pair, fwd->peer
+K5=5051525354555657585960616263646566676869     # NAT-T pair, peer->fwd (keep in sync with fwd_peer.py)
+K6=d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3     # NAT-T pair, fwd->peer
 BACKEND="${BACKEND:-dpdk}"
 fail() { echo "FAIL: $*"; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "SKIP: needs root"; exit 77; }
@@ -92,7 +96,25 @@ peer() { ip netns exec $NSP python3 "$HERE/fwd_peer.py" vpb "$PMAC" "$BMAC" $K1 
 dump_stats() { kill -USR1 $FPID; sleep 0.5; grep -E "^(stats|drops):" "$D/fwd.out" | tail -2; }
 
 rc=0
-for ph in ${PHASES:-positive window negative}; do
+# AES-CBC + HMAC combos: "<--integ> <auth key bytes> <aes key bytes>", keys derived from the index (see fwd_peer.py)
+CBC_COMBOS=("sha1 20 16" "sha256 32 16" "sha384 48 16" "sha512 64 16" "sha256 32 24" "sha256 32 32")
+kgen() { local out="" i; for ((i = 0; i < $2; i++)); do out+=$(printf '%02x' $(( ($1 + i * $3) & 255 ))); done; echo "$out"; }
+cbc_install() {   # $1 = combo index
+	set -- $1 ${CBC_COMBOS[$1]}; local idx=$1 integ=$2 akl=$3 ekl=$4 spi_in=$((0x7000 + 2 * $1)) spi_out=$((0x7001 + 2 * $1))
+	c sa-add --spi $spi_in  --src 192.0.2.2 --dst 192.0.2.1 --enc cbc --integ $integ --key $(kgen $((idx*13+1)) $ekl 7) --akey $(kgen $((idx*13+5)) $akl 11) | grep -q "sa-add: ok" || fail "CBC combo $idx inbound SA rejected"
+	c sa-add --spi $spi_out --src 192.0.2.1 --dst 192.0.2.2 --enc cbc --integ $integ --key $(kgen $((idx*13+3)) $ekl 7) --akey $(kgen $((idx*13+9)) $akl 11) | grep -q "sa-add: ok" || fail "CBC combo $idx outbound SA rejected"
+}
+PH_ALL="positive window negative esn natt"; for i in "${!CBC_COMBOS[@]}"; do PH_ALL+=" cbc$i"; done
+for ph in ${PHASES:-$PH_ALL}; do
+	case "$ph" in cbc[0-9]*) cbc_install "${ph#cbc}" ;; esac
+	if [ "$ph" = natt ]; then
+		c sa-add --spi 0x5000 --src 192.0.2.2 --dst 192.0.2.1 --key $K5 --natt | grep -q "sa-add: ok" || fail "NAT-T inbound SA rejected"
+		c sa-add --spi 0x6000 --src 192.0.2.1 --dst 192.0.2.2 --key $K6 --natt | grep -q "sa-add: ok" || fail "NAT-T outbound SA rejected"
+	fi
+	if [ "$ph" = esn ]; then   # last on purpose: the newest outbound SA wins, so the earlier phases must be done
+		c sa-add --spi 0x3000 --src 192.0.2.2 --dst 192.0.2.1 --key $K3 --esn | grep -q "sa-add: ok" || fail "ESN inbound SA rejected"
+		c sa-add --spi 0x4000 --src 192.0.2.1 --dst 192.0.2.2 --key $K4 --esn | grep -q "sa-add: ok" || fail "ESN outbound SA rejected"
+	fi
 	echo "== phase: $ph"; peer $ph || rc=1
 	[ -n "${STATS_AFTER:-}" ] && dump_stats
 done
@@ -102,11 +124,18 @@ echo "== forwarder counters (exact: every packet must be accounted for)"
 val() { echo "$STATS" | grep -o " $1=[0-9]*" | tail -1 | cut -d= -f2; }
 eq() { v=$(val "$1"); if [ "${v:-x}" = "$2" ]; then echo "  ok   $1=$v"; else echo "  FAIL $1=${v:-?} (expected $2)"; rc=1; fi; }
 if [ -z "${PHASES:-}" ] && [ "$BACKEND" = dpdk ]; then
-	# 15 positive + 4 accepted in the window phase + 1 post-garbage control = 20 round trips
-	eq esp_in 20; eq esp_out 20; eq tx_red 20; eq tx_black 20
-	eq replay 3; eq auth 2; eq no_sa 1; eq policy 2; eq bad_esp 1
+	# 15 positive + 4 window + 1 post-garbage control + 7 ESN + 2 NAT-T = 29 complete round trips, plus one NAT-T
+	# request that was decrypted and forwarded but whose reply was too big (esp_in/tx_red = 30); then CBC+HMAC:
+	# 4 combos x 8 sizes + 2 combos x 2 sizes = 36 more complete round trips
+	eq esp_in 66; eq esp_out 65; eq tx_red 66; eq tx_black 65
+	# replay: 3 (window) + 1 (ESN); auth: 2 (negative) + 2 (ESN wrong-high / far-future)
+	# CBC hostile input: flipped ciphertext, ICV and IV bits = 3 more auth failures
+	eq replay 4; eq auth 7; eq no_sa 1; eq policy 2
+	# bad_esp: 1 truncated + 2 NAT-T encapsulation mismatches; local: the IKE-marker datagram (no exception path here)
+	# (+1 bad_esp: CBC ciphertext that is not a multiple of the block size)
+	eq bad_esp 4; eq too_big 1; eq local 1; eq natt_keepalive 1
 	# nothing else may have been dropped
-	for z in bad_ip ttl no_route no_sp_sa too_big seq nobuf crypto local bypass discard; do eq $z 0; done
+	for z in bad_ip ttl no_route no_sp_sa seq nobuf crypto bypass discard expired; do eq $z 0; done
 fi
 kill -0 $FPID 2>/dev/null || { echo "  FAIL forwarder crashed"; rc=1; }
 [ $rc = 0 ] && echo "PASS ($BACKEND): AES-GCM ESP tunnel interoperates with an independent implementation" || echo "FAILED (logs in $D)"

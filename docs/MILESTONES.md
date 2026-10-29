@@ -62,10 +62,30 @@ Purpose: a second, independent dataplane behind the same protocol, so the DPDK f
 - **Not done**: kernel → client events (`EXPIRE`, `ACQUIRE`) — the engine has no push path yet (an M2 prerequisite for both backends); cleanup of kernel state on exit; running the iked+spmd stack against kfwd.
 - **What changed from the prototypes**: they called an `r2dp_cp_new(handler, ...)` API that does not exist; sent zero-filled XFRM messages with the field mapping left as a comment; never read the kernel's ACK and always replied success (so they could not fail a conformance check); the io_uring one used `SOCK_STREAM` with fixed 4096-byte reads/writes against a `SOCK_SEQPACKET` protocol, built replies without magic/version/length (our own client rejects them), leaked accept state, bypassed the engine (no SPI allocation or EEXIST/ENOENT semantics), and would not compile (`errno` unincluded; misuse of `io_uring_sqe_get_data` on a CQE).
 
-## M2 — Lifecycle & protocol coverage
-- **Builds**: lifetime tick + EXPIRE, hard-expiry RCU swap, ESN + replay window, AES-CBC + HMAC-SHA2, IPv6, NAT-T (UDP/4500 demux, non-ESP marker), HELLO capability bitmaps driving `rcpfk_supported_*`.
-- **Deps**: none new (crypto_openssl / crypto_aesni_* vdevs).
-- **Exit gate**: soft expiry triggers iked rekey with no packet loss in a ping flood; `samples/linux-matrix` rows (incl. NAT-T, ESN) pass against the forwarder; kernel-XFRM oracle matches on all algs.
+## M2 — Lifecycle & protocol coverage  ✅ DONE except IPv6 (deliberately deferred)
+- **Built**
+  - *Events*: the control-plane engine can now push unsolicited messages. `r2dp_cp_sa_expired()` (soft/hard, best-effort, non-blocking, only to IKE-role clients, keys never included), per-client roles learned from HELLO, `r2dp_cp_client_gone()`, and `opts.sw_lifetimes` + `r2dp_cp_tick()` so the mock enforces time lifetimes (`r2dp-mockfwd -L`).
+  - *Lifetimes in `r2dp-fwd`*: per-SA packet/byte/age accounting; a hard limit takes the SA out of service first and only then tells iked; a soft limit is reported once with the real packet count (iked **ignores** a soft expiry whose `lft_current_alloc` is 0 — found by reading `ike_pfkey.c`, and enforced by tests). A crossed byte limit triggers an immediate scan instead of waiting for the 1 s tick.
+  - *ESN*: 64-bit sequence numbers, high-bit inference from the replay window (RFC 4303 A2.2), 12-byte AAD (SPI|seq_hi|seq_lo). AEAD only; ESN with CBC+HMAC is refused (`EOPNOTSUPP`) rather than done wrongly.
+  - *NAT-T*: ESP-in-UDP on 4500 both ways; UDP/4500 is demuxed three ways (non-zero SPI → fast path, 4 zero bytes → IKE via the exception path, lone `0xFF` → keepalive, dropped); an SA only accepts its own encapsulation.
+  - *AES-CBC (128/192/256) + HMAC-SHA1-96/SHA2-256-128/384-192/512-256*: chained cipher+auth cryptodev sessions, per-SA IV/ICV/block geometry, per-packet IVs from `getrandom(2)` (not `rte_rand()`).
+  - HELLO capability bitmaps now reflect what the forwarder really does (`FEAT_ESN|NATT|EXPIRE`, GCM-16, CBC, the four HMACs), so iked never proposes the rest.
+- **Exit gates — what was and was not met**
+  - ✅ **Soft expiry ⇒ iked rekey, no loss under a ping flood.** iked has its own *time* timer, so only a **byte** lifetime proves the forwarder→iked EXPIRE path (iked has no byte timer). 800 pings across ~8 rekey generations, 0% loss, 0 drops of any kind, iked logged every EXPIRE; the same flood with no rekeying is the 0%-loss baseline.
+  - ✅ **Every algorithm/feature matches an independent implementation.** `fwd_e2e.sh` (scapy) now has 11 phases / 108 checks with *exact* counters: GCM, anti-replay window edges, hostile input, ESN across 2³² (incl. forged high bits that fail authentication without moving the window), NAT-T (3-way demux, mismatched encapsulation, MTU accounting), and 6 AES-CBC+HMAC combinations over every ESP pad length.
+  - ✅ iked negotiates each of them itself: ESN, forced NAT-T, AES-CBC+HMAC-SHA2-256 (`ike_fwd_e2e.sh` variants, each with a rekey flood).
+  - ❌ **`samples/linux-matrix` rows against the forwarder: not run.** They need kernel XFRM + a service-managed racoon2, neither available here.
+  - ❌ **"Kernel-XFRM oracle matches on all algs": not met.** The sandbox kernel has no ESP/GCM, so scapy was the oracle. `BACKEND=kernel fwd_e2e.sh` exists but has never run past its skip check. Its phases (ESN, NAT-T, CBC) were added only to the DPDK path's expectations — the kernel mode will need extending and debugging on a real host.
+  - ⏸ **IPv6: deferred.** The sandbox kernel has no IPv6 at all (`socket(AF_INET6)` fails), so neighbour discovery through the exception path, iked over v6, and a kernel v6 host could not be exercised, and it needs a structural refactor (16-byte SAD key, v6 ACL fields, `rte_lpm6`) that would have put the verified paths at risk. Do it where a real IPv6 stack exists. Until then v6 traffic is dropped (fails closed) and v6 SAs are refused (`EAFNOSUPPORT`).
+- **Behaviour/limits worth knowing**
+  - Time lifetimes run from install (the protocol has no "from first use"); a soft expiry of an SA that never carried traffic is reported with `alloc = 0` and iked will ignore it by design.
+  - EXPIRE is best-effort: if a client's socket is full the event is dropped and counted; the hard limit still removes the SA.
+  - Byte counting is inner-packet bytes in both directions (kernel counts differently; do not compare absolute figures).
+  - NAT-T: no NAT-OA handling, no keepalive *sending*, no port roaming; UDP checksum is 0 on send and ignored on receive. Oversize (>1500 B after encapsulation) is dropped and counted, not fragmented (M4). The replay window is fixed at 64 whatever `wsize` says.
+  - CBC+HMAC: no MD5/XCBC/CMAC, no 3DES/CTR, no ESN.
+  - `r2dp-kfwd` does **not** yet forward kernel expiry notifications (`XFRM_MSG_EXPIRE`) to clients; the kernel enforces lifetimes itself but iked gets no push from it.
+  - Still no performance numbers (`--no-huge`, virtual devices, one CPU).
+- **Defects found while building M2** (fixed; kept as a map of the sharp edges): the soft/hard constants lived in the engine header where pure clients couldn't see them (moved to `proto.h`); a first draft of the engine test re-added an SA *with its lifetimes*, so stale events queued ahead of a `HELLO_ACK` — a reminder that **events can arrive between a request and its completion**, which the shim's scratch container already handles and now has a regression test for; a sequence-0 packet and an MTU-asymmetry assumption in my own test, both mine and both caught by the forwarder behaving correctly.
 
 ## M3 — Multicore & update safety
 - **Builds**: RSS multi-queue workers, per-lcore counters, rte_rcu_qsbr table swaps, SA-pinned ordering notes (one SA = one core), hugepage/NUMA setup docs.

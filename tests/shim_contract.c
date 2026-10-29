@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "vmbuf.h"
@@ -25,7 +27,9 @@ static int fails;
 /* callback recorder */
 static struct { int n_getspi, n_update, n_add, n_delete, n_get, n_spdadd, n_spddel2, n_spddump;
                 uint32_t spi, slid, seq_last, reqid; uint8_t satype, samode, dir, pltype;
-                struct sockaddr_storage dst; int dst_set; uint32_t seqs[8]; int nseq; } rec;
+                struct sockaddr_storage dst; int dst_set; uint32_t seqs[8]; int nseq;
+                int n_expire; uint8_t expired[4]; uint64_t exp_alloc; uint32_t exp_spi; uint8_t exp_satype, exp_samode;
+                uint32_t exp_reqid; int exp_dst_ok; } rec;
 
 static int on_getspi(struct rcpfk_msg *rc) { rec.n_getspi++; rec.spi = rc->spi; rec.seq_last = rc->seq;
 	rec.satype = rc->satype; rec.samode = rc->samode; rec.reqid = rc->reqid;
@@ -39,11 +43,19 @@ static int on_get(struct rcpfk_msg *rc) { (void)rc; rec.n_get++; return 0; }
 static int on_spdadd(struct rcpfk_msg *rc) { rec.n_spdadd++; rec.slid = rc->slid; rec.dir = rc->dir;
 	rec.pltype = rc->pltype; return 0; }
 static int on_spddel2(struct rcpfk_msg *rc) { (void)rc; rec.n_spddel2++; return 0; }
+static int on_expire(struct rcpfk_msg *rc)
+{
+	if (rec.n_expire < 4) rec.expired[rec.n_expire] = rc->expired;
+	rec.n_expire++; rec.exp_alloc = rc->lft_current_alloc; rec.exp_spi = rc->spi;
+	rec.exp_satype = rc->satype; rec.exp_samode = rc->samode; rec.exp_reqid = rc->reqid;
+	rec.exp_dst_ok = rc->sa_dst && rc->sa_dst->sa_family == AF_INET;
+	return 0;
+}
 static int on_spddump(struct rcpfk_msg *rc) { (void)rc; rec.n_spddump++; return 0; }
 
 static struct rcpfk_cb cbs = { .cb_getspi = on_getspi, .cb_update = on_update, .cb_add = on_add,
 	.cb_delete = on_delete, .cb_get = on_get, .cb_spdadd = on_spdadd,
-	.cb_spddelete2 = on_spddel2, .cb_spddump = on_spddump };
+	.cb_spddelete2 = on_spddel2, .cb_spddump = on_spddump, .cb_expire = on_expire };
 
 static void sin4(struct sockaddr_in *s, const char *ip, int port)
 {
@@ -67,7 +79,7 @@ int main(int argc, char **argv)
 	snprintf(sock, sizeof(sock), "%s/s", dir);
 	setenv(R2DP_ENV_SOCK, sock, 1);
 	setenv("R2DP_ROLE", "iked", 1);
-	if ((mock = fork()) == 0) { execl(argv[1], argv[1], "-s", sock, "-K", (char *)NULL); _exit(127); }
+	if ((mock = fork()) == 0) { execl(argv[1], argv[1], "-s", sock, "-K", "-L", (char *)NULL); _exit(127); }
 	for (i = 0; i < 100; i++) { raw = r2dp_connect(sock); if (raw >= 0) break; usleep(20000); }
 	CHECK(raw >= 0);
 
@@ -207,6 +219,38 @@ int main(int argc, char **argv)
 	CHECK(rcpfk_send_get(&rc) == 0);
 	(void)wait1(&rc);		/* reply is ENOENT (SA already deleted); we only need it consumed */
 #endif
+	/* ---- EXPIRE pushed by the forwarder arrives as cb_expire, with what iked inspects ---- */
+	{
+		struct timeval tv = { .tv_sec = 6 };
+		struct sockaddr_in esrc, edst;
+		sin4(&esrc, "198.51.100.1", 0); sin4(&edst, "198.51.100.2", 0);
+		setsockopt(rc.so, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));      /* never hang the suite */
+		memset(&rc.sa_natoa_src, 0, sizeof(rc.sa_natoa_src)); memset(&rc.sa_natoa_dst, 0, sizeof(rc.sa_natoa_dst));
+		rc.sa_src = (struct sockaddr *)&esrc; rc.sa_dst = (struct sockaddr *)&edst;
+		rc.satype = RCT_SATYPE_ESP; rc.samode = RCT_IPSM_TUNNEL; rc.enctype = RCT_ALG_AES_GCM; rc.authtype = RCT_ALG_NON_AUTH;
+		rc.enckey = (caddr_t)key; rc.enckeylen = sizeof(key); rc.authkeylen = 0;
+		rc.saflags = 0; rc.wsize = 64; rc.natt_type = 0; rc.reqid = 5; rc.spi = htonl(0x5555); rc.seq = 300;
+		rc.lft_soft_time = 1; rc.lft_hard_time = 3; rc.lft_soft_bytes = rc.lft_hard_bytes = 0;
+		CHECK(rcpfk_send_add(&rc) == 0 && wait1(&rc) == 0);
+		rc.flags &= ~PFK_FLAG_WAITREPLY;
+		CHECK(rcpfk_handler(&rc) == 0);                                        /* blocks until the event (~1 s) */
+		CHECK(rec.n_expire == 1 && rec.expired[0] == 1);                       /* soft */
+		CHECK(rec.exp_spi == htonl(0x5555) && rec.exp_satype == RCT_SATYPE_ESP && rec.exp_samode == RCT_IPSM_TUNNEL);
+		CHECK(rec.exp_alloc != 0);                                             /* else iked ignores it */
+		CHECK(rec.exp_reqid == 5 && rec.exp_dst_ok);
+		CHECK(rcpfk_handler(&rc) == 0);                                        /* hard, ~3 s */
+		CHECK(rec.n_expire == 2 && rec.expired[1] == 2);
+		/* an event that lands while a caller waits for its own reply goes to the scratch container */
+		rc.spi = htonl(0x5556); rc.lft_soft_time = 1; rc.lft_hard_time = 0; rc.seq = 301;
+		CHECK(rcpfk_send_add(&rc) == 0 && wait1(&rc) == 0);
+		sleep(2);                                                              /* soft event is now queued */
+		rc.seq = 302; rc.spi = htonl(0x5555);
+		CHECK(rcpfk_send_get(&rc) == 0);                                       /* ENOENT reply queued BEHIND the event */
+		(void)wait1(&rc);
+		CHECK(rec.n_expire == 3 && rec.expired[2] == 1);                       /* event dispatched via scratch, exactly once */
+		CHECK(rc.eno == ENOENT);                                               /* and our own reply was still delivered to rc */
+	}
+
 	CHECK(rcpfk_clean(&rc) == 0 && rc.so == -1);
 	close(raw);
 	kill(mock, SIGTERM); waitpid(mock, NULL, 0);

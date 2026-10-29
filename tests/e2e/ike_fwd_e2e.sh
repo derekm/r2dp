@@ -9,6 +9,15 @@
 #                       tunnel endpoint 192.0.2.1          192.0.2.2
 #
 #   ike_fwd_e2e.sh <racoon2-prefix> <r2dp-fwd>           (root, iproute2, iputils-ping)
+#
+#   env: FLOOD_COUNT=N   after the basic checks, ping-flood hostA->hostB with N packets (50 ms apart)
+#        SA_BYTES=B      give the child SAs a hard byte lifetime of B (iked derives the soft limit);
+#                        iked has no byte timer, so a rekey here can only come from the forwarder's
+#                        EXPIRE event -- the flood must then survive several rekeys with zero loss
+#        ESN=1           negotiate extended sequence numbers (ext_sequence on)
+#        ALG=cbc         use AES-128-CBC + HMAC-SHA2-256 instead of AES-GCM for the child SAs
+#        NATT=1          force NAT traversal (nat_traversal force): IKE floats to UDP/4500 and ESP is
+#                        UDP-encapsulated, so one port carries both and the forwarder must demux them
 set -u
 PREFIX="${1:?racoon2 install prefix}"; FWD="${2:?path to r2dp-fwd}"
 SBIN="$PREFIX/sbin"; D=/tmp/r2dp-ikefwd
@@ -62,6 +71,8 @@ echo "== exception path: kernel-to-kernel ARP + ICMP through both forwarders' TA
 ip netns exec $NSA ping -c 3 -W 2 192.0.2.2 >"$D/ping-gw.out" 2>&1 || { cat "$D/ping-gw.out"; fail "gateways cannot reach each other over the exception path"; }
 echo "  ok   192.0.2.1 <-> 192.0.2.2 ($(grep -o '[0-9]* received' "$D/ping-gw.out"))"
 
+if [ "${ALG:-gcm}" = cbc ]; then ALG_LINES='esp_enc_alg { aes128_cbc; }; esp_auth_alg { hmac_sha2_256; }'
+else ALG_LINES='esp_enc_alg { aes_gcm; }; esp_auth_alg { non_auth; }'; fi
 conf() { # $1=file $2=my_ip $3=peer_ip $4=spmif $5=my_id $6=peer_id $7=passive $8=my_net $9=peer_net
 cat > "$1" <<CONF
 interface {
@@ -74,6 +85,7 @@ remote e2e_remote {
 	acceptable_kmp { ikev2; };
 	ikev2 {
 		$7
+		${NATT:+nat_traversal force;}
 		my_id fqdn "$5";
 		peers_id fqdn "$6";
 		peers_ipaddr "$3" port 500;
@@ -97,8 +109,8 @@ policy pol {
 	peers_sa_ipaddr "$3";
 	my_sa_ipaddr "$2";
 };
-ipsec ipsec_e { ipsec_sa_lifetime_time 3000 sec; sa_index esp_e; };
-sa esp_e { sa_protocol esp; esp_enc_alg { aes_gcm; }; esp_auth_alg { non_auth; }; };
+ipsec ipsec_e { ipsec_sa_lifetime_time 3000 sec; ${SA_BYTES:+ipsec_sa_lifetime_byte $SA_BYTES bytes;} ${ESN:+ext_sequence on;} sa_index esp_e; };
+sa esp_e { sa_protocol esp; ${ALG_LINES}; };
 CONF
 }
 conf "$D/a.conf" 192.0.2.1 192.0.2.2 "$D/spmif-a" a.example b.example "" 10.1.0.0/24 10.2.0.0/24
@@ -127,6 +139,24 @@ echo "  forwarder B: $(grep -E 'SA (in|out) spi' "$D/fwd-b.err" | sed 's/^fwd: /
 [ $ok = 1 ] || { echo "-- iked-a --"; tail -8 "$D/iked-a.log"; echo "-- iked-b --"; tail -8 "$D/iked-b.log"; fail "IKE did not install SAs into both forwarders in ${s}s"; }
 
 rc=0
+if [ "${ALG:-gcm}" = cbc ]; then
+	for side in a b; do   # IANA ids: encr 12 = AES-CBC, integ 12 = HMAC-SHA2-256-128
+		n=$(grep -c "SA_\(ADD\|UPDATE\).*enc=12 integ=12" "$D/fwd-$side.err")
+		[ "${n:-0}" -ge 2 ] && echo "  ok   forwarder $side received AES-CBC + HMAC-SHA2-256 SAs ($n installs)" || { echo "  FAIL forwarder $side never got a CBC+HMAC SA"; rc=1; }
+	done
+fi
+if [ -n "${NATT:-}" ]; then
+	for side in a b; do
+		n=$(grep -c "SA_\(ADD\|UPDATE\).*natt=1/4500" "$D/fwd-$side.err")
+		[ "${n:-0}" -ge 2 ] && echo "  ok   forwarder $side received UDP-encapsulated SAs ($n installs)" || { echo "  FAIL forwarder $side never got a NAT-T SA: NAT-T was not negotiated"; rc=1; }
+	done
+fi
+if [ -n "${ESN:-}" ]; then
+	for side in a b; do
+		n=$(grep -c "SA_\(ADD\|UPDATE\).*esn=1" "$D/fwd-$side.err")
+		[ "${n:-0}" -ge 2 ] && echo "  ok   forwarder $side received ESN-enabled SAs ($n installs)" || { echo "  FAIL forwarder $side never got an ESN SA: ESN was not negotiated"; rc=1; }
+	done
+fi
 echo "== dataplane: hostA <-> hostB through the IKE-negotiated tunnel (decrypt/encrypt keys must agree)"
 t() { if ip netns exec "$1" ping -c "$2" -W 2 ${4:+-s $4} "$3" >"$D/ping.out" 2>&1; then echo "  ok   $5 ($(grep -o '[0-9]* received' "$D/ping.out"))"; else echo "  FAIL $5"; tail -3 "$D/ping.out"; rc=1; fi; }
 t $NSHA 5 10.2.0.2 ""   "hostA -> hostB, 5 pings"
@@ -146,6 +176,33 @@ for side in a b; do
 	[ "${au:-1}" = 0 ] || { echo "  FAIL fwd $side saw ESP auth failures"; rc=1; }
 	[ "${xi:-0}" -gt 0 ] && [ "${xo:-0}" -gt 0 ] || { echo "  FAIL fwd $side exception path unused"; rc=1; }
 done
+if [ -n "${FLOOD_COUNT:-}" ]; then
+	echo "== flood: ${FLOOD_COUNT} pings (200 B payload, 50 ms apart)${SA_BYTES:+ across rekeys driven by a ${SA_BYTES}-byte lifetime}"
+	ip netns exec $NSHA ping -i 0.05 -s 200 -c "$FLOOD_COUNT" -W 1 10.2.0.2 >"$D/flood.out" 2>&1
+	line=$(grep "packets transmitted" "$D/flood.out"); echo "  $line"
+	tx=$(echo "$line" | awk '{print $1}'); rx=$(echo "$line" | awk '{print $4}')
+	if [ "${tx:-0}" = "$FLOOD_COUNT" ] && [ "${rx:-x}" = "$tx" ]; then echo "  ok   zero loss"; else echo "  FAIL lost $((${tx:-0} - ${rx:-0})) of ${tx:-?}"; rc=1; fi
+	SA=$(stat $FP_a "$D/fwd-a.out"); SB=$(stat $FP_b "$D/fwd-b.out")
+	for side in a b; do
+		S=$([ $side = a ] && echo "$SA" || echo "$SB")
+		es=$(val "$S" exp_soft); eh=$(val "$S" exp_hard); ns=$(val "$S" no_sp_sa); ex=$(val "$S" expired); au=$(val "$S" auth); by=$(val "$S" bypass)
+		ins=$(grep -c "SA in spi" "$D/fwd-$side.err"); outs=$(grep -c "SA out spi" "$D/fwd-$side.err")
+		echo "  fwd $side: soft_expiries=$es hard_expiries=$eh SAs installed in=$ins out=$outs  drops: no_sa=$ns expired=$ex auth=$au bypass=$by"
+		[ "${ns:-1}" = 0 ] && [ "${ex:-1}" = 0 ] && [ "${au:-1}" = 0 ] && [ "${by:-1}" = 0 ] || { echo "  FAIL fwd $side dropped packets during the flood"; rc=1; }
+	done
+	if [ -n "${SA_BYTES:-}" ]; then
+		# iked draws each side's soft threshold with independent jitter, so either end may win a given
+		# rekey race: require EXPIRE events from *somewhere*, but multiple rekeys on *both* ends.
+		soft_total=$(( $(val "$SA" exp_soft) + $(val "$SB" exp_soft) ))
+		[ "$soft_total" -ge 1 ] && echo "  ok   forwarders reported $soft_total soft expiries in total" || { echo "  FAIL no forwarder ever reported a soft expiry"; rc=1; }
+		for side in a b; do
+			ins=$(grep -c "SA in spi" "$D/fwd-$side.err")
+			[ "${ins:-0}" -ge 3 ] || { echo "  FAIL fwd $side saw fewer than 2 rekeys (inbound SAs installed: $ins)"; rc=1; }
+		done
+		n=$(cat "$D"/iked-a.log "$D"/iked-b.log | grep -c "received PFKEY_EXPIRE")
+		[ "$n" -ge 1 ] && echo "  ok   iked logged $n EXPIRE event(s) from the forwarders" || { echo "  FAIL iked never received an EXPIRE event"; rc=1; }
+	fi
+fi
 kill -0 $FP_a 2>/dev/null && kill -0 $FP_b 2>/dev/null || { echo "  FAIL a forwarder crashed"; rc=1; }
 [ $rc = 0 ] && echo "PASS: iked negotiated IKEv2 through the exception path and the DPDK forwarders carry the ESP tunnel" || echo "FAILED (logs in $D)"
 exit $rc

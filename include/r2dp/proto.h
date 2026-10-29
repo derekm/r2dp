@@ -100,6 +100,9 @@ _Static_assert(sizeof(struct r2dp_addr) == 24, "r2dp_addr layout");
 #define R2DP_NATT_ESPINUDP  1
 
 #define R2DP_SAF_ESN     0x1u   /* RFC 4303 extended sequence numbers */
+/* r2dp_sa.expired in an R2DP_EXPIRE event (same values rcpfk_msg.expired uses) */
+#define R2DP_EXPIRE_SOFT 1      /* rekey now; the SA keeps working */
+#define R2DP_EXPIRE_HARD 2      /* the forwarder has already removed the SA */
 #define R2DP_SPF_UPDATE  0x1u   /* SP_ADD: replace if selector exists */
 
 /*

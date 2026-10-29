@@ -1,6 +1,7 @@
 /* Spawns r2dp-mockfwd on a temp socket and drives the full protocol. */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,8 +22,8 @@ static pid_t spawn(int echo_keys)
 {
 	pid_t p = fork();
 	if (p == 0) {
-		if (echo_keys) execl(mockbin, mockbin, "-s", sockpath, "-K", (char *)NULL);
-		else           execl(mockbin, mockbin, "-s", sockpath, (char *)NULL);
+		if (echo_keys) execl(mockbin, mockbin, "-s", sockpath, "-K", "-L", (char *)NULL);
+		else           execl(mockbin, mockbin, "-s", sockpath, "-L", (char *)NULL);
 		_exit(127);
 	}
 	return p;
@@ -182,6 +183,64 @@ static void test_sp(int fd)
 	CHECK(xfer(fd, R2DP_SP_DEL, 29, 0, &b, sizeof(b), NULL, 0, &rep) == 0 && rep.h.status == ENOENT);
 }
 
+static int readable(int fd, int ms)
+{
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	return poll(&p, 1, ms) > 0;
+}
+
+/* Unsolicited EXPIRE events: who gets them, when, and with what. */
+static void test_expire(void)
+{
+	struct r2dp_hello_ack ack;
+	struct r2dp_msg rep, ev;
+	struct r2dp_sa sa;
+	uint8_t key[36];
+	int ike, spmd, silent;
+	uint64_t t0;
+
+	ike = connect_retry(); spmd = connect_retry(); silent = connect_retry();
+	CHECK(ike >= 0 && spmd >= 0 && silent >= 0);
+	CHECK(r2dp_hello(ike, R2DP_ROLE_IKED, &ack) == 0);
+	CHECK(r2dp_hello(spmd, R2DP_ROLE_SPMD, &ack) == 0);        /* `silent` never says HELLO */
+
+	memset(&sa, 0, sizeof(sa)); memset(key, 0x42, sizeof(key));
+	v4(&sa.src, "198.51.100.1", 0); v4(&sa.dst, "198.51.100.2", 0);
+	sa.proto = R2DP_PROTO_ESP; sa.mode = R2DP_MODE_TUNNEL; sa.enc = R2DP_ENCR_AES_GCM_16;
+	sa.spi = htonl(0x7000); sa.reqid = 11; sa.enckeylen = 20; sa.wsize = 64;
+	sa.lft_soft_time = 1; sa.lft_hard_time = 3;
+	t0 = (uint64_t)time(NULL);
+	CHECK(xfer(ike, R2DP_SA_ADD, 50, 0, &sa, sizeof(sa), key, 20, &rep) == 0 && rep.h.status == 0);
+
+	/* soft expiry: ~1 s after install, only to the IKED client */
+	CHECK(readable(ike, 2500));
+	CHECK(r2dp_recv(ike, &ev) == 0 && ev.h.type == R2DP_EXPIRE && ev.h.seq == 0);
+	CHECK(r2dp_msg_sa(&ev)->expired == R2DP_EXPIRE_SOFT);
+	CHECK(r2dp_msg_sa(&ev)->spi == sa.spi && r2dp_msg_sa(&ev)->reqid == 11);
+	CHECK(r2dp_addr_eq(&r2dp_msg_sa(&ev)->dst, &sa.dst) && r2dp_msg_sa(&ev)->proto == R2DP_PROTO_ESP);
+	CHECK(r2dp_msg_sa(&ev)->cur_alloc != 0);                    /* iked ignores soft expiries with alloc == 0 */
+	CHECK(r2dp_msg_sa(&ev)->cur_add >= t0 && r2dp_msg_sa(&ev)->cur_add <= t0 + 2);
+	CHECK(ev.h.flags & R2DP_HF_NOKEYS);                          /* keys never travel in events */
+	CHECK(!readable(spmd, 50) && !readable(silent, 50));         /* SPMD and HELLO-less clients get nothing */
+	CHECK(xfer(ike, R2DP_SA_GET, 51, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, &rep) == 0 && rep.h.status == 0);  /* soft: still installed */
+
+	/* hard expiry: ~3 s, and the SA is gone afterwards */
+	CHECK(readable(ike, 3500));
+	CHECK(r2dp_recv(ike, &ev) == 0 && ev.h.type == R2DP_EXPIRE && r2dp_msg_sa(&ev)->expired == R2DP_EXPIRE_HARD);
+	CHECK(xfer(ike, R2DP_SA_GET, 52, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, &rep) == 0 && rep.h.status == ENOENT);
+	sa.lft_soft_time = sa.lft_hard_time = 0;                    /* reinstall with no lifetimes: no further events */
+	CHECK(xfer(ike, R2DP_SA_ADD, 53, 0, &sa, sizeof(sa), key, 20, &rep) == 0 && rep.h.status == 0);   /* slot reusable */
+	CHECK(!readable(spmd, 50) && !readable(silent, 50));
+
+	/* a client that disconnects mid-flight must not wedge the engine */
+	close(silent); close(spmd);
+	sa.spi = htonl(0x7001); sa.lft_soft_time = 1; sa.lft_hard_time = 0;   /* soft only: exactly one event */
+	CHECK(xfer(ike, R2DP_SA_ADD, 54, 0, &sa, sizeof(sa), key, 20, &rep) == 0 && rep.h.status == 0);
+	CHECK(readable(ike, 2500) && r2dp_recv(ike, &ev) == 0 && ev.h.type == R2DP_EXPIRE);
+	CHECK(r2dp_hello(ike, R2DP_ROLE_IKED, &ack) == 0);           /* and the survivor is still served */
+	close(ike);
+}
+
 static void test_protocol_errors(void)
 {
 	struct r2dp_msg rep;
@@ -231,7 +290,7 @@ int main(int argc, char **argv)
 		CHECK(fd >= 0);
 		if (fd >= 0) {
 			test_sa(fd, keys);
-			if (keys) { test_sp(fd); test_protocol_errors(); }
+			if (keys) { test_sp(fd); test_expire(); test_protocol_errors(); }
 			close(fd);
 		}
 		stop(p);
