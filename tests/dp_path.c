@@ -239,6 +239,30 @@ main(void)
 		CHECK(enc && !ok, "inner packet outside B's IN selector dropped after decrypt");
 	}
 
+	/* RFC 3948 s2.2 demux on UDP/4500 */
+	{
+		static uint8_t f[128];
+		size_t u = 14 + 20, n;
+		#define NT_FRAME(dport, ulen) do { memset(f, 0, sizeof(f)); \
+			f[12] = 0x08; f[14] = 0x45; f[14 + 9] = 17; \
+			f[u + 2] = (uint8_t)((dport) >> 8); f[u + 3] = (uint8_t)(dport); \
+			f[u + 4] = (uint8_t)((ulen) >> 8); f[u + 5] = (uint8_t)(ulen); } while (0)
+		NT_FRAME(4500, 9); f[u + 8] = 0xff; n = u + 9;
+		CHECK(natt_class(f, (uint32_t)n) == NT_KEEPALIVE, "natt: lone 0xFF is a keepalive");
+		NT_FRAME(4500, 8 + 32); n = u + 8 + 32;
+		CHECK(natt_class(f, (uint32_t)n) == NT_IKE, "natt: non-ESP marker is IKE");
+		f[u + 8 + 3] = 0x01;
+		CHECK(natt_class(f, (uint32_t)n) == NT_ESP, "natt: non-zero SPI is ESP-in-UDP");
+		CHECK(natt_class(f, (uint32_t)(u + 8 + 6)) == NT_NONE, "natt: runt ESP is not ESP");
+		NT_FRAME(500, 8 + 32); f[u + 8 + 3] = 0x01;
+		CHECK(natt_class(f, (uint32_t)n) == NT_NONE, "natt: port 500 is never ESP");
+		NT_FRAME(4500, 8 + 32); f[u + 8 + 3] = 0x01; f[14 + 9] = 6;
+		CHECK(natt_class(f, (uint32_t)n) == NT_NONE, "natt: not UDP");
+		NT_FRAME(4500, 9); f[u + 8] = 0xff;
+		CHECK(natt_class(f, (uint32_t)(u + 6)) == NT_NONE, "natt: truncated UDP header");
+		#undef NT_FRAME
+	}
+
 	/* Stuck device: the batch is dropped and counted, its ops quarantined
 	 * (not back in the pool while the device owns them); once the device
 	 * completes again they are reclaimed before any new enqueue, and the

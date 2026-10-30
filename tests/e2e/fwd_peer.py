@@ -14,7 +14,7 @@ usage: fwd_peer.py <iface> <my_mac> <fwd_mac> <key1hex> <key2hex> <phase> <reply
   check is relative to the environment (64 on a host, 127 in some userns).
 """
 import sys, time, threading
-from scapy.all import (Ether, IP, ICMP, Raw, AsyncSniffer, sendp, conf)
+from scapy.all import (Ether, IP, UDP, ICMP, Raw, AsyncSniffer, sendp, conf)
 from scapy.layers.ipsec import SecurityAssociation, ESP
 
 conf.verb = 0
@@ -35,7 +35,7 @@ sa_in = mk_sa(SPI2, k2, F, P)            # forwarder encrypts with this; we decr
 # across them, so every phase starts its ESP sequence numbers well above the last.
 # (scapy stamps a packet with seq_num *before* incrementing it, and RFC 4303 forbids
 # sequence 0, so the first packet of a fresh SA must be sent with seq_num == 1.)
-SEQ_BASE = {"positive": 1, "window": 1000, "negative": 5000}
+SEQ_BASE = {"positive": 1, "window": 1000, "negative": 5000, "natt": 1}
 sa_out.seq_num = SEQ_BASE[phase]
 
 fails = 0
@@ -47,22 +47,32 @@ def check(cond, msg):
 def payload(n, tag=0):
     return bytes(((i * 7 + tag) & 0xff) for i in range(n))
 
-def send_and_wait(frame, want_reply, timeout=2.0):
+last_raw = None                          # outer frame of the last reply
+
+def is_esp_from(p, peer, natt):
+    if not p.haslayer(IP) or p[IP].src != F or p[IP].dst != peer:
+        return False
+    if natt:                             # RFC 3948: UDP/4500, ESP right after it
+        return p[IP].proto == 17 and p.haslayer(UDP) and p[UDP].sport == 4500
+    return p[IP].proto == 50
+
+def send_and_wait(frame, want_reply, timeout=2.0, sa=None, peer=P, natt=False):
     """Send one frame; return the decrypted inner packet of the first ESP reply (or None)."""
+    global last_raw
     got = []
     ev = threading.Event()
     def cb(p):
-        if p.haslayer(ESP) and p[IP].src == F and p[IP].dst == P:
-            got.append(p); ev.set()
+        got.append(p); ev.set()
     # lfilter, not a BPF filter: no libpcap/tcpdump needed in the venv
     sn = AsyncSniffer(iface=iface, prn=cb, store=False,
-                      lfilter=lambda p: p.haslayer(IP) and p[IP].proto == 50)
+                      lfilter=lambda p: is_esp_from(p, peer, natt))
     sn.start(); time.sleep(0.6)     # let the AF_PACKET socket attach before we send
     sendp(frame, iface=iface)
     ev.wait(timeout if want_reply else 0.6)
     sn.stop()
     if not got: return None
-    return sa_in.decrypt(got[0][IP])
+    last_raw = bytes(got[0])
+    return (sa or sa_in).decrypt(got[0][IP])
 
 def esp_frame(inner, sa=None):
     sa = sa or sa_out
@@ -118,4 +128,51 @@ elif phase == "negative":
     check(send_and_wait(Ether(bytes(pkt)), False) is None, "truncated ESP -> no reply")
     # control: a valid packet right after the garbage still works
     ok, _ = roundtrip(207, 32); check(ok, "forwarder still healthy after the garbage")
+elif phase == "natt":
+    # RFC 3948 on UDP/4500 against a second tunnel (peer 192.0.2.3): ESP-in-
+    # UDP both ways (ESP right after the UDP header, no marker), plain ESP to
+    # a NAT-T SA refused, a 0xFF keepalive and an IKE packet (non-ESP marker)
+    # never taken for ESP.  The kernel backend decapsulates only on a UDP
+    # socket with UDP_ENCAP_ESPINUDP, as iked would hold.
+    import socket
+    try:
+        es = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        es.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        es.bind(("0.0.0.0", 4500))
+        es.setsockopt(socket.IPPROTO_UDP, 100, 2)     # UDP_ENCAP, ESPINUDP
+    except OSError:
+        es = None
+    P2, SRC2 = "192.0.2.3", "10.3.0.1"
+    nt = lambda: UDP(sport=4500, dport=4500)
+    na_out = SecurityAssociation(ESP, spi=0x1100, crypt_algo="AES-GCM", crypt_key=bytes.fromhex(k1),
+                                 auth_algo="NULL", auth_key=None, tunnel_header=IP(src=P2, dst=F),
+                                 nat_t_header=nt())
+    na_in = SecurityAssociation(ESP, spi=0x2100, crypt_algo="AES-GCM", crypt_key=bytes.fromhex(k2),
+                                auth_algo="NULL", auth_key=None, tunnel_header=IP(src=F, dst=P2),
+                                nat_t_header=nt())
+    na_out.seq_num = 1
+    def nframe(inner):
+        return Ether(src=my_mac, dst=fwd_mac) / na_out.encrypt(inner)
+    def nround(seq, n):
+        rep = send_and_wait(nframe(echo(seq, n, src=SRC2)), True, sa=na_in, peer=P2, natt=True)
+        ok = (rep is not None and rep.haslayer(ICMP) and rep[ICMP].type == 0 and rep[ICMP].seq == seq and
+              (bytes(rep[Raw].load) if rep.haslayer(Raw) else b"") == payload(n, seq) and rep[IP].dst == SRC2)
+        return ok
+    for i, n in enumerate([0, 64, 1000]):
+        check(nround(301 + i, n), f"NAT-T round trip payload={n}")
+    o = Ether(last_raw) if last_raw else None
+    check(o is not None and o[IP].proto == 17 and o[UDP].sport == 4500 and o[UDP].dport == 4500 and
+          bytes(o[UDP].payload)[:4] == (0x2100).to_bytes(4, "big") and o[UDP].len == len(o[UDP]),
+          "NAT-T egress framing: UDP 4500->4500, SPI right after the UDP header")
+    plain = Ether(src=my_mac, dst=fwd_mac) / SecurityAssociation(
+        ESP, spi=0x1100, crypt_algo="AES-GCM", crypt_key=bytes.fromhex(k1), auth_algo="NULL",
+        auth_key=None, tunnel_header=IP(src=P2, dst=F)).encrypt(echo(310, 32, src=SRC2))
+    check(send_and_wait(plain, False, sa=na_in, peer=P2, natt=True) is None,
+          "plain ESP to a NAT-T SA -> no reply")
+    ka = Ether(src=my_mac, dst=fwd_mac) / IP(src=P2, dst=F) / nt() / Raw(b"\xff")
+    check(send_and_wait(ka, False, sa=na_in, peer=P2, natt=True) is None, "NAT keepalive (0xFF) -> consumed")
+    ike = Ether(src=my_mac, dst=fwd_mac) / IP(src=P2, dst=F) / nt() / Raw(b"\0\0\0\0" + bytes(28))
+    check(send_and_wait(ike, False, sa=na_in, peer=P2, natt=True) is None, "non-ESP marker (IKE) -> not ESP")
+    check(nround(320, 48), "NAT-T path still healthy after keepalive/IKE")
+    if es: es.close()
 sys.exit(1 if fails else 0)

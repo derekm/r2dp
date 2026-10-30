@@ -10,7 +10,7 @@
 #   fwd_e2e.sh <r2dp-fwd> <r2dpctl>
 #   env: PYTHON (python with scapy + cryptography; default python3)
 #        R2DP_E2E_DIR scratch dir (default: a fresh mktemp -d)
-#        PHASES="positive window negative" (subset => counters not asserted)
+#        PHASES="positive window negative natt" (subset => counters not asserted)
 #        BACKEND=dpdk|kernel  (kernel: r2dp-fwd with the XFRM data plane)
 #
 # Needs root in its own network namespace.  Unprivileged:
@@ -72,12 +72,15 @@ if [ "$BACKEND" = dpdk ]; then
 	# far subnet into the inner tap
 	ip addr add 10.2.0.2/24 dev r2i
 	ip route add 10.1.0.0/24 via 10.2.0.1 dev r2i
+	ip route add 10.3.0.0/24 via 10.2.0.1 dev r2i
 	ip neigh replace 10.2.0.1 lladdr 02:00:00:00:00:99 dev r2i nud permanent
 else
 	grep -q "kernel XFRM dataplane ready" "$D/fwd.out" || { cat "$D/fwd.out"; fail "XFRM data plane did not come up"; }
 	ip addr add 10.2.0.2/32 dev lo
 	ip route add 10.1.0.0/24 via 192.0.2.2 dev r2ok src 10.2.0.2
 	ip neigh replace 192.0.2.2 lladdr $PMAC dev r2ok nud permanent
+	ip route add 10.3.0.0/24 via 192.0.2.3 dev r2ok src 10.2.0.2
+	ip neigh replace 192.0.2.3 lladdr $PMAC dev r2ok nud permanent
 fi
 # (not /sys/class/net: under unshare -n without a sysfs remount it shows
 # the parent namespace)
@@ -92,6 +95,12 @@ c sa-add dir=in  spi=0x1000 src=192.0.2.2 dst=192.0.2.1 enc=aes-gcm-16 key=$K1 >
 c sa-add dir=out spi=0x2000 src=192.0.2.1 dst=192.0.2.2 enc=aes-gcm-16 key=$K2 >/dev/null || fail "outbound SA rejected"
 c sp-add slid=1 dir=in  action=protect src=10.1.0.0/24 dst=10.2.0.0/24 tsrc=192.0.2.2 tdst=192.0.2.1 >/dev/null || fail "in SP rejected"
 c sp-add slid=2 dir=out action=protect src=10.2.0.0/24 dst=10.1.0.0/24 tsrc=192.0.2.1 tdst=192.0.2.2 >/dev/null || fail "out SP rejected"
+# second tunnel, RFC 3948 ESP-in-UDP on 4500 (the "natt" phase): peer
+# 192.0.2.3 protecting 10.3.0.0/24
+c sa-add dir=in  spi=0x1100 src=192.0.2.3 dst=192.0.2.1 enc=aes-gcm-16 key=$K1 natt=4500:4500 >/dev/null || fail "NAT-T inbound SA rejected"
+c sa-add dir=out spi=0x2100 src=192.0.2.1 dst=192.0.2.3 enc=aes-gcm-16 key=$K2 natt=4500:4500 >/dev/null || fail "NAT-T outbound SA rejected"
+c sp-add slid=3 dir=in  action=protect src=10.3.0.0/24 dst=10.2.0.0/24 tsrc=192.0.2.3 tdst=192.0.2.1 >/dev/null || fail "NAT-T in SP rejected"
+c sp-add slid=4 dir=out action=protect src=10.2.0.0/24 dst=10.3.0.0/24 tsrc=192.0.2.1 tdst=192.0.2.3 >/dev/null || fail "NAT-T out SP rejected"
 
 # Nothing routes the inner reply on its way back (the DPDK forwarder is a
 # bump in the wire; with the kernel backend the host is the endpoint), so
@@ -106,7 +115,7 @@ dump_stats() {
 }
 
 rc=0
-for ph in ${PHASES:-positive window negative}; do
+for ph in ${PHASES:-positive window negative natt}; do
 	echo "== phase: $ph"; peer $ph || rc=1
 done
 
@@ -123,11 +132,15 @@ if [ -z "${PHASES:-}" ] && [ "$BACKEND" = dpdk ]; then
 	# ipsec_reject (rte_ipsec prepare); bit-flip + tampered seq ->
 	# crypto_fail; unknown SPI -> no_sa_in; off-selector -> inner_sel.
 	# The cleartext ICMP is the one non-ESP frame (clear_outer).
-	eq rx 49; eq tx 40; eq esp 48; eq ike 0
+	# natt phase: 4 ESP-in-UDP round trips (+4 rx outer, +4 rx inner, +8
+	# tx, +8 esp), plain ESP to the NAT-T SA (+1 rx, +1 esp, encap), a
+	# keepalive (+1 rx, consumed, not a drop) and an IKE packet behind the
+	# non-ESP marker (+1 rx, ike, +1 tx to the kernel side).
+	eq rx 60; eq tx 49; eq esp 57; eq ike 1
 	eq replay 2; eq ipsec_reject 2; eq crypto_fail 2; eq no_sa_in 1
-	eq inner_sel 1; eq clear_outer 1
+	eq inner_sel 1; eq clear_outer 1; eq encap 1; eq natt_keepalive 1
 	for z in malformed no_sa_out policy_discard crypto_enq crypto_stuck nomem no_nexthop esp_on_inner tx_full spd_fail; do eq $z 0; done
-	eq drop 9
+	eq drop 10
 fi
 kill -0 $FPID 2>/dev/null || { echo "  FAIL forwarder crashed"; cat "$D/fwd.out"; rc=1; }
 [ $rc = 0 ] && echo "PASS ($BACKEND): ESP tunnel interoperates with an independent implementation" ||
