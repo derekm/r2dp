@@ -72,6 +72,7 @@ fixed and verified.
 ## M3 — Multicore & update safety
 - **Builds**: RSS multi-queue workers, per-lcore counters, rte_rcu_qsbr table swaps, SA-pinned ordering notes (one SA = one core), hugepage/NUMA setup docs.
 - **Deps**: multi-queue-capable PMD (or net_tap multi-queue for CI), perf tools (optional).
+- **Precondition (today's code)**: `r2dp-fwd` runs exactly one worker (`DP_NB_WORKERS == 1`, a `_Static_assert` in `fwd/dp_dpdk.c`; `dpd_start` refuses a second start and leaves extra lcores idle). The anti-replay window, SA byte counters, drop counters and the stuck-cryptodev quarantine are single-writer worker state with no locks or atomics. M3 must pin each inbound SA to one core (RSS/steering by SPI) or add a per-SA lock before raising it.
 - **Exit gate**: N-tunnel scale test linear to core count; table churn (SA/SP add/del at 1k/s) under traffic with zero drops/crashes (ASan/TSan builds clean).
 
 ## M4 — Offload, on-demand, MTU

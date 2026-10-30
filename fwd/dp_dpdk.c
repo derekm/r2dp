@@ -2171,6 +2171,15 @@ worker_main(void *arg)
 	return 0;
 }
 
+/* Exactly one worker owns the packet path.  Its per-SA state -- the
+ * anti-replay window (rp_top/rp_map), byte counters, cq_stale and the drop
+ * counters -- is written without locks or atomics.  Running a second
+ * worker needs per-core SAs (RSS by SPI) or a per-SA lock first; until
+ * then dpd_start launches one and refuses a second start. */
+#define DP_NB_WORKERS 1
+_Static_assert(DP_NB_WORKERS == 1,
+    "replay window and SA counters are single-writer worker state");
+
 static int
 dpd_start(struct fwd_dp *dp)
 {
@@ -2179,6 +2188,8 @@ dpd_start(struct fwd_dp *dp)
 
 	if (d->port_id < 0)
 		return -ENODEV;
+	if (d->running)
+		return -EBUSY;        /* one worker only (DP_NB_WORKERS) */
 	/* pick a slave lcore, skipping the main (calling) lcore */
 	lcore = rte_get_next_lcore(-1, 1, 1);
 	if (lcore >= RTE_MAX_LCORE) {
@@ -2207,6 +2218,10 @@ dpd_start(struct fwd_dp *dp)
 		}
 		rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
 	}
+	if (rte_lcore_count() > 1 + DP_NB_WORKERS)
+		fprintf(stderr, "r2dp-fwd: %u lcores given, using one worker "
+		    "(replay state is single-writer); the rest stay idle\n",
+		    rte_lcore_count());
 	d->running = 1;
 	d->worker_lcore = lcore;
 	rte_eal_remote_launch(worker_main, d, lcore);
