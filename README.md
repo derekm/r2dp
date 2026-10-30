@@ -8,12 +8,12 @@ a separate project that speaks a PF_KEY-shaped protocol over a unix socket.
     iked / spmd ──(rcpfk_* ABI)── if_r2dp.c ──(r2dp, SOCK_SEQPACKET)── forwarder (DPDK)
 
 ## Status
-**M0 done** (protocol, client/server lib, mock forwarder, racoon2 backend, and a
-real two-peer IKEv2 test). **M1 (the DPDK `r2dp-fwd` forwarder) in progress**:
-the SAD + ESP decrypt pipeline is implemented and the data plane runs, but the
-end-to-end "real ESP decrypts through the forwarder" proof and the iked-over-
-veth interop exit gate are still open.
-See `MILESTONES.md` for the full plan, exit gates, and findings.
+M0 and M1 are done; parts of M2 are in (ESN, NAT-T, lifetimes with EXPIRE,
+replay windows up to 1024).  `r2dp-fwd` runs one of two data planes behind
+the same socket: DPDK (`rte_ipsec`, AES-GCM-16, IPv4 tunnel, one worker)
+or the kernel's XFRM (`--dp kernel`).  Both interoperate with an
+independent ESP implementation in CI.  See `COVERAGE.md` for what is
+verified and what is not, and `MILESTONES.md` for the plan.
 
 ## Layout
 | path | what |
