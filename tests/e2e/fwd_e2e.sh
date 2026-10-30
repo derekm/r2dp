@@ -126,7 +126,7 @@ if [ -z "${PHASES:-}" ] && [ "$BACKEND" = dpdk ]; then
 	eq rx 49; eq tx 40; eq esp 48; eq ike 0
 	eq replay 2; eq ipsec_reject 2; eq crypto_fail 2; eq no_sa_in 1
 	eq inner_sel 1; eq clear_outer 1
-	for z in malformed no_sa_out policy_discard crypto_enq nomem no_nexthop esp_on_inner tx_full spd_fail; do eq $z 0; done
+	for z in malformed no_sa_out policy_discard crypto_enq crypto_stuck nomem no_nexthop esp_on_inner tx_full spd_fail; do eq $z 0; done
 	eq drop 9
 fi
 kill -0 $FPID 2>/dev/null || { echo "  FAIL forwarder crashed"; cat "$D/fwd.out"; rc=1; }

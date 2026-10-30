@@ -11,6 +11,11 @@
  * DISCARD overrides a covering PROTECT (M5), PROTECT without an SA drops.
  * Runs in CI's DPDK lanes (R2DP_REQUIRE_DPDK=1 turns SKIP into failure).
  */
+/* A cryptodev that stops completing: dequeue returns nothing while set. */
+static int deq_stuck;
+#define DP_CRYPTO_DEQ(dev, qp, ops, n) \
+	(deq_stuck ? 0 : rte_cryptodev_dequeue_burst((dev), (qp), (ops), (n)))
+#define DP_CRYPTO_SPIN_MAX 1000
 #include "../fwd/dp_dpdk.c"
 
 static int fails;
@@ -232,6 +237,35 @@ main(void)
 		struct rte_mbuf *m = inner_frame("10.0.9.5", "10.0.2.5", 1, 0, want);
 		int ok = run(a, b, m, &enc, got);
 		CHECK(enc && !ok, "inner packet outside B's IN selector dropped after decrypt");
+	}
+
+	/* Stuck device: the batch is dropped and counted, its ops quarantined
+	 * (not back in the pool while the device owns them); once the device
+	 * completes again they are reclaimed before any new enqueue, and the
+	 * path recovers with no op or mbuf leaked. */
+	{
+		static uint8_t w[64], g[64];
+		unsigned cops = rte_mempool_avail_count(a->cop_mp);
+		unsigned mbs = rte_mempool_avail_count(mp);
+		struct rte_mbuf *m;
+
+		deq_stuck = 1;
+		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		CHECK(!run(a, b, m, &enc, g) && !enc, "stuck cryptodev: batch dropped");
+		CHECK(a->n_dropr[DR_CRYPTO_STUCK] == 1 && a->n_crypto_stuck == 1 &&
+		    a->cq_stale == 1, "stuck cryptodev: counted, one op quarantined");
+		CHECK(rte_mempool_avail_count(a->cop_mp) == cops - 1,
+		    "stuck cryptodev: quarantined op not returned to the pool");
+		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		CHECK(!run(a, b, m, &enc, g) && a->n_dropr[DR_CRYPTO_STUCK] == 2 &&
+		    a->cq_stale == 1, "still stuck: nothing new enqueued behind it");
+		deq_stuck = 0;
+		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		CHECK(run(a, b, m, &enc, g) && memcmp(g, w, 64) == 0 && a->cq_stale == 0,
+		    "device back: stale op reclaimed, path recovers");
+		CHECK(rte_mempool_avail_count(a->cop_mp) == cops &&
+		    rte_mempool_avail_count(mp) == mbs,
+		    "no crypto op or mbuf leaked across the stall");
 	}
 
 	/* A forged datagram must never decrypt to cleartext: flip a ciphertext

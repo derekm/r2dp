@@ -139,18 +139,19 @@ enum dp_drop {
 	DR_CRYPTO_FAIL,     /* crypto op failed: ICV/auth failure, PMD error */
 	DR_REPLAY,          /* authenticated, but a replay or left of the window */
 	DR_IPSEC_REJECT,    /* rte_ipsec prepare/process rejected (window, ...) */
-	DR_CRYPTO_ENQ,      /* cryptodev queue full / stuck */
+	DR_CRYPTO_ENQ,      /* cryptodev queue full */
 	DR_NOMEM,           /* op pool, headroom, output array */
 	DR_NO_NEXTHOP,      /* egress ESP with no learned peer MAC */
 	DR_CLEAR_OUTER,     /* non-IKE/ARP cleartext on the outer side */
 	DR_ESP_ON_INNER,    /* ESP arriving on the plaintext side */
 	DR_TX_FULL,         /* tx ring full */
+	DR_CRYPTO_STUCK,    /* cryptodev stopped completing ops (see crypto_run) */
 	DR_NUM
 };
 static const char *const dp_drop_name[DR_NUM] = {
 	"malformed", "no_sa_in", "no_sa_out", "policy_discard", "inner_sel",
 	"crypto_fail", "replay", "ipsec_reject", "crypto_enq", "nomem", "no_nexthop",
-	"clear_outer", "esp_on_inner", "tx_full",
+	"clear_outer", "esp_on_inner", "tx_full", "crypto_stuck",
 };
 #define DROP(d, r, n) do { uint64_t n_ = (n); (d)->n_drop += n_; \
 	(d)->n_dropr[(r)] += n_; } while (0)
@@ -243,6 +244,12 @@ struct dpdk_priv {
 	/* per-queue counters for the worker (single rx/tx queue) */
 	uint64_t            n_rx, n_tx, n_esp, n_ike, n_drop;
 	uint64_t            n_dropr[DR_NUM]; /* n_drop split by reason */
+	/* Ops a stuck cryptodev still owns (worker-only).  They are never put
+	 * back to cop_mp while the device holds them; crypto_run drains them
+	 * (freeing their mbufs) before it enqueues anything new, so a late
+	 * completion can never be mistaken for the current batch. */
+	uint32_t            cq_stale;
+	uint64_t            n_crypto_stuck;  /* times the device stopped completing */
 };
 
 /* The inbound SAD stores &dp_sa.sess as its value, so a session handed back
@@ -748,6 +755,35 @@ replay_accept(struct dp_sa *ds, uint32_t lo)
  * every other one is dropped (counted, freed).  A failed op (AUTH_FAILED on
  * a forged ICV, any error) never reaches rte_ipsec_pkt_process, which does
  * not inspect op status (fail closed). */
+/* Test hooks: tests/dp_path.c simulates a device that stops completing. */
+#ifndef DP_CRYPTO_DEQ
+#define DP_CRYPTO_DEQ rte_cryptodev_dequeue_burst
+#endif
+#ifndef DP_CRYPTO_SPIN_MAX
+#define DP_CRYPTO_SPIN_MAX (1u << 24)
+#endif
+
+/* Reclaim ops a stuck device has since completed: their packets belong to
+ * an abandoned batch (already counted as dropped), so free them.  Returns
+ * the number still outstanding. */
+static uint32_t
+crypto_drain_stale(struct dpdk_priv *d)
+{
+	struct rte_crypto_op *cop[BURST_SZ];
+
+	while (d->cq_stale) {
+		uint16_t got = DP_CRYPTO_DEQ(d->cdev_id, 0, cop,
+		    (uint16_t)RTE_MIN(d->cq_stale, (uint32_t)BURST_SZ));
+		if (!got)
+			break;
+		for (uint16_t i = 0; i < got; i++)
+			rte_pktmbuf_free(cop[i]->sym->m_src);
+		rte_mempool_put_bulk(d->cop_mp, (void **)cop, got);
+		d->cq_stale -= got;
+	}
+	return d->cq_stale;
+}
+
 static uint16_t
 crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
     struct rte_mbuf *mb[], uint16_t n, struct rte_mbuf *ok[])
@@ -758,6 +794,14 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	int rp = !(rte_ipsec_sa_type(ss->sa) & RTE_IPSEC_SATP_DIR_MASK);  /* inbound */
 	struct dp_sa *ds;
 
+	/* A device still holding an abandoned batch gets nothing new: its next
+	 * completions would be indistinguishable from this batch's. */
+	if (d->cq_stale && crypto_drain_stale(d)) {
+		DROP(d, DR_CRYPTO_STUCK, n);
+		for (uint16_t i = 0; i < n; i++)
+			rte_pktmbuf_free(mb[i]);
+		return 0;
+	}
 	if (rte_crypto_op_bulk_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 	    cop, n) == 0) {
 		for (uint16_t i = 0; i < n; i++) {
@@ -783,11 +827,18 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 		rte_mempool_put_bulk(d->cop_mp, (void **)&cop[enq], n - enq);
 	/* own every op before touching any mbuf again (async PMDs) */
 	while (dq < enq) {
-		uint16_t got = rte_cryptodev_dequeue_burst(d->cdev_id, 0,
-		    &cop[dq], enq - dq);
+		uint16_t got = DP_CRYPTO_DEQ(d->cdev_id, 0, &cop[dq], enq - dq);
 		dq += got;
-		if (!got && ++spins > (1u << 24))
-			break;           /* stuck device: leave its ops */
+		if (!got && ++spins > DP_CRYPTO_SPIN_MAX)
+			break;
+	}
+	if (dq < enq) {
+		/* Stuck device: the undequeued ops (and their mbufs) still belong
+		 * to it.  Quarantine them -- never back to cop_mp, never touched --
+		 * until crypto_drain_stale reclaims them. */
+		d->cq_stale += enq - dq;
+		d->n_crypto_stuck++;
+		DROP(d, DR_CRYPTO_STUCK, enq - dq);
 	}
 	ds = rp ? sa_of_sess(d, ss) : NULL;
 	for (uint16_t i = 0; i < dq; i++) {
@@ -811,7 +862,6 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	}
 	if (dq)
 		rte_mempool_put_bulk(d->cop_mp, (void **)cop, dq);
-	DROP(d, DR_CRYPTO_ENQ, enq - dq);       /* abandoned in a stuck device */
 	if (!ng)
 		return 0;
 	/* process moves the mbufs it rejected (e.g. replay) to the tail */
@@ -2059,6 +2109,8 @@ dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 	for (int r = 0; r < DR_NUM; r++)
 		fprintf(f, " %s=%llu", dp_drop_name[r],
 		    (unsigned long long)d->n_dropr[r]);
+	fprintf(f, " (crypto_stuck_events=%llu outstanding=%u)",
+	    (unsigned long long)d->n_crypto_stuck, d->cq_stale);
 	fprintf(f, "\n");
 	fflush(f);
 }
