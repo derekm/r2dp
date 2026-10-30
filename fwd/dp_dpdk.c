@@ -102,7 +102,7 @@ struct dp_sa {
 	 * authoritative; rte_ipsec's stays as a second line. */
 	uint64_t           rp_top;   /* highest accepted (64-bit, ESN-expanded) */
 	uint64_t           rp_map[RP_WORDS]; /* bit (seq % RP_BITS) seen */
-	uint32_t           rp_w;     /* window size (packets), 1..RP_BITS */
+	uint32_t           rp_w;     /* window (packets), 0 = off, <= RP_BITS */
 	uint8_t            rp_esn;   /* SA uses extended sequence numbers */
 };
 
@@ -370,7 +370,7 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	ds->proto = rsa->proto;
 	ds->rp_top = 0;
 	memset(ds->rp_map, 0, sizeof(ds->rp_map));
-	ds->rp_w = rsa->wsize ? rsa->wsize : 64;     /* as r2dp_gcm_sa_prm */
+	ds->rp_w = rsa->wsize;          /* 0 = anti-replay off (PF_KEY) */
 	ds->rp_esn = (rsa->saflags & R2DP_SAF_ESN) != 0;
 	/* tunnel endpoints: addr4_to_u32 memcpy's rsa->dst.addr[0..4], raw wire
 	 * order; match that exactly for endpoint selection (H3). */
@@ -702,12 +702,16 @@ static int in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 static struct dp_sa *sa_of_sess(struct dpdk_priv *d, struct rte_ipsec_session *ss);
 
 /* RFC 4303 s3.4.3 / App. A anti-replay on an authenticated packet's 32-bit
- * sequence number: 1 = accept (and record), 0 = replay / too old. */
+ * sequence number: 1 = accept (and record), 0 = replay / too old.  A zero
+ * window means the SA was installed with anti-replay disabled. */
 static int
 replay_accept(struct dp_sa *ds, uint32_t lo)
 {
 	uint64_t t = ds->rp_top, sqn = lo;
 	uint32_t w = ds->rp_w, tl = (uint32_t)t;
+
+	if (!w)
+		return 1;
 
 	if (ds->rp_esn) {                /* RFC 4303 App. A2.2 reconstruction */
 		uint64_t hi = t >> 32;

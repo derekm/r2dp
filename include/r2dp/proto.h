@@ -176,8 +176,8 @@ struct r2dp_sa {
 	uint8_t  mode;                /* R2DP_MODE_* */
 	uint8_t  enc;                 /* R2DP_ENCR_* */
 	uint8_t  integ;               /* R2DP_INTEG_* */
-	uint8_t  wsize;               /* replay window (packets), 0 = forwarder
-	                               * default (64); anti-replay is never off */
+	uint8_t  wsize;               /* replay window (packets); 0 = anti-replay
+	                               * disabled (PF_KEY sadb_sa_replay) */
 	uint8_t  natt_type;           /* R2DP_NATT_* */
 	uint8_t  expired;             /* EXPIRE only: 1 soft, 2 hard */
 	uint8_t  dir;                 /* v2: R2DP_DIR_IN (protects traffic to

@@ -247,12 +247,48 @@ t_replay_window(void)
 	CHECK(replay_accept(&s, 500) && replay_accept(&s, 301) && !replay_accept(&s, 300) &&
 	    !replay_accept(&s, 301), "replay: 200-packet window (> 64) honoured");
 
+	memset(&s, 0, sizeof(s)); s.rp_w = 0;     /* wsize 0: PF_KEY "off" */
+	CHECK(replay_accept(&s, 7) && replay_accept(&s, 7) && replay_accept(&s, 1),
+	    "replay: window 0 disables anti-replay (duplicates and old seqs pass)");
+
 	memset(&s, 0, sizeof(s)); s.rp_w = 64; s.rp_esn = 1;
 	s.rp_top = 0xfffffff0ull;
 	CHECK(replay_accept(&s, 5) && s.rp_top == 0x100000005ull,
 	    "replay/ESN: low seq after the top wraps into the next epoch");
 	CHECK(replay_accept(&s, 0xfffffff8u) && !replay_accept(&s, 0xfffffff8u),
 	    "replay/ESN: late packet from the previous epoch once, not twice");
+}
+
+/* sa_install carries the requested window into both our window and
+ * librte_ipsec's: 0 (off) installs with and without ESN. */
+static struct dp_sa *
+sa_by_spi(struct dpdk_priv *d, uint32_t spi)
+{
+	for (int i = 0; i < MAX_SA; i++)
+		if (d->sa_tab[i].used && d->sa_tab[i].spi == spi)
+			return &d->sa_tab[i];
+	return NULL;
+}
+
+static void
+t_wsize_install(struct dpdk_priv *d)
+{
+	struct r2dp_sa r;
+	struct dp_sa *s;
+
+	mk_sa(&r, 0x5001, "192.0.2.2", "192.0.2.1");
+	r.wsize = 0;
+	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0 && (s = sa_by_spi(d, 0x5001)) &&
+	    s->rp_w == 0, "wsize 0: inbound SA installs with anti-replay off");
+	sa_install(d, &r, NULL, 0, 1, 1);
+	r.saflags = R2DP_SAF_ESN;
+	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0 && (s = sa_by_spi(d, 0x5001)) &&
+	    s->rp_w == 0 && s->rp_esn, "wsize 0 + ESN: installs (rte_ipsec keeps 64 for ESN)");
+	sa_install(d, &r, NULL, 0, 1, 1);
+	r.saflags = 0; r.wsize = 200;
+	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0 && (s = sa_by_spi(d, 0x5001)) &&
+	    s->rp_w == 200, "wsize 200 carried to the SA");
+	sa_install(d, &r, NULL, 0, 1, 1);
 }
 
 /* Indexed inbound check (installed SAs -> snapshot per-SA policy list) and
@@ -554,6 +590,7 @@ main(void)
 	t_inbound_policy(d);
 	t_binding(d);
 	t_replay_window();
+	t_wsize_install(d);
 	t_inbound_indexed(d);
 	t_acl_diff(d);
 

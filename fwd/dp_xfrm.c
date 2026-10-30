@@ -15,8 +15,9 @@
  *    changes the selector installs the new policy first and only then
  *    removes the old one (rolling the new one back if that fails);
  *  - SA direction comes from the v2 r2dp_sa.dir (via FWD_DP_SA_INBOUND):
- *    inbound SAs always carry an XFRMA_REPLAY_ESN_VAL bitmap replay state,
- *    so windows larger than the legacy 32-bit field work (wsize 0 -> 64);
+ *    inbound SAs with a window carry an XFRMA_REPLAY_ESN_VAL bitmap replay
+ *    state, so windows larger than the legacy 32-bit field work (wsize 0 =
+ *    anti-replay off, as PF_KEY);
  *    the ESN flag is set only when the SA negotiated ESN;
  *  - lifetimes stay with ctl.c (it sends EXPIRE); the kernel gets none, so
  *    it never deletes an SA behind ctl's back.  sa_bytes reads curlft;
@@ -331,10 +332,10 @@ build_sa(struct nlb *n, uint16_t type, const struct r2dp_sa *sa,
 	/* Replay state: always the bitmap (ESN_VAL) form on inbound SAs, so a
 	 * window above the legacy u8/32-bit limit works; outbound SAs only
 	 * need it to carry the 64-bit counter under ESN. */
-	if (inbound || esn) {
+	if ((inbound && sa->wsize) || esn) {
 		uint8_t eb[sizeof(struct xfrm_replay_state_esn) + 4 * 8];
 		struct xfrm_replay_state_esn *e = (struct xfrm_replay_state_esn *)eb;
-		unsigned win = inbound ? (sa->wsize ? sa->wsize : 64) : 0;
+		unsigned win = inbound ? sa->wsize : 0;   /* 0 = off */
 		unsigned words = (win + 31) / 32;
 		memset(eb, 0, sizeof(eb));
 		e->bmp_len = words;

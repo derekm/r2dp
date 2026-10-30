@@ -80,6 +80,7 @@ mk_sa(struct r2dp_sa *r, uint32_t spi, const char *src, const char *dst)
 	memset(r, 0, sizeof(*r));
 	r->proto = R2DP_PROTO_ESP; r->mode = R2DP_MODE_TUNNEL;
 	r->enc = R2DP_ENCR_AES_GCM_16; r->spi = htonl(spi); r->enckeylen = 20;
+	r->wsize = 64;
 	r->src.family = r->dst.family = R2DP_AF_INET4;
 	inet_pton(AF_INET, src, r->src.addr);
 	inet_pton(AF_INET, dst, r->dst.addr);

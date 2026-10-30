@@ -18,7 +18,7 @@
  *   r2dpctl [socket] sa-add dir=in|out spi=0x1001 src=A dst=B
  *           enc=aes-gcm-16|aes-gcm-12|aes-gcm-8|aes-cbc|aes-ctr|null|NUM
  *           [integ=none|sha1|sha256|sha384|sha512|NUM] key=HEX [authkey=HEX]
- *           [reqid=N] [wsize=N] [mode=tunnel|transport] [natt=SPORT:DPORT]
+ *           [reqid=N] [wsize=N (default 64, 0 = no anti-replay)] [mode=tunnel|transport] [natt=SPORT:DPORT]
  *   r2dpctl [socket] sa-del spi=0x1001 dst=B
  *   r2dpctl [socket] sp-add dir=in|out|fwd action=protect|discard|bypass
  *           src=NET/LEN dst=NET/LEN [proto=any|tcp|udp|icmp|NUM]
@@ -249,6 +249,7 @@ cmd_sa(int fd, int add, int argc, char **argv)
 	memset(&sa, 0, sizeof(sa));
 	sa.proto = R2DP_PROTO_ESP;
 	sa.mode = R2DP_MODE_TUNNEL;
+	sa.wsize = 64;                 /* iked's default; wsize=0 turns it off */
 	if (parse_u32(kv(argc, argv, "spi"), &v) || v < 256)
 		return usage("spi=N (>= 256) required");
 	sa.spi = htonl(v);
