@@ -269,7 +269,16 @@ do_getspi(int fd, const struct r2dp_msg *m)
  * tracked here (available to every backend); BYTE needs a per-SA counter in the
  * dataplane and is skipped when the backend offers no ->sa_bytes (0 is
  * "infinite").  Notify flags are shared per level: whichever threshold (time or
- * bytes) trips first for soft/hard fires the one EXPIRE. */
+ * bytes) trips first for soft/hard fires the one EXPIRE.
+ *
+ * Ordering: a hard expiry withdraws the SA from the dataplane BEFORE iked
+ * hears of it, so no packet is protected by an SA iked already treats as
+ * dead.  Soft is reported at most once per install and never after hard.
+ * The EXPIRE carries the SA's current counters: iked drops a soft expiry
+ * whose allocation count is 0 (ike_pfkey.c: Linux soft-expires unused SAs
+ * too), so a used SA must report alloc > 0 or it is never rekeyed early.
+ * The backends count bytes, not packets: alloc is 1 once any byte moved
+ * (or when the backend cannot count), 0 for a provably idle SA. */
 static void
 check_lifetimes(const int *cli, int ncli)
 {
@@ -317,14 +326,22 @@ check_lifetimes(const int *cli, int ncli)
 		} else {
 			continue;
 		}
-		for (int c = 0; c < ncli; c++)
-			csend(cli[c], R2DP_EXPIRE, 0, 0, R2DP_HF_NOKEYS,
-			    &sp, sizeof(sp), NULL, 0);
+		if (nbytes < 0 && C->dp.ops && C->dp.ops->sa_bytes) {
+			uint32_t ndip;
+			memcpy(&ndip, &e->sa.dst.addr, 4);
+			nbytes = C->dp.ops->sa_bytes(&C->dp, ntohl(e->sa.spi), ndip);
+		}
+		sp.cur_add = (uint64_t)e->installed_at;
+		sp.cur_bytes = nbytes > 0 ? (uint64_t)nbytes : 0;
+		sp.cur_alloc = nbytes != 0 ? 1 : 0;
 		if (stale) {
-			/* hard expiry: withdraw the SA from the dataplane too */
+			/* hard expiry: out of service first, then tell iked */
 			(void)sa_apply_dp(C, 0, &e->sa, NULL, 0);
 			e->used = 0; e->installed_at = 0;
 		}
+		for (int c = 0; c < ncli; c++)
+			csend(cli[c], R2DP_EXPIRE, 0, 0, R2DP_HF_NOKEYS,
+			    &sp, sizeof(sp), NULL, 0);
 	}
 }
 

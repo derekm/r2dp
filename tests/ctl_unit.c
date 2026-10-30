@@ -13,6 +13,9 @@ static int fails;
 
 /* ---- fake dataplane ---- */
 static int fk_last_flags = -1, fk_sa_calls, fk_sp_fail, fk_sa_fail;
+static int fk_del_saw_expire = -1;   /* EXPIRE queued when the dp delete ran? */
+static int64_t fk_bytes = -1;        /* sa_bytes answer; -1 = not offered */
+static int sv[2];       /* sv[0] = server end, sv[1] = client end */
 static struct r2dp_sp fk_last_sp;
 
 static int
@@ -22,6 +25,10 @@ fk_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	(void)dp; (void)sa; (void)blob; (void)blen;
 	fk_sa_calls++;
 	fk_last_flags = add;
+	if (!add) {
+		struct pollfd p = { .fd = sv[1], .events = POLLIN };
+		fk_del_saw_expire = poll(&p, 1, 0) == 1;
+	}
 	return fk_sa_fail;
 }
 
@@ -42,12 +49,19 @@ fk_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 	return 0;
 }
 
+static int64_t
+fk_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
+{
+	(void)dp; (void)spi; (void)dip;
+	return fk_bytes;
+}
+
 static const struct fwd_dp_ops fk_ops = {
 	.sa_add = fk_sa_add, .sp_add = fk_sp_add, .sp_del = fk_sp_del,
+	.sa_bytes = fk_sa_bytes,
 };
 
 static struct fwd_ctl ctl;
-static int sv[2];       /* sv[0] = server end, sv[1] = client end */
 
 /* Dispatch one request and return the reply status (or -1 on no reply). */
 static int
@@ -228,6 +242,101 @@ t_replay_win(void)
 	    "replay_win stored for GET/DUMP");
 }
 
+/* Read every EXPIRE queued on the client end; returns how many, the last
+ * one in *last. */
+static int
+expires(struct r2dp_sa *last)
+{
+	struct r2dp_msg r;
+	struct pollfd p = { .fd = sv[1], .events = POLLIN };
+	int n = 0;
+
+	while (poll(&p, 1, 0) == 1 && r2dp_recv(sv[1], &r) == 0)
+		if (r.h.type == R2DP_EXPIRE) {
+			*last = *r2dp_msg_sa(&r);
+			n++;
+		}
+	return n;
+}
+
+/* Lifetime expiry as iked needs it (ported coverage from the upstream
+ * prototype's M2 gate): soft once, with counters that make iked rekey;
+ * hard takes the SA out of service before the EXPIRE goes out; a byte
+ * limit behaves like a time limit; an idle SA reports alloc 0. */
+static void
+t_expiry(void)
+{
+	struct r2dp_sa sa, x;
+	struct fwd_sa_ent *e;
+	uint8_t key[20] = { 0 };
+	int cli[1] = { sv[0] };
+
+	expires(&x);                         /* nothing stale on the wire */
+	mk_sa(&sa, 0x9201); sa.enckeylen = 20; sa.dir = R2DP_DIR_OUT;
+	sa.lft_soft_time = 10; sa.lft_hard_time = 20;
+	CHECK(req(R2DP_SA_ADD, 0, &sa, sizeof(sa), key, 20, NULL) == 0, "expiry: ADD");
+	e = sa_find(C, &sa);
+	if (!e) { CHECK(0, "expiry: SA present"); return; }
+
+	fk_bytes = 1500;
+	check_lifetimes(cli, 1);
+	CHECK(expires(&x) == 0, "expiry: nothing before the soft limit");
+	e->installed_at -= 11;
+	check_lifetimes(cli, 1);
+	CHECK(expires(&x) == 1 && x.expired == 1 && x.spi == sa.spi,
+	    "expiry: soft EXPIRE at the soft limit");
+	CHECK(x.cur_alloc > 0 && x.cur_bytes == 1500 && x.cur_add == (uint64_t)e->installed_at,
+	    "expiry: soft carries live counters (alloc > 0: iked rekeys)");
+	CHECK(fk_last_flags != 0, "expiry: soft leaves the SA in service");
+	check_lifetimes(cli, 1);
+	CHECK(expires(&x) == 0, "expiry: soft reported once");
+
+	e->installed_at -= 10;
+	fk_del_saw_expire = -1;
+	check_lifetimes(cli, 1);
+	CHECK(fk_last_flags == 0 && fk_del_saw_expire == 0,
+	    "expiry: hard removes the SA from the dataplane before notifying");
+	CHECK(expires(&x) == 1 && x.expired == 2, "expiry: hard EXPIRE sent");
+	CHECK(!sa_find(C, &sa), "expiry: hard-expired SA gone from the SAD");
+	check_lifetimes(cli, 1);
+	CHECK(expires(&x) == 0, "expiry: hard reported once");
+
+	/* both limits passed in one tick: hard only, never a late soft */
+	mk_sa(&sa, 0x9202); sa.enckeylen = 20; sa.dir = R2DP_DIR_OUT;
+	sa.lft_soft_time = 10; sa.lft_hard_time = 20;
+	req(R2DP_SA_ADD, 0, &sa, sizeof(sa), key, 20, NULL);
+	sa_find(C, &sa)->installed_at -= 30;
+	check_lifetimes(cli, 1);
+	CHECK(expires(&x) == 1 && x.expired == 2, "expiry: soft+hard together -> one hard");
+
+	/* byte limits; an idle SA soft-expires with alloc 0 (iked: no rekey) */
+	mk_sa(&sa, 0x9203); sa.enckeylen = 20; sa.dir = R2DP_DIR_OUT;
+	sa.lft_soft_bytes = 1000; sa.lft_hard_bytes = 2000;
+	req(R2DP_SA_ADD, 0, &sa, sizeof(sa), key, 20, NULL);
+	fk_bytes = 999;
+	check_lifetimes(cli, 1);
+	CHECK(expires(&x) == 0, "expiry: below the soft byte limit");
+	fk_bytes = 1000;
+	check_lifetimes(cli, 1);
+	CHECK(expires(&x) == 1 && x.expired == 1 && x.cur_bytes == 1000,
+	    "expiry: soft byte limit");
+	fk_bytes = 2000;
+	fk_del_saw_expire = -1;
+	check_lifetimes(cli, 1);
+	CHECK(fk_del_saw_expire == 0 && expires(&x) == 1 && x.expired == 2,
+	    "expiry: hard byte limit, out of service first");
+
+	mk_sa(&sa, 0x9204); sa.enckeylen = 20; sa.dir = R2DP_DIR_OUT;
+	sa.lft_soft_time = 5;
+	req(R2DP_SA_ADD, 0, &sa, sizeof(sa), key, 20, NULL);
+	sa_find(C, &sa)->installed_at -= 6;
+	fk_bytes = 0;
+	check_lifetimes(cli, 1);
+	CHECK(expires(&x) == 1 && x.expired == 1 && x.cur_alloc == 0,
+	    "expiry: idle SA soft-expires with alloc 0");
+	fk_bytes = -1;
+}
+
 static void
 t_sp_upsert(void)
 {
@@ -319,6 +428,7 @@ main(void)
 	t_prefix();
 	t_lifetime_clock();
 	t_replay_win();
+	t_expiry();
 	t_sp_upsert();
 	t_slow_client();
 
