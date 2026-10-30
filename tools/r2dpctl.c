@@ -278,8 +278,14 @@ cmd_sa(int fd, int add, int argc, char **argv)
 	if ((s = kv(argc, argv, "reqid")) && parse_u32(s, &sa.reqid))
 		return usage("bad reqid=");
 	if ((s = kv(argc, argv, "wsize"))) {
-		if (parse_u32(s, &v) || v > 255) return usage("wsize=0..255");
-		sa.wsize = (uint8_t)v;
+		if (parse_u32(s, &v) || v > R2DP_MAX_REPLAY_WIN)
+			return usage("wsize=0..1024");
+		if (v > 255) {         /* wide window: replay_win, wsize saturates */
+			sa.replay_win = v;
+			sa.wsize = 255;
+		} else {
+			sa.wsize = (uint8_t)v;
+		}
 	}
 	if ((s = kv(argc, argv, "natt"))) {
 		unsigned sp, dp;

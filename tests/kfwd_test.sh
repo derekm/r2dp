@@ -32,6 +32,8 @@ chk "inbound SA, wsize=128" $C sa-add dir=in spi=0x1000 src=192.0.2.2 dst=192.0.
 chk "kernel holds a 128-packet bitmap window" sh -c "ip -d xfrm state get src 192.0.2.2 dst 192.0.2.1 proto esp spi 0x1000 | grep -Eq 'replay-window 128|window 128'"
 chk "default window (r2dpctl: 64)" $C sa-add dir=in spi=0x1001 src=192.0.2.2 dst=192.0.2.1 enc=aes-gcm-16 key=$K
 chk "  ... and the kernel shows 64" sh -c "ip -d xfrm state get src 192.0.2.2 dst 192.0.2.1 proto esp spi 0x1001 | grep -Eq 'replay-window 64|window 64'"
+chk "inbound SA, wsize=1024 (replay_win)" $C sa-add dir=in spi=0x1004 src=192.0.2.2 dst=192.0.2.1 enc=aes-gcm-16 key=$K wsize=1024
+chk "  ... and the kernel holds 1024" sh -c "ip -d xfrm state get src 192.0.2.2 dst 192.0.2.1 proto esp spi 0x1004 | grep -Eq 'replay-window 1024|window 1024'"
 chk "wsize=0: anti-replay off" $C sa-add dir=in spi=0x1003 src=192.0.2.2 dst=192.0.2.1 enc=aes-gcm-16 key=$K wsize=0
 chk "  ... and the kernel shows replay-window 0" sh -c "ip -d xfrm state get src 192.0.2.2 dst 192.0.2.1 proto esp spi 0x1003 | grep -q 'replay-window 0'"
 chk "outbound SA (dir=out): no replay window" $C sa-add dir=out spi=0x2000 src=192.0.2.1 dst=192.0.2.2 enc=aes-gcm-16 key=$K
@@ -53,6 +55,6 @@ chk "  ... gone from the kernel" sh -c "! ip xfrm state get src 192.0.2.2 dst 19
 kill -TERM $P; wait $P 2>/dev/null
 chk "cleanup on exit: no states left" sh -c "[ -z \"\$(ip xfrm state list)\" ]"
 chk "cleanup on exit: no policies left" sh -c "[ -z \"\$(ip xfrm policy list)\" ]"
-chk "cleanup reported" grep -q "cleanup removed 3 SA(s), 1 SP(s)" "$T/fwd.out"
+chk "cleanup reported" grep -q "cleanup removed 4 SA(s), 1 SP(s)" "$T/fwd.out"
 [ $fails = 0 ] && echo "kfwd_test: OK" || { echo "kfwd_test: $fails failures"; cat "$T/fwd.out"; }
 exit $((fails != 0))

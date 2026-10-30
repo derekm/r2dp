@@ -81,7 +81,7 @@ r2dp_gcm_sa_prm(const struct r2dp_sa *rsa, const void *key, int inbound,
 	prm->ipsec_xform.options.esn = (rsa->saflags & R2DP_SAF_ESN) ? 1 : 0;
 	/* 0 = anti-replay off (PF_KEY).  librte_ipsec still keeps a 64-packet
 	 * window under ESN: it needs one to infer the high sequence bits. */
-	prm->ipsec_xform.replay_win_sz = rsa->wsize;
+	prm->ipsec_xform.replay_win_sz = r2dp_sa_window(rsa);
 	prm->ipsec_xform.tunnel.type = RTE_SECURITY_IPSEC_TUNNEL_IPV4;
 
 	memset(eh, 0, sizeof(*eh));

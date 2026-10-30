@@ -206,6 +206,28 @@ t_lifetime_clock(void)
 	}
 }
 
+/* Replay windows wider than the u8 wsize ride in replay_win; anything over
+ * R2DP_MAX_REPLAY_WIN is refused before the dataplane sees it. */
+static void
+t_replay_win(void)
+{
+	struct r2dp_sa sa;
+	uint8_t key[20] = { 0 };
+	int calls = fk_sa_calls;
+
+	mk_sa(&sa, 0x9101); sa.enckeylen = 20; sa.dir = R2DP_DIR_IN;
+	sa.wsize = 255; sa.replay_win = R2DP_MAX_REPLAY_WIN + 1;
+	CHECK(req(R2DP_SA_ADD, 0, &sa, sizeof(sa), key, 20, NULL) == EINVAL &&
+	    fk_sa_calls == calls, "replay_win > %d refused (EINVAL, dp untouched)",
+	    R2DP_MAX_REPLAY_WIN);
+	sa.replay_win = R2DP_MAX_REPLAY_WIN;
+	CHECK(req(R2DP_SA_ADD, 0, &sa, sizeof(sa), key, 20, NULL) == 0,
+	    "replay_win %d accepted", R2DP_MAX_REPLAY_WIN);
+	CHECK(r2dp_sa_window(&sa) == R2DP_MAX_REPLAY_WIN && sa_find(C, &sa) &&
+	    sa_find(C, &sa)->sa.replay_win == R2DP_MAX_REPLAY_WIN,
+	    "replay_win stored for GET/DUMP");
+}
+
 static void
 t_sp_upsert(void)
 {
@@ -296,6 +318,7 @@ main(void)
 	t_reserved_spi();
 	t_prefix();
 	t_lifetime_clock();
+	t_replay_win();
 	t_sp_upsert();
 	t_slow_client();
 

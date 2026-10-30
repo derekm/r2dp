@@ -247,6 +247,18 @@ t_replay_window(void)
 	CHECK(replay_accept(&s, 500) && replay_accept(&s, 301) && !replay_accept(&s, 300) &&
 	    !replay_accept(&s, 301), "replay: 200-packet window (> 64) honoured");
 
+	memset(&s, 0, sizeof(s)); s.rp_w = RP_BITS;   /* widest window: 1024 */
+	bad = 0;
+	for (uint32_t q = 1; q <= 3000; q++)
+		bad += !replay_accept(&s, q);
+	for (uint32_t q = 3000 - RP_BITS + 1; q <= 3000; q++)
+		bad += replay_accept(&s, q);
+	CHECK(!bad && !replay_accept(&s, 3000 - RP_BITS),
+	    "replay: 1024-packet window, every slot refused once, edge outside");
+	CHECK(replay_accept(&s, 3000 + RP_BITS - 1) && !replay_accept(&s, 3000) &&
+	    !replay_accept(&s, 2999) && replay_accept(&s, 3500),
+	    "replay: slide by window-1 keeps the oldest seen, drops what fell out");
+
 	memset(&s, 0, sizeof(s)); s.rp_w = 0;     /* wsize 0: PF_KEY "off" */
 	CHECK(replay_accept(&s, 7) && replay_accept(&s, 7) && replay_accept(&s, 1),
 	    "replay: window 0 disables anti-replay (duplicates and old seqs pass)");
@@ -285,6 +297,11 @@ t_wsize_install(struct dpdk_priv *d)
 	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0 && (s = sa_by_spi(d, 0x5001)) &&
 	    s->rp_w == 0 && s->rp_esn, "wsize 0 + ESN: installs (rte_ipsec keeps 64 for ESN)");
 	sa_install(d, &r, NULL, 0, 1, 1);
+	r.wsize = 255; r.replay_win = 1024;
+	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0 && (s = sa_by_spi(d, 0x5001)) &&
+	    s->rp_w == 1024, "replay_win 1024 (ESN) overrides the u8 wsize");
+	sa_install(d, &r, NULL, 0, 1, 1);
+	r.replay_win = 0;
 	r.saflags = 0; r.wsize = 200;
 	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0 && (s = sa_by_spi(d, 0x5001)) &&
 	    s->rp_w == 200, "wsize 200 carried to the SA");

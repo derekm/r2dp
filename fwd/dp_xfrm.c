@@ -332,10 +332,11 @@ build_sa(struct nlb *n, uint16_t type, const struct r2dp_sa *sa,
 	/* Replay state: always the bitmap (ESN_VAL) form on inbound SAs, so a
 	 * window above the legacy u8/32-bit limit works; outbound SAs only
 	 * need it to carry the 64-bit counter under ESN. */
-	if ((inbound && sa->wsize) || esn) {
-		uint8_t eb[sizeof(struct xfrm_replay_state_esn) + 4 * 8];
+	if ((inbound && r2dp_sa_window(sa)) || esn) {
+		uint8_t eb[sizeof(struct xfrm_replay_state_esn) +
+		    4 * (R2DP_MAX_REPLAY_WIN / 32)];
 		struct xfrm_replay_state_esn *e = (struct xfrm_replay_state_esn *)eb;
-		unsigned win = inbound ? sa->wsize : 0;   /* 0 = off */
+		unsigned win = inbound ? r2dp_sa_window(sa) : 0;   /* 0 = off */
 		unsigned words = (win + 31) / 32;
 		memset(eb, 0, sizeof(eb));
 		e->bmp_len = words;

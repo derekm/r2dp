@@ -372,6 +372,8 @@ do_sa(int fd, const struct r2dp_msg *m)
 		blen = el + al;
 	}
 
+	/* every backend sizes its replay state for at most this window */
+	if (r2dp_sa_window(rq) > R2DP_MAX_REPLAY_WIN) { rc = EINVAL; goto out; }
 	switch (m->h.type) {
 	case R2DP_SA_ADD:
 		if (e && !e->larval) { rc = EEXIST; goto out; }

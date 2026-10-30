@@ -21,6 +21,7 @@
 #define R2DP_VERSION      2                  /* v2: r2dp_sa.dir (was pad0) */
 #define R2DP_MAX_MSG      4096
 #define R2DP_MAX_KEY      64                 /* per key blob, bytes */
+#define R2DP_MAX_REPLAY_WIN 1024             /* r2dp_sa.replay_win cap */
 #define R2DP_DEFAULT_SOCK "/run/r2dp/r2dp.sock"
 #define R2DP_ENV_SOCK     "R2DP_SOCK"
 
@@ -187,11 +188,22 @@ struct r2dp_sa {
 	uint16_t natt_sport, natt_dport;   /* network order; meaningful only if natt_type != NONE
 	                                    * (iked sets them to 500 even for non-NAT-T SAs) */
 	uint16_t enckeylen, authkeylen;    /* bytes of tail */
-	uint32_t pad1;
+	uint32_t replay_win;          /* replay window (packets) when it does not
+	                               * fit wsize; 0 = use wsize.  Senders set
+	                               * wsize = 255 alongside it so a forwarder
+	                               * that predates the field still protects.
+	                               * Capped at R2DP_MAX_REPLAY_WIN. */
 	struct r2dp_addr src, dst;         /* tunnel endpoints */
 	struct r2dp_addr natoa_src, natoa_dst;  /* UNSET if none */
 };
 _Static_assert(sizeof(struct r2dp_sa) == 200, "r2dp_sa layout");
+
+/* Effective anti-replay window of an SA, in packets (0 = off). */
+static inline uint32_t
+r2dp_sa_window(const struct r2dp_sa *sa)
+{
+	return sa->replay_win ? sa->replay_win : sa->wsize;
+}
 
 /* ---- SP -------------------------------------------------------------- */
 struct r2dp_sp {

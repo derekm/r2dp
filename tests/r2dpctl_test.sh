@@ -32,6 +32,7 @@ ok $C sa-del spi=0x1001 dst=192.0.2.2
 rc 1 $C sa-del spi=0x1001 dst=192.0.2.2
 ok $C sa-del spi=0x2001 dst=192.0.2.1
 rc 2 $C sa-add spi=1
+rc 2 $C sa-add dir=in spi=0x3001 src=192.0.2.2 dst=192.0.2.1 enc=aes-gcm-16 key=$KEY wsize=1025
 rc 2 $C sa-add spi=0x1001 dst=192.0.2.2 src=192.0.2.1 enc=aes-gcm-16 key=$KEY   # no dir (v2)
 rc 2 $C sp-add dir=out action=protect src=10.0.0.0/8 dst=10.0.0.0/8             # no tunnel
 rc 2 $C bogus

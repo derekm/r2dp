@@ -66,7 +66,7 @@
 #define BURST_SZ      128
 #define TAP_IF_DEFAULT "r2dp-tap"
 
-#define RP_BITS  256              /* >= the largest window (wsize is a u8) */
+#define RP_BITS  R2DP_MAX_REPLAY_WIN  /* >= the largest window ctl accepts */
 #define RP_WORDS (RP_BITS / 64)
 
 struct dp_sa {
@@ -370,7 +370,7 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	ds->proto = rsa->proto;
 	ds->rp_top = 0;
 	memset(ds->rp_map, 0, sizeof(ds->rp_map));
-	ds->rp_w = rsa->wsize;          /* 0 = anti-replay off (PF_KEY) */
+	ds->rp_w = r2dp_sa_window(rsa); /* 0 = off; ctl caps it at RP_BITS */
 	ds->rp_esn = (rsa->saflags & R2DP_SAF_ESN) != 0;
 	/* tunnel endpoints: addr4_to_u32 memcpy's rsa->dst.addr[0..4], raw wire
 	 * order; match that exactly for endpoint selection (H3). */
