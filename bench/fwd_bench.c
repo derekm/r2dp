@@ -19,7 +19,7 @@
  *     R2DP_BENCH_MAX_CYC=0 disables it (sanitizer builds).
  * Exit 77 (skip) without EAL/crypto_openssl unless R2DP_REQUIRE_DPDK=1.
  */
-#include "../fwd/dp_dpdk.c"
+#include "dpdk_int.h"
 
 #define NPKT 16384
 #define BURST 32

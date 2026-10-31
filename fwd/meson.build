@@ -21,7 +21,8 @@ fwd_sources = files(
 
 fwd_o = fwd_sources
 if dpdk.found()
-  fwd_o += files('dp_dpdk.c', 'dp_gcm.c', 'dp_nh.c')
+  fwd_o += files('dp_dpdk.c', 'dpdk_sad.c', 'dpdk_spd.c', 'dpdk_esp.c',
+    'dpdk_stats.c', 'dp_gcm.c', 'dp_nh.c')
   dpdk_inc = dpdk
 else
   # When DPDK is disabled, dp_dpdk.c is not compiled; dp.h's

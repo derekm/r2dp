@@ -13,7 +13,7 @@
  *
  * SKIP (77) without EAL/crypto_openssl unless R2DP_REQUIRE_DPDK is set.
  */
-#include "../fwd/dp_dpdk.c"
+#include "dpdk_int.h"
 
 static int fails;
 #define CHECK(c, m) do { if (c) printf("ok   %s\n", m); \

@@ -55,7 +55,8 @@ if dpdk.found()
   # dp_sa: production dp_dpdk.c SA table under ASan/UBSan -- C1 (no
   # sa_tab[-1] write on a fresh inbound install) and newest-SA egress pick.
   test('dp_sa',
-    executable('dp_sa', 'dp_sa.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c', '../fwd/dp_sel.c',
+    executable('dp_sa', 'dp_sa.c', '../fwd/dpdk_sad.c', '../fwd/dpdk_spd.c', '../fwd/dpdk_esp.c',
+      '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c', '../fwd/dp_sel.c',
       include_directories: [include_directories('../include'),
                             include_directories('../fwd')],
       dependencies: dpdk,
@@ -66,7 +67,8 @@ if dpdk.found()
   # dp_path: outbound encrypt -> inbound decrypt through the production
   # data path, with policy dispositions (CI data-path coverage).
   test('dp_path',
-    executable('dp_path', 'dp_path.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c',
+    executable('dp_path', 'dp_path.c', '../fwd/dpdk_sad.c', '../fwd/dpdk_spd.c', '../fwd/dpdk_esp.c',
+      '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c',
       '../fwd/dp_sel.c',
       include_directories: [include_directories('../include'),
                             include_directories('../fwd')],

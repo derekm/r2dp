@@ -13,10 +13,13 @@
  */
 /* A cryptodev that stops completing: dequeue returns nothing while set. */
 static int deq_stuck;
-#define DP_CRYPTO_DEQ(dev, qp, ops, n) \
-	(deq_stuck ? 0 : rte_cryptodev_dequeue_burst((dev), (qp), (ops), (n)))
-#define DP_CRYPTO_SPIN_MAX 1000
-#include "../fwd/dp_dpdk.c"
+#include "dpdk_int.h"
+
+static uint16_t
+test_deq(uint8_t dev, uint16_t qp, struct rte_crypto_op **ops, uint16_t n)
+{
+	return deq_stuck ? 0 : rte_cryptodev_dequeue_burst(dev, qp, ops, n);
+}
 
 static int fails;
 #define CHECK(c, m) do { if (c) printf("ok   %s\n", m); \
@@ -38,6 +41,8 @@ mk_priv(const char *tag)
 	memset(d, 0, sizeof(*d));
 	d->cdev_id = (uint8_t)cdev;
 	d->have_cdev = 1;
+	d->cdeq = test_deq;
+	d->spin_max = 1000;
 	snprintf(n, sizeof(n), "%s_sess", tag);
 	d->sess_mp = rte_cryptodev_sym_session_pool_create(n, 64,
 	    rte_cryptodev_sym_get_private_session_size(d->cdev_id), 0, 0,
