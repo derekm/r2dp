@@ -515,7 +515,12 @@ t_acl_diff(struct dpdk_priv *d)
 		memcpy(bip[bn], ip, sizeof(ip));
 		bav[bn] = avail;
 		bwant[bn++] = got;
-		if (bn == BURST_SZ || n + 1 == npk) {
+		if (n % 3 == 0) {        /* same key twice in a row: shared result */
+			memcpy(bip[bn], ip, sizeof(ip));
+			bav[bn] = avail;
+			bwant[bn++] = got;
+		}
+		if (bn >= BURST_SZ - 1 || n + 1 == npk) {
 			const struct rte_ipv4_hdr *bp[BURST_SZ];
 			const struct r2dp_sp *bgot[BURST_SZ];
 			struct dp_sa *bds[BURST_SZ];

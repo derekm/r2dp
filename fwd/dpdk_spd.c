@@ -508,10 +508,13 @@ sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip, size_t avail,
 	return spd_resolve(d, s, res, sa);
 }
 
-/* sp_match_out for a burst: one rte_acl_classify over every packet that
- * parses (the trie walk is vectorised across the burst and the snapshot is
- * loaded once).  ip[i] == NULL or an unparsable header yields sp[i] = NULL,
- * sa[i] = NULL, exactly as sp_match_out would. */
+/* sp_match_out for a burst: one rte_acl_classify over the burst's
+ * distinct keys (the trie walk is vectorised across them and the snapshot
+ * is loaded once); a packet whose key equals the previous distinct one --
+ * the common case, a burst is mostly one flow -- reuses its result
+ * (acl_key_fill zeroes the key, so the compare covers the padding too).
+ * ip[i] == NULL or an unparsable header yields sp[i] = NULL, sa[i] = NULL,
+ * exactly as sp_match_out would. */
 void
 sp_match_out_burst(struct dpdk_priv *d, const struct rte_ipv4_hdr *const ip[],
     const size_t avail[], uint16_t n, const struct r2dp_sp *sp[],
@@ -521,21 +524,30 @@ sp_match_out_burst(struct dpdk_priv *d, const struct rte_ipv4_hdr *const ip[],
 	struct acl_key k[BURST_SZ];
 	const uint8_t *data[BURST_SZ];
 	uint32_t res[BURST_SZ];
-	uint16_t idx[BURST_SZ], nk = 0;
+	int16_t ux[BURST_SZ];
+	uint16_t nk = 0;
 
+	if (n > BURST_SZ)
+		n = BURST_SZ;
+	for (uint16_t i = 0; i < n; i++) {
+		ux[i] = -1;
+		if (!s || !s->acl || !ip[i] ||
+		    !acl_key_fill(&k[nk], (const uint8_t *)ip[i], avail[i]))
+			continue;
+		if (!nk || memcmp(&k[nk], &k[nk - 1], sizeof(k[0]))) {
+			data[nk] = (const uint8_t *)&k[nk];
+			nk++;
+		}
+		ux[i] = (int16_t)(nk - 1);
+	}
+	if (nk && rte_acl_classify(s->acl, data, res, nk, 1) != 0)
+		nk = 0;
 	for (uint16_t i = 0; i < n; i++) {
 		sp[i] = NULL;
 		sa[i] = NULL;
-		if (s && s->acl && ip[i] &&
-		    acl_key_fill(&k[nk], (const uint8_t *)ip[i], avail[i])) {
-			data[nk] = (const uint8_t *)&k[nk];
-			idx[nk++] = i;
-		}
+		if (nk && ux[i] >= 0)
+			sp[i] = spd_resolve(d, s, res[ux[i]], &sa[i]);
 	}
-	if (!nk || rte_acl_classify(s->acl, data, res, nk, 1) != 0)
-		return;
-	for (uint16_t j = 0; j < nk; j++)
-		sp[idx[j]] = spd_resolve(d, s, res[j], &sa[idx[j]]);
 }
 
 /* Is `ip` (raw wire order) the far end of a configured tunnel?  Far end =
