@@ -155,9 +155,9 @@ crypto_run(struct dp_wk *w, struct rte_ipsec_session *ss,
 		}
 		return 0;
 	}
-	for (uint16_t i = 0; i < n; i++)
-		rte_crypto_op_attach_sym_session(cop[i], ss->crypto.ses);
-	/* prepare moves the mbufs it rejected to the tail */
+	/* prepare sets each op up (type, status, m_src, and the session:
+	 * lksd_none_cop_prepare), so no attach pass of our own; it moves the
+	 * mbufs it rejected to the tail */
 	k = rte_ipsec_pkt_crypto_prepare(ss, mb, cop, n);
 	for (uint16_t i = k; i < n; i++) {
 		DROP(w, DR_IPSEC_REJECT, 1);
