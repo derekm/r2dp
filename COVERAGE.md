@@ -26,7 +26,7 @@ same commit as the behaviour it describes.
 | NAT-T interop (RFC 3948): ESP-in-UDP round trips, egress framing, plain ESP to a NAT-T SA refused, keepalive consumed, IKE marker not ESP | `fwd_e2e.sh` phase natt | both backends | CI |
 | Kernel XFRM backend via the r2dp socket | `kfwd_test`, `fwd_e2e.sh BACKEND=kernel` | `fwd/dp_xfrm.c` | CI |
 | Sanitizers | all of the above under ASan+UBSan | — | CI |
-| Data-path cost (cycles/pkt at 1/65/201 tunnels) | `bench/fwd_bench` regression gate | `bench/` | CI |
+| Data-path cost (cycles/pkt, Mpps; 64/512/1400B at 1/65/201 tunnels) | `bench/fwd_bench` regression gate | `bench/` | CI |
 
 ## Not covered (known gaps)
 

@@ -67,10 +67,19 @@ jobs:
       - name: Test (gcm_kat must not skip)
         run: |
           R2DP_REQUIRE_DPDK=1 meson test -C build-dpdk --print-errorlogs
-      - name: Data-path benchmark regression (cycles/pkt, 1/65/201 tunnels)
+      - name: Data-path benchmark regression (64/512/1400B, 1/65/201 tunnels)
         run: |
-          # fails if 201-tunnel cost > 1.5x 1-tunnel cost, or > 8000 cyc/pkt
+          # relative gate: per size, 201-tunnel cost <= 1.5x 1-tunnel cost;
+          # plus a loose 8000 cyc/pkt sanity bound at 64B
           R2DP_REQUIRE_DPDK=1 meson test -C build-dpdk --benchmark --print-errorlogs -v
+          for pmd in openssl auto; do
+            build-dpdk/bench/fwd_bench --pmd $pmd --json bench-$pmd.json
+          done
+      - name: Upload benchmark JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: fwd-bench
+          path: bench-*.json
       - name: ASan+UBSan data plane
         run: |
           meson setup build-dpkasan --buildtype=debug -Denable_dpdk=enabled \

@@ -158,11 +158,15 @@ into per-backend protocol forks.
 - **Next hops**: the 64-entry MAC table evicts least-recently-seen entries.
 - **CI**: `dp_path` runs outbound encrypt → inbound decrypt through the
   production code in the DPDK lanes.
-- **Benchmark gate**: `bench/fwd_bench` measures `esp_outbound`/`esp_inbound`
-  cycles/pkt (64B, 32-packet bursts) at 1, 65 and 201 tunnels; CI's DPDK
-  lane runs it via `meson test --benchmark` and fails if the 201-tunnel cost
-  exceeds 1.5x the 1-tunnel cost or 8000 cycles/pkt
-  (`R2DP_BENCH_MAX_SCALE`, `R2DP_BENCH_MAX_CYC`).
+- **Benchmark gate**: `bench/fwd_bench` measures single-core
+  `esp_outbound`/`esp_inbound` cycles/pkt and Mpps for 64, 512 and 1400-byte
+  inner packets at 1, 65 and 201 tunnels (warmup, then the median of 5 runs;
+  `--no-huge`; crypto_aesni_mb when available, else crypto_openssl;
+  `--json` for machine-readable output).  CI's DPDK lane runs it via
+  `meson test --benchmark` and fails if, for any size, the 201-tunnel cost
+  exceeds 1.5x the 1-tunnel cost, or the 64B cost exceeds 8000 cycles/pkt
+  (`R2DP_BENCH_MAX_SCALE`, `R2DP_BENCH_MAX_CYC`); the JSON for both PMDs is
+  uploaded as the `fwd-bench` artifact.
 
 ## Backends: kernel XFRM vs DPDK
 
