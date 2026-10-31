@@ -1,7 +1,7 @@
 /*
- * nh_test: unit tests for the egress next-hop table (fwd/dp_nh.c), N1/N2:
- * learn only from unicast IPv4 IKE (UDP 500/4500) or ESP, key by peer IP,
- * relearn on change, unknown peer -> NULL (caller drops, never broadcasts).
+ * nh_test: unit tests for the next-hop learning classifier (fwd/dp_nh.c),
+ * N1: learn only from unicast IPv4 IKE (UDP 500/4500) or ESP.  The table
+ * itself (fwd/dpdk_nh.c) is covered by nh_tab.
  */
 #include <stdio.h>
 #include <string.h>
@@ -31,19 +31,15 @@ frame(uint8_t *f, const uint8_t dmac[6], const uint8_t smac[6],
 int
 main(void)
 {
-	static struct r2dp_nh_tab t;
-	uint8_t mo[6];
 	const uint8_t us[6] = { 0x02, 0, 0, 0, 0, 1 };
 	const uint8_t peer[6] = { 0x02, 0, 0, 0, 0, 2 };
-	const uint8_t peer2[6] = { 0x02, 0, 0, 0, 0, 3 };
 	const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 	uint8_t f[64];
-	uint32_t ip, pip, pip2;
+	uint32_t ip, pip;
 	const uint8_t *m;
 	size_t n;
 
 	inet_pton(AF_INET, "192.0.2.2", &pip);
-	inet_pton(AF_INET, "192.0.2.3", &pip2);
 
 	n = frame(f, us, peer, "192.0.2.2", 17, 500, 500);
 	CHECK(r2dp_nh_frame_ike_esp(f, n, &ip, &m) == 1 && ip == pip &&
@@ -62,30 +58,6 @@ main(void)
 	CHECK(r2dp_nh_frame_ike_esp(f, 30, &ip, &m) == 0, "truncated frame ignored");
 	f[12] = 0x86; f[13] = 0xdd;
 	CHECK(r2dp_nh_frame_ike_esp(f, n, &ip, &m) == 0, "non-IPv4 ethertype ignored");
-
-	CHECK(r2dp_nh_lookup(&t, pip, mo) == 0, "unknown peer -> NULL (drop)");
-	CHECK(r2dp_nh_learn(&t, pip, peer, 1) == 1, "learn new peer");
-	CHECK(r2dp_nh_learn(&t, pip, peer, 2) == 0, "same MAC unchanged");
-	CHECK(r2dp_nh_lookup(&t, pip, mo) && memcmp(mo, peer, 6) == 0, "lookup peer");
-	CHECK(r2dp_nh_learn(&t, pip2, peer2, 3) == 1, "second peer keyed separately");
-	CHECK(r2dp_nh_lookup(&t, pip, mo) && memcmp(mo, peer, 6) == 0,
-	    "first peer unaffected by second");
-	CHECK(r2dp_nh_learn(&t, pip, peer2, 4) == 2, "relearn on MAC change");
-	CHECK(r2dp_nh_lookup(&t, pip, mo) && memcmp(mo, peer2, 6) == 0,
-	    "lookup returns relearned MAC");
-
-	{
-		static struct r2dp_nh_tab full;
-		int r = 0;
-		for (uint32_t i = 0; i < R2DP_NH_MAX; i++)
-			r |= r2dp_nh_learn(&full, i + 1, peer, 100 + i) != 1;
-		r2dp_nh_learn(&full, 1, peer, 1000);       /* peer 1 still active */
-		CHECK(r == 0 && r2dp_nh_learn(&full, 0xffffffffu, peer2, 1001) == 3,
-		    "table full -> LRU eviction");
-		CHECK(r2dp_nh_lookup(&full, 0xffffffffu, mo), "new peer learned");
-		CHECK(!r2dp_nh_lookup(&full, 2, mo), "least recently seen peer evicted");
-		CHECK(r2dp_nh_lookup(&full, 1, mo), "recently refreshed peer kept");
-	}
 
 	if (fails) { printf("nh_test: %d failures\n", fails); return 1; }
 	puts("nh_test: OK");

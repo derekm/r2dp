@@ -8,11 +8,15 @@
  * driving racoon2 and the test suite.
  *
  * Usage:
- *   r2dp-fwd [-s sockpath] [-v] [-n workers] [--dp dpdk|kernel] [EAL args]
+ *   r2dp-fwd [-s sockpath] [-v] [-n workers] [--nh-size peers]
+ *            [--dp dpdk|kernel] [EAL args]
  *
  * -n: DPDK packet workers (default 1).  With more than one, an extra lcore
  * dispatches packets to the worker owning each tunnel, so give the EAL
  * -n + 2 lcores (main + dispatcher + workers), e.g. -n 2 -l 0-3.
+ *
+ * --nh-size: initial size of the DPDK next-hop table, in tunnel peers
+ * (default 1024).  It is not a limit: the table doubles as it fills.
  */
 #include <getopt.h>
 #include <signal.h>
@@ -42,6 +46,7 @@ main(int argc, char **argv)
 	const char *dpname = "dpdk";   /* --dp dpdk|kernel */
 	int dp_cleanup = 0;
 	int nb_workers = 1;
+	unsigned long nh_size = 0;   /* --nh-size; 0 = default */
 	/* DPDK EAL args (everything not one of our own) go to rte_eal_init */
 	char **eal_argv, **eal_base;
 	int eal_argc = 1, i;
@@ -69,6 +74,15 @@ main(int argc, char **argv)
 			dpname = argv[++i];
 		} else if (strcmp(a, "--dp-cleanup") == 0) {
 			dp_cleanup = 1;
+		} else if (strcmp(a, "--nh-size") == 0 && i + 1 < argc) {
+			char *e;
+			nh_size = strtoul(argv[++i], &e, 10);
+			if (*e || !nh_size || nh_size > 0xffffffffUL) {
+				fprintf(stderr, "r2dp-fwd: --nh-size %s: want a "
+				    "positive peer count\n", argv[i]);
+				free(eal_base);
+				return 2;
+			}
 		} else if (strcmp(a, "-n") == 0 && i + 1 < argc) {
 			nb_workers = atoi(argv[++i]);   /* DPDK packet workers */
 		} else {
@@ -100,7 +114,7 @@ main(int argc, char **argv)
 	 * the control socket (racoon2 bring-up + M0 tests). */
 	{
 		int r = fwd_dp_dpdk_probe(&ctl.dp, &eal_argc, &eal_argv,
-		    sockpath, verbose, nb_workers);
+		    sockpath, verbose, nb_workers, (unsigned)nh_size);
 		if (r < 0)
 			fprintf(stderr, "r2dp-fwd: DPDK dataplane unavailable (%s); "
 			    "serving control-only\n", r == -2 ? "no DPDK build" : strerror(-r));

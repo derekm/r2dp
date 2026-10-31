@@ -55,6 +55,16 @@ dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 	    (unsigned long long)t.n_crypto_stuck, t.cq_stale,
 	    (unsigned long long)t.n_natt_keepalive);
 	fprintf(f, "\n");
+	fprintf(f, "r2dp-fwd: nexthop peers=%u cap=%u grows=%llu grow_fail=%llu "
+	    "pending=%u q_drop=%llu\n",
+	    __atomic_load_n(&d->nh.n, __ATOMIC_RELAXED),
+	    __atomic_load_n(&d->nh.cap, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&d->nh.n_grow, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&d->nh.n_grow_fail,
+	    __ATOMIC_RELAXED),
+	    __atomic_load_n(&d->nh.npend, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&d->nh.n_q_drop,
+	    __ATOMIC_RELAXED));
 	if (d->nb_wk > 1)
 		for (unsigned i = 0; i <= d->nb_wk; i++)
 			fprintf(f, "r2dp-fwd: %s %u: rx=%llu tx=%llu esp=%llu "

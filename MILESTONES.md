@@ -77,8 +77,8 @@ fixed and verified.
   so both directions and every rekey stay put) and every per-SA writer --
   replay window, sequence number, byte counters -- is that worker; others
   drop a stray packet as `steer`.  With N > 1 a dispatcher lcore receives
-  on every RX queue, learns next hops (single writer; readers use a
-  seqlock), consumes NAT-T keepalives and hands frames to the owner over
+  on every RX queue, learns next hops (serialized writer; readers
+  look up lock-free, see Next hops), consumes NAT-T keepalives and hands frames to the owner over
   SP/SC rings.  Per-worker TX queues, cryptodev queue pairs, counters and
   stuck-crypto quarantine; the stats dump sums them.  SAs also carry
   `RTE_IPSEC_SAFLAG_SQN_ATOM` as a backstop against GCM nonce reuse.
@@ -170,7 +170,22 @@ into per-backend protocol forks.
   does not touch the data plane; request buffers are scrubbed.
 - **libr2dp**: tail-length checks for every message type, `MSG_NOSIGNAL`,
   send buffers scrubbed, HELLO validates seq/status and skips async messages.
-- **Next hops**: the 64-entry MAC table evicts least-recently-seen entries.
+- **Next hops**: one shared `rte_hash` (`fwd/dpdk_nh.c`) keyed by the
+  peer's outer IPv4 address, MAC in the entry's data word, created with
+  `RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF`.  Workers acquire-load the
+  published table pointer and do one lock-free
+  `rte_hash_lookup_bulk_data` per burst over its distinct destinations.
+  No tunnel-count cap and no capacity eviction: a learned entry leaves only
+  by explicit deletion, and a MAC change is an in-place update.  The
+  learner inserts under a trylock or queues the request; a maintenance
+  thread grows the table 2x at 75% load (or on `-ENOSPC`) off the data
+  path -- copy under the writer lock, release-publish, free the old table
+  after a QSBR grace period.  If growth cannot allocate, the current table
+  keeps serving and the new peer waits on a retried pending list.
+  `--nh-size` sets the initial size (default 1024).  Stats:
+  `nexthop peers/cap/grows/grow_fail/pending/q_drop`.  (Replaced a
+  64-entry linear-scan table under a seqlock, which blackholed the 65th
+  peer's egress.)
 - **CI**: `dp_path` runs outbound encrypt → inbound decrypt through the
   production code in the DPDK lanes.
 - **Benchmark gate**: `bench/fwd_bench` measures single-core

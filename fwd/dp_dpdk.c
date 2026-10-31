@@ -150,13 +150,11 @@ port_tx(uint16_t port, uint16_t q, struct rte_mbuf **pkts, uint16_t n)
 /* Learn the peer's MAC (keyed by its IP) only from unicast IKE/ESP whose
  * source is a configured tunnel peer, so an arbitrary host on the segment
  * cannot capture egress ESP; relearn when the peer's MAC changes (N1).
- * Called only by the lcore that receives on the outer port (the single
- * writer of d->nh). */
+ * Called by the lcore that receives on the outer port (the table also
+ * serializes writers itself). */
 /* Per-burst memo: a burst is mostly one peer, and a repeat of the
- * previous frame's (source IP, source MAC) at the same `now` would change
- * nothing -- skip its peer check and table scan. */
+ * previous frame's (source IP, source MAC) would change nothing -- skip its peer check and table scan. */
 struct nh_memo {
-	uint64_t now;
 	uint64_t mac;
 	uint32_t sip;
 	int      valid;
@@ -181,7 +179,7 @@ nh_learn_frame(struct dpdk_priv *d, struct rte_mbuf *m, struct nh_memo *mo)
 	mo->valid = 1;
 	if (!is_tunnel_peer(d, sip))
 		return;
-	lr = r2dp_nh_learn(&d->nh, sip, smac, mo->now);
+	lr = r2dp_nh_learn(&d->nh, sip, smac);
 	if (lr > 0 && d->verbose)
 		fprintf(stderr, "r2dp-fwd: %s next hop for peer %08x: "
 		    "%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -223,7 +221,7 @@ outer_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port,
 		fprintf(stderr, "\n");
 	}
 	uint16_t nesp = 0, nex = 0;
-	struct nh_memo mo = { .now = learn ? rte_get_tsc_cycles() : 0 };
+	struct nh_memo mo = { .valid = 0 };
 	for (uint16_t i = 0; i < nr; i++) {
 		if (learn)
 			nh_learn_frame(d, bufs[i], &mo);
@@ -381,35 +379,47 @@ inner_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port)
 		uint16_t ntx = 0;
 		struct rte_mbuf *txq[BURST_SZ];
 		uint16_t to = (d->port_id >= 0) ? d->port_id : port;
-		uint32_t last_dst = 0;          /* per-burst next-hop memo */
-		uint8_t nmac[6];
-		int have = 0;
+		/* Egress ESP is unicast to the tunnel peer's learned next
+		 * hop (keyed by the outer destination IP).  With no learned
+		 * MAC, drop: broadcasting ESP would spray it to every host
+		 * on the segment (N2).  One lock-free bulk lookup per burst,
+		 * over its distinct destinations (mostly one peer). */
+		uint32_t udst[BURST_SZ];
+		uint64_t umac[BURST_SZ], uhit;
+		uint8_t  ui[BURST_SZ];
+		unsigned nu = 0;
+		for (uint16_t i = 0; i < nout; i++) {
+			const struct rte_ipv4_hdr *oip = rte_pktmbuf_mtod(
+			    esp_out[i], const struct rte_ipv4_hdr *);
+			uint32_t odst;
+			unsigned u;
+			memcpy(&odst, &oip->dst_addr, 4);
+			if (nu && udst[nu - 1] == odst)
+				u = nu - 1;
+			else {
+				for (u = 0; u < nu && udst[u] != odst; u++)
+					;
+				if (u == nu)
+					udst[nu++] = odst;
+			}
+			ui[i] = (uint8_t)u;
+		}
+		uhit = r2dp_nh_lookup_bulk(&d->nh, udst, nu, umac);
 		for (uint16_t i = 0; i < nout; i++) {
 			struct rte_ether_hdr *eh;
-			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
-			if (!h) { DROP(w, DR_NOMEM, 1); rte_pktmbuf_free(esp_out[i]); continue; }
-			eh = rte_pktmbuf_mtod(esp_out[i], struct rte_ether_hdr *);
-			/* Egress ESP is unicast to the tunnel peer's learned
-			 * next hop (keyed by the outer destination IP).  With
-			 * no learned MAC, drop: broadcasting ESP would spray it
-			 * to every host on the segment (N2). */
-			{
-				const struct rte_ipv4_hdr *oip =
-				    (const struct rte_ipv4_hdr *)(eh + 1);
-				uint32_t odst;
-				memcpy(&odst, &oip->dst_addr, 4);
-				if (!have || odst != last_dst) {
-					have = r2dp_nh_lookup(&d->nh, odst, nmac);
-					last_dst = odst;
-				}
-				if (!have) {
-					DROP(w, DR_NO_NEXTHOP, 1);
-					rte_pktmbuf_free(esp_out[i]);
-					continue;
-				}
-				memcpy(eh->dst_addr.addr_bytes, nmac, 6);
-				memcpy(eh->src_addr.addr_bytes, d->our_mac, 6);
+			if (!(uhit >> ui[i] & 1)) {
+				DROP(w, DR_NO_NEXTHOP, 1);
+				rte_pktmbuf_free(esp_out[i]);
+				continue;
 			}
+			if (!rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN)) {
+				DROP(w, DR_NOMEM, 1);
+				rte_pktmbuf_free(esp_out[i]);
+				continue;
+			}
+			eh = rte_pktmbuf_mtod(esp_out[i], struct rte_ether_hdr *);
+			memcpy(eh->dst_addr.addr_bytes, &umac[ui[i]], 6);
+			memcpy(eh->src_addr.addr_bytes, d->our_mac, 6);
 			eh->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 			esp_out[i]->l2_len = RTE_ETHER_HDR_LEN;
 			esp_out[i]->l3_len = 20;
@@ -598,7 +608,7 @@ dispatcher_main(void *arg)
 		uint16_t rq = qi++ % d->nb_wk;     /* round-robin the RX queues */
 		uint16_t nr = rte_eth_rx_burst(d->port_id, rq, bufs, BURST_SZ);
 
-		struct nh_memo mo = { .now = nr ? rte_get_tsc_cycles() : 0 };
+		struct nh_memo mo = { .valid = 0 };
 
 		uint16_t nk = 0;
 
@@ -686,7 +696,8 @@ dpd_start(struct fwd_dp *dp)
 	 * every reader has passed a grace period -- the workers read
 	 * sa_tab/sp_tab and hold session pointers across their crypto path
 	 * with no lock.  tid = lcore id (< RTE_MAX_LCORE). */
-	{
+	if (!d->rcu) {   /* kept across stop/start: the next-hop table is
+			  * attached to it */
 		size_t rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
 		d->rcu = rte_zmalloc("r2dp-rcu", rsz, RTE_CACHE_LINE_SIZE);
 		if (!d->rcu) {
@@ -694,6 +705,20 @@ dpd_start(struct fwd_dp *dp)
 			return -ENOMEM;
 		}
 		rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
+	}
+	/* next-hop table: lock-free readers, grown off the data path by its
+	 * own maintenance thread, retired tables freed through the same
+	 * QSBR (dpdk_nh.h) */
+	if (!d->nh.h) {
+		int r = r2dp_nh_init(&d->nh, "r2dp_nh", d->nh_size, d->rcu,
+		    SOCKET_ID_ANY);
+		if (r == 0)
+			r = r2dp_nh_start(&d->nh);
+		if (r < 0) {
+			fprintf(stderr, "r2dp-fwd: next-hop table: %s\n",
+			    strerror(-r));
+			return r;
+		}
 	}
 	for (unsigned i = 0; i <= d->nb_wk; i++) {
 		dp_wk_init(d, i);
@@ -862,7 +887,7 @@ ports_find(struct dpdk_priv *d)
 
 int
 fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
-    const char *sockpath, int verbose, int nb_workers)
+    const char *sockpath, int verbose, int nb_workers, unsigned nh_size)
 {
 	struct dpdk_priv *d;
 	unsigned maxw;
@@ -883,6 +908,13 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	memset(d, 0, sizeof(*d));
 	d->verbose = verbose;
 	d->nb_wk = (unsigned)nb_workers;
+	if (nh_size > R2DP_NH_MAX_CAP) {
+		fprintf(stderr, "r2dp-fwd: --nh-size %u: at most %u\n", nh_size,
+		    R2DP_NH_MAX_CAP);
+		free(d);
+		return -EINVAL;
+	}
+	d->nh_size = nh_size;
 	for (unsigned i = 0; i <= DP_MAX_WK; i++)
 		dp_wk_init(d, i);
 	snprintf(d->tap_if, sizeof(d->tap_if), "%s",

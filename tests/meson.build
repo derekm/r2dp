@@ -56,7 +56,7 @@ if dpdk.found()
   # sa_tab[-1] write on a fresh inbound install) and newest-SA egress pick.
   test('dp_sa',
     executable('dp_sa', 'dp_sa.c', '../fwd/dpdk_sad.c', '../fwd/dpdk_spd.c', '../fwd/dpdk_esp.c',
-      '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c', '../fwd/dp_sel.c',
+      '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c', '../fwd/dpdk_nh.c', '../fwd/dp_sel.c',
       include_directories: [include_directories('../include'),
                             include_directories('../fwd')],
       dependencies: dpdk,
@@ -68,7 +68,7 @@ if dpdk.found()
   # data path, with policy dispositions (CI data-path coverage).
   test('dp_path',
     executable('dp_path', 'dp_path.c', '../fwd/dpdk_sad.c', '../fwd/dpdk_spd.c', '../fwd/dpdk_esp.c',
-      '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c',
+      '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c', '../fwd/dp_nh.c', '../fwd/dpdk_nh.c',
       '../fwd/dp_sel.c',
       include_directories: [include_directories('../include'),
                             include_directories('../fwd')],
@@ -83,11 +83,20 @@ if dpdk.found()
   test('dp_mt',
     executable('dp_mt', 'dp_mt.c', '../fwd/dpdk_sad.c', '../fwd/dpdk_spd.c',
       '../fwd/dpdk_esp.c', '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c',
-      '../fwd/dp_nh.c', '../fwd/dp_sel.c',
+      '../fwd/dp_nh.c', '../fwd/dpdk_nh.c', '../fwd/dp_sel.c',
       include_directories: [include_directories('../include'),
                             include_directories('../fwd')],
       dependencies: dpdk,
       link_with: libr2dp,
+      c_args: ['-DR2DP_HAVE_DPDK=1']),
+    is_parallel: false, timeout: 60)
+
+  # nh_tab: the next-hop table (fwd/dpdk_nh.c): >64 peers, growth from 8
+  # to 10000 under concurrent lookups, allocation failure during growth.
+  test('nh_tab',
+    executable('nh_tab', 'nh_tab.c', '../fwd/dpdk_nh.c',
+      include_directories: include_directories('../fwd'),
+      dependencies: dpdk,
       c_args: ['-DR2DP_HAVE_DPDK=1']),
     is_parallel: false, timeout: 60)
 endif

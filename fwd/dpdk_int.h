@@ -43,6 +43,7 @@
 #include "ctl.h"
 #include "dp_gcm.h"
 #include "dp_nh.h"
+#include "dpdk_nh.h"
 #include "dp_sel.h"
 #include <signal.h>
 
@@ -248,8 +249,9 @@ struct dpdk_priv {
 	uint64_t            sa_gen;       /* last dp_sa.gen handed out */
 	/* Egress ESP L2: per-peer next hop learned from IKE/ESP sent by a
 	 * configured tunnel peer (dp_nh.c), and our own outer-port MAC.
-	 * Worker-thread only. */
+	 * Shared by every lcore (dpdk_nh.h). */
 	struct r2dp_nh_tab  nh;
+	unsigned            nh_size;         /* --nh-size: initial (0 = default) */
 	uint8_t             our_mac[6];      /* outer (peer) tap MAC */
 	uint8_t             our_inner_mac[6]; /* inner (plaintext host) tap MAC */
 

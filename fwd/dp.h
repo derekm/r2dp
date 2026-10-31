@@ -70,9 +70,10 @@ extern volatile sig_atomic_t fwd_stats_req;
 /* Defaults: zero -> no backend (ctl.c still answers protocol). */
 void fwd_dp_init(struct fwd_dp *dp);
 
-/* DPDK backend (fwd/dp_dpdk.c).  argc/argv after DPDK EAL init. */
+/* DPDK backend (fwd/dp_dpdk.c).  argc/argv after DPDK EAL init.  nh_size:
+ * initial next-hop table size in peers (0 = default; it grows, dpdk_nh.h). */
 int fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
-    const char *sockpath, int verbose, int nb_workers);
+    const char *sockpath, int verbose, int nb_workers, unsigned nh_size);
 
 /* Linux kernel XFRM backend (fwd/dp_xfrm.c, `r2dp-fwd --dp kernel`):
  * opens NETLINK_XFRM and probes which transforms the kernel accepts.
