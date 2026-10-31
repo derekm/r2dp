@@ -1,13 +1,9 @@
 name: all-branches-ci
 
-# Compiles and tests EVERY commit across EVERY branch of the repo — not just
-# the default `main` tip.  Meta branches (lineage/agent/usage/site) carry no
-# source, so their commits are recorded as SKIP; code-carrying commits are
-# meson-built (milestone 0, no DPDK) or proto.h-checked.  Fails only if a
-# code-carrying commit fails to build.
-#
-# This yml is just the keeper/home of the gate — the actual per-commit build
-# walks all branches via ci/ci_all_branches.sh.
+# Builds and tests the TIP of every branch (ci/ci_all_branches.sh): meson
+# without DPDK where the tree has a meson.build, a proto.h check where it
+# only carries the header, SKIP for meta branches.  Fails only if a
+# code-carrying tip fails.
 on:
   push:
     branches: [main]
@@ -24,11 +20,11 @@ jobs:
         with:
           fetch-depth: 0   # full history of every branch
 
-      - name: Apt deps (meson + C toolchain; no DPDK at milestone 0)
+      - name: Apt deps (meson + C toolchain; no DPDK)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config meson ninja-build
 
-      - name: Build + test every commit on every branch
+      - name: Build + test every branch tip
         run: |
           bash ci/ci_all_branches.sh
