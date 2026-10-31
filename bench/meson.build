@@ -11,3 +11,9 @@ if dpdk.found()
     c_args: ['-DR2DP_HAVE_DPDK=1'])
   benchmark('fwd_bench', fwd_bench, args: ['--check'], timeout: 300)
 endif
+
+# End-to-end forwarder benchmark: traffic generator + validating sink
+# (bench/e2e_bench.sh drives it against two r2dp-fwd instances over memif).
+if dpdk.found()
+  e2e_tgen = executable('e2e_tgen', 'e2e_tgen.c', dependencies: dpdk)
+endif
