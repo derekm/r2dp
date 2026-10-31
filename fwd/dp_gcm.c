@@ -82,6 +82,11 @@ r2dp_gcm_sa_prm(const struct r2dp_sa *rsa, const void *key, int inbound,
 	/* 0 = anti-replay off (PF_KEY).  librte_ipsec still keeps a 64-packet
 	 * window under ESN: it needs one to infer the high sequence bits. */
 	prm->ipsec_xform.replay_win_sz = r2dp_sa_window(rsa);
+	/* Atomic sequence numbers.  Each SA is processed by one worker by
+	 * construction (dp_sa.owner), but rte_ipsec uses the outbound sequence
+	 * number as the GCM IV, so a second writer would mean nonce reuse;
+	 * this keeps the SA correct even if that invariant were ever broken. */
+	prm->flags |= RTE_IPSEC_SAFLAG_SQN_ATOM;
 	prm->ipsec_xform.tunnel.type = RTE_SECURITY_IPSEC_TUNNEL_IPV4;
 
 	memset(eh, 0, sizeof(*eh));
