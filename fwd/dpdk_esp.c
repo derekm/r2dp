@@ -335,7 +335,6 @@ esp_inbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 			    ntohl(es->spi), rte_be_to_cpu_32(ip->dst_addr),
 			    es->spi, ip->dst_addr);
 		}
-		keys[nk] = &kkey[nk];
 		pm[nk] = bufs[i];
 		pnat[nk] = natlen != 0;
 		nk++;
@@ -352,7 +351,22 @@ bad:
 		return 0;
 	}
 
-	uint32_t nlook = rte_ipsec_sad_lookup(d->sad, keys, sas, nk);
+	/* Look up each distinct key once: a burst is normally one flow, and
+	 * every rte_ipsec_sad lookup is a full hash probe under the table's
+	 * reader lock.  Runs of the same (SPI, DIP) share one result. */
+	uint32_t nu = 0;
+	uint8_t ux[BURST_SZ];
+	void *usa[BURST_SZ];
+
+	for (uint32_t i = 0; i < nk; i++) {
+		if (!nu || kkey[i].v4.spi != keys[nu - 1]->v4.spi ||
+		    kkey[i].v4.dip != keys[nu - 1]->v4.dip)
+			keys[nu++] = &kkey[i];
+		ux[i] = (uint8_t)(nu - 1);
+	}
+	uint32_t nlook = rte_ipsec_sad_lookup(d->sad, keys, usa, nu);
+	for (uint32_t i = 0; i < nk; i++)
+		sas[i] = usa[ux[i]];
 
 	if (d->verbose) {
 		fprintf(stderr, "r2dp-fwd: esp_inbound nk=%u nlook=%u\n",

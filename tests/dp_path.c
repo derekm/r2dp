@@ -328,8 +328,9 @@ main(void)
 	}
 
 	/* Batched crypto: a 32-packet burst (every 8th outside A's policy ->
-	 * bypass) is encrypted in one run; packet 5 is then forged.  Exactly the
-	 * other protected packets decrypt, in order, byte-identical. */
+	 * bypass) is encrypted in one run; packet 5 is then forged and packet
+	 * 9 gets an unknown SPI (the SAD key changes mid-burst and back).
+	 * Exactly the other protected packets decrypt, in order, byte-identical. */
 	{
 		enum { N = 32 };
 		static uint8_t w[N][64];
@@ -350,11 +351,13 @@ main(void)
 			uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(esp[k], 14);
 			memset(f, 0, 14); f[12] = 0x08;
 			if (k == 5) f[14 + 40] ^= 1;
+			if (k == 9) f[14 + 20] ^= 0x80;      /* SPI: no such SA */
 		}
 		esp_inbound(&b->wk[0], esp, nout, dec, &ndec);
-		CHECK(ndec == nout - 1, "burst: forged packet dropped, the rest decrypt");
+		CHECK(ndec == nout - 2, "burst: forged and unknown-SPI packets dropped, the rest decrypt");
 		for (uint16_t k = 0, src = 0; k < ndec; k++, src++) {
-			while (src % 8 == 7 || src == 5) src++;   /* skip bypass + forged */
+			/* skip bypass, forged (esp 5 = src 5), unknown SPI (esp 9 = src 10) */
+			while (src % 8 == 7 || src == 5 || src == 10) src++;
 			if (memcmp(rte_pktmbuf_mtod(dec[k], uint8_t *), w[src], 64)) good = 0;
 			rte_pktmbuf_free(dec[k]);
 		}
