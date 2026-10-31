@@ -14,6 +14,10 @@
  *
  *   fwd_bench [--check] [--json FILE|-] [--runs N] [--sizes a,b,..]
  *             [--tunnels a,b,..] [--pmd auto|openssl|aesni_mb] [--workers N]
+ *             [--natt]
+ *
+ * --natt: every SA is RFC 3948 ESP-in-UDP (UDP/4500 encapsulation on
+ * encrypt, the UDP header removed again on decrypt).
  *
  * --workers N (N > 1): N lcores run the same enc/dec loop at once, each on
  * a tunnel it owns (dp_owner), sharing the cryptodev (one queue pair
@@ -45,6 +49,7 @@ static uint8_t key[20] = { 9,8,7,6,5,4,3,2,1,0,1,2,3,4,5,6, 0xde,0xad,0xbe,0xef 
 static struct rte_mempool *mp;
 static int cdev = -1;
 static struct rte_mbuf *espq[DP_MAX_WK][NPKT];
+static int natt;              /* --natt: ESP-in-UDP SAs */
 
 static struct dpdk_priv *
 mk_priv(const char *tag)
@@ -100,6 +105,8 @@ mk_sa(struct r2dp_sa *r, uint32_t spi, const char *src, const char *dst)
 	r->proto = R2DP_PROTO_ESP; r->mode = R2DP_MODE_TUNNEL;
 	r->enc = R2DP_ENCR_AES_GCM_16; r->spi = htonl(spi); r->enckeylen = 20;
 	r->wsize = 64;
+	if (natt)
+		r->natt_type = R2DP_NATT_ESPINUDP;
 	r->src.family = r->dst.family = R2DP_AF_INET4;
 	inet_pton(AF_INET, src, r->src.addr);
 	inet_pton(AF_INET, dst, r->dst.addr);
@@ -374,7 +381,7 @@ usage(void)
 {
 	fprintf(stderr, "usage: fwd_bench [--check] [--json FILE|-] [--runs N] "
 	    "[--sizes 64,512,1400] [--tunnels 1,65,201] "
-	    "[--pmd auto|openssl|aesni_mb] [--workers N]\n");
+	    "[--pmd auto|openssl|aesni_mb] [--workers N] [--natt]\n");
 }
 
 int
@@ -406,6 +413,8 @@ main(int argc, char **argv)
 			nsz = parse_list(argv[++i], sizes, 28, 1400);
 		else if (!strcmp(argv[i], "--tunnels") && v)
 			ntun = parse_list(argv[++i], tunnels, 1, MAX_SA / 2 - 1);
+		else if (!strcmp(argv[i], "--natt"))
+			natt = 1;
 		else if (!strcmp(argv[i], "--workers") && v)
 			nw = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--pmd") && v)

@@ -283,17 +283,13 @@ esp_inbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 		ip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
 		if (natlen) {
 			/* NAT-T: after the eth strip the frame is IP + UDP(8) +
-			 * ESP.  rte_pktmbuf_adj would strip from the FRONT
-			 * (the IP header), which is wrong.  Instead move the ESP payload
-			 * down so it sits immediately after the IP header (bare IP + ESP
-			 * for librte), then trim the now-empty UDP-header tail. */
-			int payload = rte_pktmbuf_pkt_len(bufs[i]) - ihl - natlen;
+			 * ESP; librte wants bare IP + ESP.  Slide the IP header
+			 * (ihl bytes, inside this segment -- checked above) up
+			 * over the UDP header and drop the 8 bytes now in front,
+			 * instead of moving the whole ESP payload down. */
 			uint8_t *base = rte_pktmbuf_mtod(bufs[i], uint8_t *);
-			if (payload > 0)
-				memmove(base + ihl, base + ihl + natlen,
-				    (size_t)payload);
-			if (natlen)
-				rte_pktmbuf_trim(bufs[i], natlen);
+			memmove(base + natlen, base, ihl);
+			(void)rte_pktmbuf_adj(bufs[i], natlen);
 			ip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
 			ip->next_proto_id = IPPROTO_ESP;
 			ip->total_length = rte_cpu_to_be_16((uint16_t)(ipsize - natlen));
@@ -604,12 +600,16 @@ drop:
 				    (oip->version_ihl >> 4) == 4) {
 					uint8_t ihl = (oip->version_ihl & 0x0f) * 4;
 					uint32_t len = rte_pktmbuf_pkt_len(m);
-					uint8_t *base = rte_pktmbuf_mtod(m, uint8_t*);
+					uint8_t *base;
 					uint16_t plen;
-					if (rte_pktmbuf_append(m, 8)) {
+					/* slide the outer IP header down into the
+					 * headroom and put the UDP header in the gap,
+					 * rather than moving the ESP payload up */
+					if (ihl <= rte_pktmbuf_data_len(m) &&
+					    (base = (uint8_t *)rte_pktmbuf_prepend(m, 8))) {
 						struct rte_udp_hdr *uh;
-						memmove(base + ihl + 8, base + ihl,
-						    len - ihl);
+						memmove(base, base + 8, ihl);
+						oip = (struct rte_ipv4_hdr *)base;
 						uh = (struct rte_udp_hdr *)(base + ihl);
 						uh->src_port = ds->natt_sport;
 						uh->dst_port = ds->natt_dport;
@@ -621,7 +621,7 @@ drop:
 						    (uint16_t)(len + 8));
 						oip->hdr_checksum = 0;
 					} else {
-						/* no tailroom: never send it as bare ESP */
+						/* no headroom: never send it as bare ESP */
 						DROP(w, DR_NOMEM, 1);
 						rte_pktmbuf_free(m);
 						continue;
