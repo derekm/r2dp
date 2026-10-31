@@ -2,26 +2,25 @@
  * fwd/dp_sel.c -- selector matching (see dp_sel.h).
  */
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "dp_sel.h"
 
-static int
+/* One 32-bit masked compare instead of a variable-length memcmp plus a
+ * partial-byte mask: same result for every prefix 0..32. */
+static inline int
 prefix_match(const struct r2dp_addr *sel, uint8_t pref, const uint8_t *a)
 {
-	unsigned full, rem;
+	uint32_t s, x, mask;
 
 	if (sel->family != R2DP_AF_INET4 || pref > 32)
 		return 0;
-	full = pref / 8;
-	rem = pref % 8;
-	if (memcmp(sel->addr, a, full) != 0)
-		return 0;
-	if (rem) {
-		uint8_t mask = (uint8_t)(0xff << (8 - rem));
-		if ((sel->addr[full] & mask) != (a[full] & mask))
-			return 0;
-	}
-	return 1;
+	if (!pref)
+		return 1;
+	memcpy(&s, sel->addr, 4);
+	memcpy(&x, a, 4);
+	mask = htonl(~0u << (32 - pref));
+	return ((s ^ x) & mask) == 0;
 }
 
 int
