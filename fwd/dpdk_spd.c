@@ -508,6 +508,36 @@ sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip, size_t avail,
 	return spd_resolve(d, s, res, sa);
 }
 
+/* sp_match_out for a burst: one rte_acl_classify over every packet that
+ * parses (the trie walk is vectorised across the burst and the snapshot is
+ * loaded once).  ip[i] == NULL or an unparsable header yields sp[i] = NULL,
+ * sa[i] = NULL, exactly as sp_match_out would. */
+void
+sp_match_out_burst(struct dpdk_priv *d, const struct rte_ipv4_hdr *const ip[],
+    const size_t avail[], uint16_t n, const struct r2dp_sp *sp[],
+    struct dp_sa *sa[])
+{
+	const struct dp_spd *s = __atomic_load_n(&d->spd, __ATOMIC_ACQUIRE);
+	struct acl_key k[BURST_SZ];
+	const uint8_t *data[BURST_SZ];
+	uint32_t res[BURST_SZ];
+	uint16_t idx[BURST_SZ], nk = 0;
+
+	for (uint16_t i = 0; i < n; i++) {
+		sp[i] = NULL;
+		sa[i] = NULL;
+		if (s && s->acl && ip[i] &&
+		    acl_key_fill(&k[nk], (const uint8_t *)ip[i], avail[i])) {
+			data[nk] = (const uint8_t *)&k[nk];
+			idx[nk++] = i;
+		}
+	}
+	if (!nk || rte_acl_classify(s->acl, data, res, nk, 1) != 0)
+		return;
+	for (uint16_t j = 0; j < nk; j++)
+		sp[idx[j]] = spd_resolve(d, s, res[j], &sa[idx[j]]);
+}
+
 /* Is `ip` (raw wire order) the far end of a configured tunnel?  Far end =
  * src of an inbound SA, dst of an outbound SA, or tun_dst/tun_src of a
  * PROTECT OUT/IN policy (policies exist before IKE completes, so the

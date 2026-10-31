@@ -469,25 +469,38 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 	struct dp_sa *pds[BURST_SZ];
 	enum dp_drop why = DR_MALFORMED;
 
-	if (nr > BURST_SZ) nr = BURST_SZ;
-	for (uint16_t i = 0; i < nr; i++) {
-		struct dp_sa *ds;
-		const struct r2dp_sp *sp;
-		uint8_t ihl;
-		struct rte_ipv4_hdr *ip, *lip;
+	const struct rte_ipv4_hdr *cip[BURST_SZ] = { NULL };
+	const struct r2dp_sp *csp[BURST_SZ];
+	struct dp_sa *cds[BURST_SZ];
+	size_t cav[BURST_SZ] = { 0 };
 
-		/* inner tap delivers Ethernet: parse the inner IP at the L2 offset
-		 * for policy matching; only STRIP L2 below for a matched packet so
-		 * the unconsumed (bypass) mbufs keep their frame for forwarding. */
-		if (rte_pktmbuf_pkt_len(bufs[i]) <
-		    RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr)) {
-			nb++; continue;
-		}
-		ip = (struct rte_ipv4_hdr *)((uint8_t *)
-		    rte_pktmbuf_mtod(bufs[i], uint8_t *) + RTE_ETHER_HDR_LEN);
-		if ((ip->version_ihl >> 4) != 4) { nb++; continue; }
-		sp = sp_match_out(d, ip, rte_pktmbuf_data_len(bufs[i]) -
-		    RTE_ETHER_HDR_LEN, &ds);
+	if (nr > BURST_SZ) nr = BURST_SZ;
+	/* inner tap delivers Ethernet: parse the inner IP at the L2 offset for
+	 * policy matching (one ACL classify for the whole burst); only STRIP
+	 * L2 below for a matched packet so the unconsumed (bypass) mbufs keep
+	 * their frame for forwarding. */
+	for (uint16_t i = 0; i < nr; i++) {
+		const struct rte_ipv4_hdr *ip;
+
+		cip[i] = NULL;
+		cav[i] = 0;
+		if (rte_pktmbuf_data_len(bufs[i]) <
+		    RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
+			continue;
+		ip = (const struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(bufs[i],
+		    const uint8_t *) + RTE_ETHER_HDR_LEN);
+		if ((ip->version_ihl >> 4) != 4)
+			continue;
+		cip[i] = ip;
+		cav[i] = rte_pktmbuf_data_len(bufs[i]) - RTE_ETHER_HDR_LEN;
+	}
+	sp_match_out_burst(d, cip, cav, nr, csp, cds);
+	for (uint16_t i = 0; i < nr; i++) {
+		struct dp_sa *ds = cds[i];
+		const struct r2dp_sp *sp = csp[i];
+		uint8_t ihl;
+		struct rte_ipv4_hdr *lip;
+
 		if (!sp) { nb++; continue; }   /* no matching OUT policy: bypass */
 
 		/* A matched policy decides the disposition (H2, RFC 4301 5.1):

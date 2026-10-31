@@ -347,6 +347,10 @@ spd_teardown(struct dpdk_priv *d);
 const struct r2dp_sp *
 sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip, size_t avail,
     struct dp_sa **sa);
+void
+sp_match_out_burst(struct dpdk_priv *d, const struct rte_ipv4_hdr *const ip[],
+    const size_t avail[], uint16_t n, const struct r2dp_sp *sp[],
+    struct dp_sa *sa[]);
 int
 is_tunnel_peer(struct dpdk_priv *d, uint32_t ip);
 

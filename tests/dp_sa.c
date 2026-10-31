@@ -484,6 +484,11 @@ t_acl_diff(struct dpdk_priv *d)
 		if (dpd_sp_add(&dp, &sp) != 0) { CHECK(0, "acl-diff: sp_add"); return; }
 		if (rnd() % 10 == 0) { sp.slid = 5000 + (rnd() % 260); dpd_sp_del(&dp, &sp); }
 	}
+	static uint8_t bip[BURST_SZ][64];
+	static const struct r2dp_sp *bwant[BURST_SZ];
+	unsigned bn = 0, bmism = 0;
+	size_t bav[BURST_SZ];
+
 	for (unsigned n = 0; n < npk; n++) {
 		uint8_t ip[64];
 		size_t ihl = (rnd() % 8) ? 20 : 24, avail;
@@ -506,6 +511,22 @@ t_acl_diff(struct dpdk_priv *d)
 		want = ref_match(d, ip, avail);
 		got = sp_match_out(d, (const struct rte_ipv4_hdr *)ip, avail, &ds);
 		if (want) matched++; else nomatch++;
+		/* the burst classifier must agree packet for packet */
+		memcpy(bip[bn], ip, sizeof(ip));
+		bav[bn] = avail;
+		bwant[bn++] = got;
+		if (bn == BURST_SZ || n + 1 == npk) {
+			const struct rte_ipv4_hdr *bp[BURST_SZ];
+			const struct r2dp_sp *bgot[BURST_SZ];
+			struct dp_sa *bds[BURST_SZ];
+			for (unsigned b = 0; b < bn; b++)
+				bp[b] = (b % 7 == 3) ? NULL : (const struct rte_ipv4_hdr *)bip[b];
+			sp_match_out_burst(d, bp, bav, (uint16_t)bn, bgot, bds);
+			for (unsigned b = 0; b < bn; b++)
+				if (bgot[b] != (bp[b] ? bwant[b] : NULL))
+					bmism++;
+			bn = 0;
+		}
 		if (want != got) {
 			if (mism++ < 5)
 				printf("     mismatch pkt %u: want slid %u got slid %u\n", n,
@@ -513,6 +534,7 @@ t_acl_diff(struct dpdk_priv *d)
 		}
 	}
 	printf("     acl-diff: %u packets, %u matched, %u matched none\n", npk, matched, nomatch);
+	CHECK(bmism == 0, "acl-diff: sp_match_out_burst == sp_match_out");
 	CHECK(mism == 0 && matched > npk / 4 && nomatch > npk / 20, "acl-diff: rte_acl SPD == full scan on random policies/packets");
 	spd_teardown(d);
 }
