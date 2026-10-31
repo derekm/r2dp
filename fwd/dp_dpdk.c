@@ -137,6 +137,16 @@ is_ike_arp(struct rte_mbuf *mb)
  * forwarder's strong definition lives in dp.c. */
 __attribute__((weak)) volatile sig_atomic_t fwd_stats_req;
 
+/* rte_eth_tx_burst, but never with zero packets: some PMDs (net_memif's
+ * copy path reads bufs[0]->pool before it looks at nb_pkts) dereference
+ * the first slot regardless, and every caller here can end up with an
+ * empty array -- e.g. a burst whose packets all lacked a next hop. */
+static inline uint16_t
+port_tx(uint16_t port, uint16_t q, struct rte_mbuf **pkts, uint16_t n)
+{
+	return n ? rte_eth_tx_burst(port, q, pkts, n) : 0;
+}
+
 /* Learn the peer's MAC (keyed by its IP) only from unicast IKE/ESP whose
  * source is a configured tunnel peer, so an arbitrary host on the segment
  * cannot capture egress ESP; relearn when the peer's MAC changes (N1).
@@ -295,7 +305,7 @@ outer_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port,
 			for (uint16_t i = 0; i < ndec; i++)
 				if (dec[i])
 					txq[ntx++] = dec[i];
-			uint16_t sent = rte_eth_tx_burst(to, w->txq, txq, ntx);
+			uint16_t sent = port_tx(to, w->txq, txq, ntx);
 			w->n_tx += sent;
 			DROP(w, DR_TX_FULL, ntx - sent);
 			if (d->verbose)
@@ -322,7 +332,7 @@ outer_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port,
 		if (nf) {
 			if (is_udp(fwd[0]))
 				w->n_ike += nf;   /* IKE */
-			uint16_t sent = rte_eth_tx_burst(to, w->txq, fwd, nf);
+			uint16_t sent = port_tx(to, w->txq, fwd, nf);
 			w->n_tx += sent;
 			DROP(w, DR_TX_FULL, nf - sent);
 			for (uint16_t i = sent; i < nf; i++)
@@ -413,7 +423,7 @@ inner_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port)
 			}
 			txq[ntx++] = esp_out[i];
 		}
-		uint16_t sent = rte_eth_tx_burst(to, w->txq, txq, ntx);
+		uint16_t sent = port_tx(to, w->txq, txq, ntx);
 		w->n_tx += sent;
 		DROP(w, DR_TX_FULL, ntx - sent);
 		if (d->verbose)
@@ -437,7 +447,7 @@ inner_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port)
 				txq[ntx++] = nonesp[i];
 		if (ntx && is_udp(txq[0]))
 			w->n_ike += ntx;
-		uint16_t sent = rte_eth_tx_burst(to, w->txq, txq, ntx);
+		uint16_t sent = port_tx(to, w->txq, txq, ntx);
 		w->n_tx += sent;
 		DROP(w, DR_TX_FULL, ntx - sent);
 		for (uint16_t i = sent; i < ntx; i++)
