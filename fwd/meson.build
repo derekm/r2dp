@@ -6,8 +6,10 @@
 # turns on the DPDK dataplane build.
 fs = import('fs')
 
+# include_type system: DPDK's own headers are not ours to keep warning-clean
+# (23.11 trips -Wpedantic), so they must not break -Dwerror=true builds.
 dpdk = dependency('libdpdk', required: get_option('enable_dpdk'),
-  version: '>=23.11', method: 'pkg-config')
+  version: '>=23.11', method: 'pkg-config', include_type: 'system')
 
 fwd_sources = files(
   'ctl.c',

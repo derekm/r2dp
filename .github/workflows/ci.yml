@@ -23,7 +23,7 @@ jobs:
 
       - name: Meson setup
         run: |
-          CC=${{ matrix.compiler }} meson setup build --buildtype=debugoptimized
+          CC=${{ matrix.compiler }} meson setup build --buildtype=debugoptimized -Dwerror=true
 
       - name: Build
         run: meson compile -C build
@@ -62,7 +62,7 @@ jobs:
           sudo apt-get install -y ninja-build meson pkg-config libdpdk-dev libssl-dev
       - name: Build data plane (DPDK enabled)
         run: |
-          meson setup build-dpdk --buildtype=debugoptimized -Denable_dpdk=enabled
+          meson setup build-dpdk --buildtype=debugoptimized -Denable_dpdk=enabled -Dwerror=true
           meson compile -C build-dpdk
       - name: Test (gcm_kat must not skip)
         run: |
