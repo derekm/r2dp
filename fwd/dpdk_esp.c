@@ -421,11 +421,13 @@ bad:
 		}
 		while (j < nk && sas[j] == ss)
 			j++;
+		uint64_t rb = 0;        /* this run's bytes, one counter update */
+
 		ng = crypto_run(w, ss, &pm[i], (uint16_t)(j - i), ok);
 		for (uint16_t k = 0; k < ng; k++) {
 			/* D8: RFC 4301 s5.2 IN selector check + trim to inner IP */
 			if (out && no < BURST_SZ && in_inner_ok(d, ss, ok[k])) {
-				sa_bytes_add(d, ss, rte_pktmbuf_pkt_len(ok[k]));
+				rb += rte_pktmbuf_pkt_len(ok[k]);
 				out[no++] = ok[k];
 			} else {
 				if (d->verbose)
@@ -434,6 +436,8 @@ bad:
 				rte_pktmbuf_free(ok[k]);
 			}
 		}
+		if (rb)
+			sa_bytes_add(d, ss, rb);
 		i = j;
 	}
 	(void)nlook;
@@ -577,6 +581,8 @@ drop:
 
 		while (j < nm && pds[j] == ds)
 			j++;
+		uint64_t rb = 0;        /* this run's bytes, one counter update */
+
 		ng = crypto_run(w, &ds->sess, &pm[i], j - i, ok);
 		for (uint16_t k = 0; k < ng; k++) {
 			struct rte_mbuf *m = ok[k];
@@ -587,9 +593,7 @@ drop:
 				rte_pktmbuf_free(m);
 				continue;
 			}
-			/* byte-lifetime: count the crypted bytes on this egress SA */
-			__atomic_fetch_add(&ds->bytes, rte_pktmbuf_pkt_len(m),
-			    __ATOMIC_RELAXED);
+			rb += rte_pktmbuf_pkt_len(m);
 			{
 				struct rte_ipv4_hdr *oip =
 				    rte_pktmbuf_mtod(m, struct rte_ipv4_hdr *);
@@ -643,6 +647,9 @@ drop:
 			w->n_esp++;
 			out[no++] = m;
 		}
+		/* byte-lifetime: count the crypted bytes on this egress SA */
+		if (rb)
+			__atomic_fetch_add(&ds->bytes, rb, __ATOMIC_RELAXED);
 		i = j;
 	}
 	if (nout) *nout = no;
