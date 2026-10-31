@@ -29,7 +29,7 @@ plane. Exit gate MET (2026-10-25). **Final state:**
   (forwarder-allocated SPI), SA ADD/UPDATE/DEL/GET/DUMP, SP ADD/DEL/GET/DUMP,
   keys withheld, idempotent SP_ADD, cheap SP_DUMP, lifetime EXPIRE.
   `tools/r2dpctl dump|dump-sp|count` reads the live SAD/SPD over the wire.
-- **Data plane** (`fwd/dp_dpdk.c`, DPDK ≥ 23.11): two-tap bump-in-the-wire
+- **Data plane** (`fwd/dp_dpdk.c` + `fwd/dpdk_*.c`, DPDK ≥ 23.11): two-tap bump-in-the-wire
   (outer ESP tap, inner plaintext tap); `rte_ipsec_sad` (SPI+DIP) + AES-GCM
   `crypto_openssl0`; inbound decrypt (INGRESS direction, aad=8 per RFC 4106);
   egress encrypt via in-DP SPD with per-peer next-hop L2 learning and outer
@@ -72,7 +72,22 @@ fixed and verified.
 ## M3 — Multicore & update safety
 - **Builds**: RSS multi-queue workers, per-lcore counters, rte_rcu_qsbr table swaps, SA-pinned ordering notes (one SA = one core), hugepage/NUMA setup docs.
 - **Deps**: multi-queue-capable PMD (or net_tap multi-queue for CI), perf tools (optional).
-- **Precondition (today's code)**: `r2dp-fwd` runs exactly one worker (`DP_NB_WORKERS == 1`, a `_Static_assert` in `fwd/dp_dpdk.c`; `dpd_start` refuses a second start and leaves extra lcores idle). The anti-replay window, SA byte counters, drop counters and the stuck-cryptodev quarantine are single-writer worker state with no locks or atomics. M3 must pin each inbound SA to one core (RSS/steering by SPI) or add a per-SA lock before raising it.
+- **In (today's code)**: `r2dp-fwd -n N` runs N packet workers.  Each
+  tunnel is owned by one worker (`dp_owner`: a hash of its two endpoints,
+  so both directions and every rekey stay put) and every per-SA writer --
+  replay window, sequence number, byte counters -- is that worker; others
+  drop a stray packet as `steer`.  With N > 1 a dispatcher lcore receives
+  on every RX queue, learns next hops (single writer; readers use a
+  seqlock), consumes NAT-T keepalives and hands frames to the owner over
+  SP/SC rings.  Per-worker TX queues, cryptodev queue pairs, counters and
+  stuck-crypto quarantine; the stats dump sums them.  SAs also carry
+  `RTE_IPSEC_SAFLAG_SQN_ATOM` as a backstop against GCM nonce reuse.
+  Covered by `dp_mt` (concurrent workers on shared SAs: unique gapless
+  sequence numbers, exactly-once inbound, replay refused) and `fwd_e2e.sh`
+  with `FWD_WORKERS=2/3` in CI.  `fwd_bench --workers N` measures the
+  multi-worker ESP path.
+- **Still open**: NIC RSS steering instead of the dispatcher, NUMA/hugepage
+  docs, the scale and churn exit gate below.
 - **Exit gate**: N-tunnel scale test linear to core count; table churn (SA/SP add/del at 1k/s) under traffic with zero drops/crashes (ASan/TSan builds clean).
 
 ## M4 — Offload, on-demand, MTU
@@ -175,7 +190,7 @@ and pass the same scapy e2e suite (`tests/e2e/fwd_e2e.sh`, `BACKEND=`).
 
 | | DPDK (`fwd/dp_dpdk.c`) | kernel (`fwd/dp_xfrm.c`) |
 |---|---|---|
-| Datapath | userspace poll-mode, `rte_ipsec` lookaside, `crypto_openssl` | Linux XFRM via NETLINK_XFRM |
+| Datapath | userspace poll-mode, `rte_ipsec` lookaside, `crypto_aesni_mb` or `crypto_openssl`, `-n` workers (SA-pinned) | Linux XFRM via NETLINK_XFRM |
 | Transforms | AES-GCM-16 only (others `EOPNOTSUPP`) | GCM, CCM (3-byte salt), ChaCha20-Poly1305, CBC/CTR + HMAC |
 | SPD | `rte_acl` + per-SA inbound index, QSBR-retired snapshots | kernel SPD, priority from `r2dp_sel_score` |
 | Anti-replay | own 256-bit ESN window (DPDK's drops bits 32-63 per bucket) | ESN bitmap (`XFRMA_REPLAY_ESN_VAL`), window 64 if 0 |

@@ -10,7 +10,8 @@ a separate project that speaks a PF_KEY-shaped protocol over a unix socket.
 ## Status
 M0 and M1 are done; parts of M2 are in (ESN, NAT-T, lifetimes with EXPIRE,
 replay windows up to 1024).  `r2dp-fwd` runs one of two data planes behind
-the same socket: DPDK (`rte_ipsec`, AES-GCM-16, IPv4 tunnel, one worker)
+the same socket: DPDK (`rte_ipsec`, AES-GCM-16, IPv4 tunnel, `-n` workers
+with each tunnel pinned to one of them)
 or the kernel's XFRM (`--dp kernel`).  Both interoperate with an
 independent ESP implementation in CI.  See `COVERAGE.md` for what is
 verified and what is not, and `MILESTONES.md` for the plan.
@@ -20,9 +21,11 @@ verified and what is not, and `MILESTONES.md` for the plan.
 |---|---|
 | `include/r2dp/proto.h` | the wire contract (algorithms = IANA IKEv2 IDs, protocols = IP proto numbers) |
 | `include/r2dp/client.h`, `libr2dp/` | transport, validation, address helpers (client + server side) |
+| `fwd/` | `r2dp-fwd`: control server (`ctl.c`) and data planes: DPDK (`dp_dpdk.c` ports/workers/dispatcher, `dpdk_sad.c` SA table, `dpdk_spd.c` policy/ACL, `dpdk_esp.c` ESP path, `dpdk_stats.c`) or kernel XFRM (`dp_xfrm.c`) |
+| `bench/fwd_bench.c` | ESP path cycles/pkt and Mpps (sizes, tunnel counts, `--workers N`, `--json`) |
 | `tools/mockfwd.c` | `r2dp-mockfwd`: protocol-faithful forwarder with no dataplane |
 | `patches/racoon2-r2dp-backend.patch` | applies to racoon2 `93e3511` (pre-r2dp base): the r2dp backend, generated from derekm/racoon2 `feat/r2dp-km-backend` @ `baf7094` (`git diff 93e3511 baf7094`) |
-| `tests/` | protocol/client: `test_proto`, `test_mock`, `shim_contract` (spin `r2dp-mockfwd`); control server: `ctl_unit`, `ctl_poll`, `smoke_fwd`; data plane (DPDK, crypto_openssl vdev): `gcm_kat`, `dp_sa`, `dp_path` (encrypt→decrypt round trip + policy dispositions); pure logic: `sel_test`, `nh_test` |
+| `tests/` | protocol/client: `test_proto`, `test_mock`, `shim_contract` (spin `r2dp-mockfwd`); control server: `ctl_unit`, `ctl_poll`, `smoke_fwd`; data plane (DPDK, crypto_openssl vdev): `gcm_kat`, `dp_sa`, `dp_path` (encrypt→decrypt round trip + policy dispositions), `dp_mt` (concurrent workers on shared SAs); interop: `tests/e2e/fwd_e2e.sh`; pure logic: `sel_test`, `nh_test` |
 | `build.sh` | deps / check / build / test / sanitize / e2e / milestones |
 
 ## Quick start

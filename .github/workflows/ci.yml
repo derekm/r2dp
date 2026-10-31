@@ -75,6 +75,7 @@ jobs:
           for pmd in openssl auto; do
             build-dpdk/bench/fwd_bench --pmd $pmd --json bench-$pmd.json
           done
+          build-dpdk/bench/fwd_bench --workers 2 --json bench-workers2.json
       - name: Upload benchmark JSON
         uses: actions/upload-artifact@v4
         with:
@@ -97,6 +98,10 @@ jobs:
       fail-fast: false
       matrix:
         backend: [dpdk, kernel]
+        workers: [1]
+        include:
+          - { backend: dpdk, workers: 2 }
+          - { backend: dpdk, workers: 3 }
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
@@ -119,11 +124,11 @@ jobs:
       - name: kfwd_test (kernel backend through the r2dp socket)
         if: matrix.backend == 'kernel'
         run: R2DP_REQUIRE_KERNEL=1 meson test -C build-e2e kfwd_test --print-errorlogs
-      - name: fwd_e2e (unshare -Urnm, ${{ matrix.backend }})
+      - name: fwd_e2e (unshare -Urnm, ${{ matrix.backend }}, ${{ matrix.workers }} worker(s))
         run: |
           unshare -Urnm --propagation private bash -c '
             mount -t tmpfs none /run &&
-            BACKEND=${{ matrix.backend }} \
+            BACKEND=${{ matrix.backend }} FWD_WORKERS=${{ matrix.workers }} \
             PYTHON="$RUNNER_TEMP/venv/bin/python" R2DP_E2E_DIR="$RUNNER_TEMP/e2e" \
               tests/e2e/fwd_e2e.sh build-e2e/fwd/r2dp-fwd build-e2e/r2dpctl'
       - name: Forwarder log on failure
