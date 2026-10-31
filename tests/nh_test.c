@@ -32,6 +32,7 @@ int
 main(void)
 {
 	static struct r2dp_nh_tab t;
+	uint8_t mo[6];
 	const uint8_t us[6] = { 0x02, 0, 0, 0, 0, 1 };
 	const uint8_t peer[6] = { 0x02, 0, 0, 0, 0, 2 };
 	const uint8_t peer2[6] = { 0x02, 0, 0, 0, 0, 3 };
@@ -62,15 +63,15 @@ main(void)
 	f[12] = 0x86; f[13] = 0xdd;
 	CHECK(r2dp_nh_frame_ike_esp(f, n, &ip, &m) == 0, "non-IPv4 ethertype ignored");
 
-	CHECK(r2dp_nh_lookup(&t, pip) == NULL, "unknown peer -> NULL (drop)");
+	CHECK(r2dp_nh_lookup(&t, pip, mo) == 0, "unknown peer -> NULL (drop)");
 	CHECK(r2dp_nh_learn(&t, pip, peer, 1) == 1, "learn new peer");
 	CHECK(r2dp_nh_learn(&t, pip, peer, 2) == 0, "same MAC unchanged");
-	CHECK((m = r2dp_nh_lookup(&t, pip)) && memcmp(m, peer, 6) == 0, "lookup peer");
+	CHECK(r2dp_nh_lookup(&t, pip, mo) && memcmp(mo, peer, 6) == 0, "lookup peer");
 	CHECK(r2dp_nh_learn(&t, pip2, peer2, 3) == 1, "second peer keyed separately");
-	CHECK((m = r2dp_nh_lookup(&t, pip)) && memcmp(m, peer, 6) == 0,
+	CHECK(r2dp_nh_lookup(&t, pip, mo) && memcmp(mo, peer, 6) == 0,
 	    "first peer unaffected by second");
 	CHECK(r2dp_nh_learn(&t, pip, peer2, 4) == 2, "relearn on MAC change");
-	CHECK((m = r2dp_nh_lookup(&t, pip)) && memcmp(m, peer2, 6) == 0,
+	CHECK(r2dp_nh_lookup(&t, pip, mo) && memcmp(mo, peer2, 6) == 0,
 	    "lookup returns relearned MAC");
 
 	{
@@ -81,9 +82,9 @@ main(void)
 		r2dp_nh_learn(&full, 1, peer, 1000);       /* peer 1 still active */
 		CHECK(r == 0 && r2dp_nh_learn(&full, 0xffffffffu, peer2, 1001) == 3,
 		    "table full -> LRU eviction");
-		CHECK(r2dp_nh_lookup(&full, 0xffffffffu) != NULL, "new peer learned");
-		CHECK(r2dp_nh_lookup(&full, 2) == NULL, "least recently seen peer evicted");
-		CHECK(r2dp_nh_lookup(&full, 1) != NULL, "recently refreshed peer kept");
+		CHECK(r2dp_nh_lookup(&full, 0xffffffffu, mo), "new peer learned");
+		CHECK(!r2dp_nh_lookup(&full, 2, mo), "least recently seen peer evicted");
+		CHECK(r2dp_nh_lookup(&full, 1, mo), "recently refreshed peer kept");
 	}
 
 	if (fails) { printf("nh_test: %d failures\n", fails); return 1; }

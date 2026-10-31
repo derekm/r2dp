@@ -359,10 +359,9 @@ worker_inner(struct dpdk_priv *d, int port)
 				const struct rte_ipv4_hdr *oip =
 				    (const struct rte_ipv4_hdr *)(eh + 1);
 				uint32_t odst;
-				const uint8_t *nmac;
+				uint8_t nmac[6];
 				memcpy(&odst, &oip->dst_addr, 4);
-				nmac = r2dp_nh_lookup(&d->nh, odst);
-				if (nmac == NULL) {
+				if (!r2dp_nh_lookup(&d->nh, odst, nmac)) {
 					DROP(d, DR_NO_NEXTHOP, 1);
 					rte_pktmbuf_free(esp_out[i]);
 					continue;

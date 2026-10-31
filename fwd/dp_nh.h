@@ -5,8 +5,13 @@
  * per peer IPv4 address, only from unicast frames that are IKE (UDP 500/4500)
  * or ESP and whose source IP is a configured tunnel peer, and is relearned
  * when it changes.  Egress to a peer with no learned MAC is dropped, never
- * broadcast.  Pure C (no DPDK) so it is unit-testable; the worker thread is
- * the only reader/writer.
+ * broadcast.  Pure C (no DPDK) so it is unit-testable.
+ *
+ * Concurrency: one writer (the lcore that receives on the outer port) and
+ * any number of concurrent readers (the packet workers).  A table-wide
+ * sequence counter (seqlock) lets a reader detect and retry a lookup that
+ * overlapped a learn; every field is accessed with atomic loads/stores, so
+ * a reader never sees a torn IP/MAC pair.
  */
 #ifndef R2DP_FWD_DP_NH_H
 #define R2DP_FWD_DP_NH_H
@@ -18,12 +23,13 @@
 
 struct r2dp_nh {
 	uint32_t ip;          /* raw wire-order IPv4 */
-	uint8_t  mac[6];
-	uint8_t  used;
-	uint64_t seen;        /* caller's clock at last learn/refresh */
+	uint32_t used;
+	uint64_t mac;         /* 6 MAC bytes, in memory order, low bytes */
+	uint64_t seen;        /* caller's clock at last learn/refresh (writer) */
 };
 
 struct r2dp_nh_tab {
+	uint32_t       seq;   /* odd while the writer is updating */
 	struct r2dp_nh e[R2DP_NH_MAX];
 };
 
@@ -40,7 +46,8 @@ int r2dp_nh_frame_ike_esp(const uint8_t *f, size_t len, uint32_t *sip,
 int r2dp_nh_learn(struct r2dp_nh_tab *t, uint32_t ip, const uint8_t mac[6],
     uint64_t now);
 
-/* MAC for ip, or NULL if unknown. */
-const uint8_t *r2dp_nh_lookup(const struct r2dp_nh_tab *t, uint32_t ip);
+/* Copy ip's MAC to mac[] and return 1, or return 0 if unknown.  Safe
+ * against a concurrent r2dp_nh_learn on another thread. */
+int r2dp_nh_lookup(const struct r2dp_nh_tab *t, uint32_t ip, uint8_t mac[6]);
 
 #endif /* R2DP_FWD_DP_NH_H */
