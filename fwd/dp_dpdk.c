@@ -142,17 +142,36 @@ __attribute__((weak)) volatile sig_atomic_t fwd_stats_req;
  * cannot capture egress ESP; relearn when the peer's MAC changes (N1).
  * Called only by the lcore that receives on the outer port (the single
  * writer of d->nh). */
+/* Per-burst memo: a burst is mostly one peer, and a repeat of the
+ * previous frame's (source IP, source MAC) at the same `now` would change
+ * nothing -- skip its peer check and table scan. */
+struct nh_memo {
+	uint64_t now;
+	uint64_t mac;
+	uint32_t sip;
+	int      valid;
+};
+
 static void
-nh_learn_frame(struct dpdk_priv *d, struct rte_mbuf *m)
+nh_learn_frame(struct dpdk_priv *d, struct rte_mbuf *m, struct nh_memo *mo)
 {
 	uint32_t sip;
 	const uint8_t *smac;
+	uint64_t mac = 0;
 	int lr;
 
 	if (!r2dp_nh_frame_ike_esp(rte_pktmbuf_mtod(m, const uint8_t *),
-	    rte_pktmbuf_data_len(m), &sip, &smac) || !is_tunnel_peer(d, sip))
+	    rte_pktmbuf_data_len(m), &sip, &smac))
 		return;
-	lr = r2dp_nh_learn(&d->nh, sip, smac, rte_get_tsc_cycles());
+	memcpy(&mac, smac, 6);
+	if (mo->valid && mo->sip == sip && mo->mac == mac)
+		return;
+	mo->sip = sip;
+	mo->mac = mac;
+	mo->valid = 1;
+	if (!is_tunnel_peer(d, sip))
+		return;
+	lr = r2dp_nh_learn(&d->nh, sip, smac, mo->now);
 	if (lr > 0 && d->verbose)
 		fprintf(stderr, "r2dp-fwd: %s next hop for peer %08x: "
 		    "%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -194,9 +213,10 @@ outer_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port,
 		fprintf(stderr, "\n");
 	}
 	uint16_t nesp = 0, nex = 0;
+	struct nh_memo mo = { .now = learn ? rte_get_tsc_cycles() : 0 };
 	for (uint16_t i = 0; i < nr; i++) {
 		if (learn)
-			nh_learn_frame(d, bufs[i]);
+			nh_learn_frame(d, bufs[i], &mo);
 		if (natt_class(rte_pktmbuf_mtod(bufs[i], const uint8_t *),
 		    rte_pktmbuf_data_len(bufs[i])) == NT_KEEPALIVE) {
 			w->n_natt_keepalive++;      /* RFC 3948 s2.3: discard */
@@ -351,6 +371,9 @@ inner_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port)
 		uint16_t ntx = 0;
 		struct rte_mbuf *txq[BURST_SZ];
 		uint16_t to = (d->port_id >= 0) ? d->port_id : port;
+		uint32_t last_dst = 0;          /* per-burst next-hop memo */
+		uint8_t nmac[6];
+		int have = 0;
 		for (uint16_t i = 0; i < nout; i++) {
 			struct rte_ether_hdr *eh;
 			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
@@ -364,9 +387,12 @@ inner_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port)
 				const struct rte_ipv4_hdr *oip =
 				    (const struct rte_ipv4_hdr *)(eh + 1);
 				uint32_t odst;
-				uint8_t nmac[6];
 				memcpy(&odst, &oip->dst_addr, 4);
-				if (!r2dp_nh_lookup(&d->nh, odst, nmac)) {
+				if (!have || odst != last_dst) {
+					have = r2dp_nh_lookup(&d->nh, odst, nmac);
+					last_dst = odst;
+				}
+				if (!have) {
 					DROP(w, DR_NO_NEXTHOP, 1);
 					rte_pktmbuf_free(esp_out[i]);
 					continue;
@@ -625,11 +651,13 @@ dispatcher_main(void *arg)
 		uint16_t rq = qi++ % d->nb_wk;     /* round-robin the RX queues */
 		uint16_t nr = rte_eth_rx_burst(d->port_id, rq, bufs, BURST_SZ);
 
+		struct nh_memo mo = { .now = nr ? rte_get_tsc_cycles() : 0 };
+
 		dw->n_rx += nr;
 		for (uint16_t i = 0; i < nr; i++) {
 			unsigned t;
 
-			nh_learn_frame(d, bufs[i]);
+			nh_learn_frame(d, bufs[i], &mo);
 			if (natt_class(rte_pktmbuf_mtod(bufs[i], const uint8_t *),
 			    rte_pktmbuf_data_len(bufs[i])) == NT_KEEPALIVE) {
 				dw->n_natt_keepalive++;   /* RFC 3948 s2.3 */

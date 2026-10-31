@@ -82,31 +82,35 @@ int
 r2dp_nh_learn(struct r2dp_nh_tab *t, uint32_t ip, const uint8_t mac[6],
     uint64_t now)
 {
-	int free_i = -1, lru = 0, ret = 1;
+	int free_i = -1, lru = -1, ret = 1;
 	uint64_t m = mac_pack(mac);
 
+	/* Refresh of a known peer -- every received IKE/ESP frame -- is a
+	 * plain scan for the address; the eviction choice is only made when
+	 * a new peer has to be inserted. */
 	for (int i = 0; i < R2DP_NH_MAX; i++) {
 		struct r2dp_nh *e = &t->e[i];
-		if (!e->used) {
-			if (free_i < 0)
-				free_i = i;
+		if (!e->used || e->ip != ip)
 			continue;
-		}
-		if (e->seen < t->e[lru].seen || !t->e[lru].used)
-			lru = i;
-		if (e->ip != ip)
-			continue;
-		e->seen = now;
+		t->seen[i] = now;
 		if (e->mac == m)
 			return 0;
 		nh_write(t, e, ip, m);        /* peer moved: relearn */
 		return 2;
 	}
+	for (int i = 0; i < R2DP_NH_MAX; i++) {
+		if (!t->e[i].used) {
+			free_i = i;
+			break;
+		}
+		if (lru < 0 || t->seen[i] < t->seen[lru])
+			lru = i;
+	}
 	if (free_i < 0) {
 		free_i = lru;                 /* full: evict least recently seen */
 		ret = 3;
 	}
-	t->e[free_i].seen = now;
+	t->seen[free_i] = now;
 	nh_write(t, &t->e[free_i], ip, m);
 	return ret;
 }

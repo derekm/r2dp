@@ -25,12 +25,16 @@ struct r2dp_nh {
 	uint32_t ip;          /* raw wire-order IPv4 */
 	uint32_t used;
 	uint64_t mac;         /* 6 MAC bytes, in memory order, low bytes */
-	uint64_t seen;        /* caller's clock at last learn/refresh (writer) */
 };
 
+/* e[] is what readers scan (16 bytes an entry, four to a cache line);
+ * the writer's per-packet LRU clock lives in its own lines, so refreshing
+ * it never invalidates the readers' copy of e[]. */
 struct r2dp_nh_tab {
 	uint32_t       seq;   /* odd while the writer is updating */
 	struct r2dp_nh e[R2DP_NH_MAX];
+	/* caller's clock at last learn/refresh (writer only) */
+	uint64_t       seen[R2DP_NH_MAX] __attribute__((aligned(64)));
 };
 
 /* Classify an Ethernet frame.  Returns 1 if it is a unicast IPv4 frame
