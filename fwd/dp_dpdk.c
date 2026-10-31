@@ -21,12 +21,11 @@
 static struct fwd_dp_ops dpdk_ops;
 
 /* ------------------------------------------------------------------ */
-/* M1 packet path: run-to-completion on one lcore.  rx from the tap port,
- * classify, and tx back (the M1 topology is a TAP bridged to a kernel
- * interface; ESP is later processed, non-ESP IKE/ARP rides the exception
- * path -- both re-emit on the same port so the kernel sees them). */
+/* nq RX and nq TX queues (net_tap insists they match): one TX queue per
+ * worker; with several workers the dispatcher polls every RX queue (a
+ * multiqueue tap spreads the kernel's frames over all of them). */
 static int
-port_init(struct dpdk_priv *d, uint16_t port)
+port_init(struct dpdk_priv *d, uint16_t port, unsigned ntxq)
 {
 	struct rte_eth_conf conf;
 	struct rte_eth_dev_info dev_info;
@@ -41,14 +40,19 @@ port_init(struct dpdk_priv *d, uint16_t port)
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
-	uint16_t nrxq = NB_RX_QUEUE, ntxq = NB_TX_QUEUE;
-	if (rte_eth_dev_configure(port, nrxq, ntxq, &conf) < 0)
+	uint16_t nrxq = (uint16_t)ntxq;
+	if (ntxq > dev_info.max_tx_queues) {
+		fprintf(stderr, "r2dp-fwd: port %u has %u tx queues, need %u\n",
+		    port, dev_info.max_tx_queues, ntxq);
+		return -1;
+	}
+	if (rte_eth_dev_configure(port, nrxq, (uint16_t)ntxq, &conf) < 0)
 		return -rte_errno;
 	for (uint16_t q = 0; q < nrxq; q++)
 		if (rte_eth_rx_queue_setup(port, q, 1024, rte_eth_dev_socket_id(port),
 		    NULL, d->pool) < 0)
 			return -rte_errno;
-	for (uint16_t q = 0; q < ntxq; q++)
+	for (uint16_t q = 0; q < (uint16_t)ntxq; q++)
 		if (rte_eth_tx_queue_setup(port, q, 1024, rte_eth_dev_socket_id(port),
 		    NULL) < 0)
 			return -rte_errno;
@@ -129,6 +133,33 @@ is_ike_arp(struct rte_mbuf *mb)
 	return dport == 500 || dport == 4500;
 }
 
+/* Weak so test programs that link the modules without dp.c resolve it; the
+ * forwarder's strong definition lives in dp.c. */
+__attribute__((weak)) volatile sig_atomic_t fwd_stats_req;
+
+/* Learn the peer's MAC (keyed by its IP) only from unicast IKE/ESP whose
+ * source is a configured tunnel peer, so an arbitrary host on the segment
+ * cannot capture egress ESP; relearn when the peer's MAC changes (N1).
+ * Called only by the lcore that receives on the outer port (the single
+ * writer of d->nh). */
+static void
+nh_learn_frame(struct dpdk_priv *d, struct rte_mbuf *m)
+{
+	uint32_t sip;
+	const uint8_t *smac;
+	int lr;
+
+	if (!r2dp_nh_frame_ike_esp(rte_pktmbuf_mtod(m, const uint8_t *),
+	    rte_pktmbuf_data_len(m), &sip, &smac) || !is_tunnel_peer(d, sip))
+		return;
+	lr = r2dp_nh_learn(&d->nh, sip, smac, rte_get_tsc_cycles());
+	if (lr > 0 && d->verbose)
+		fprintf(stderr, "r2dp-fwd: %s next hop for peer %08x: "
+		    "%02x:%02x:%02x:%02x:%02x:%02x\n",
+		    lr == 2 ? "relearned" : "learned", sip, smac[0], smac[1],
+		    smac[2], smac[3], smac[4], smac[5]);
+}
+
 /* Process a burst received on the OUTER tap (ESP side): ESP -> decrypt ->
  * forward the inner (cleartext) packet out the inner tap; non-ESP (IKE, ARP)
  * is the exception path and crosses to the inner (kernel) side.
@@ -140,15 +171,12 @@ is_ike_arp(struct rte_mbuf *mb)
  * Never touch bufs[] again after the single pass below. */
 
 static void
-worker_outer(struct dpdk_priv *d, int port)
+outer_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port,
+    int learn)
 {
-	struct rte_mbuf *bufs[BURST_SZ];
+	struct dpdk_priv *d = w->d;
 	struct rte_mbuf *esp[BURST_SZ], *exc[BURST_SZ];
-	uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
 
-	if (nr == 0)
-		return;
-	d->n_rx += nr;
 	if (d->verbose) {
 		/* Dump the first raw frame as the tap delivered it, BEFORE any L2
 		 * strip, so we can compare it byte-for-byte against what was
@@ -167,34 +195,16 @@ worker_outer(struct dpdk_priv *d, int port)
 	}
 	uint16_t nesp = 0, nex = 0;
 	for (uint16_t i = 0; i < nr; i++) {
-		/* Learn the peer's MAC (keyed by its IP) only from unicast
-		 * IKE/ESP whose source is a configured tunnel peer, so an
-		 * arbitrary host on the segment cannot capture egress ESP;
-		 * relearn when the peer's MAC changes (N1). */
-		{
-			uint32_t sip;
-			const uint8_t *smac;
-			if (r2dp_nh_frame_ike_esp(rte_pktmbuf_mtod(bufs[i],
-			    const uint8_t *), rte_pktmbuf_data_len(bufs[i]),
-			    &sip, &smac) && is_tunnel_peer(d, sip)) {
-				int lr = r2dp_nh_learn(&d->nh, sip, smac,
-				    rte_get_tsc_cycles());
-				if (lr > 0 && d->verbose)
-					fprintf(stderr, "r2dp-fwd: %s next hop for "
-					    "peer %08x: %02x:%02x:%02x:%02x:%02x:%02x\n",
-					    lr == 2 ? "relearned" : "learned", sip,
-					    smac[0], smac[1], smac[2], smac[3],
-					    smac[4], smac[5]);
-			}
-		}
+		if (learn)
+			nh_learn_frame(d, bufs[i]);
 		if (natt_class(rte_pktmbuf_mtod(bufs[i], const uint8_t *),
 		    rte_pktmbuf_data_len(bufs[i])) == NT_KEEPALIVE) {
-			d->n_natt_keepalive++;      /* RFC 3948 s2.3: discard */
+			w->n_natt_keepalive++;      /* RFC 3948 s2.3: discard */
 			rte_pktmbuf_free(bufs[i]);
 			continue;
 		}
 		if (is_esp(bufs[i]) || is_nat_esp(bufs[i])) {
-			d->n_esp++;
+			w->n_esp++;
 			esp[nesp++] = bufs[i];
 		} else {
 			exc[nex++] = bufs[i];
@@ -204,7 +214,7 @@ worker_outer(struct dpdk_priv *d, int port)
 	if (nesp) {
 		struct rte_mbuf *dec[BURST_SZ];
 		uint16_t ndec = 0;
-		esp_inbound(d, esp, nesp, dec, &ndec);
+		esp_inbound(w, esp, nesp, dec, &ndec);
 		if (ndec) {
 			/* rte_ipsec_pkt_process leaves the decrypted INNER packet as
 			 * bare IP (l2_len=0, no Ethernet header).  net_tap transmits
@@ -219,7 +229,7 @@ worker_outer(struct dpdk_priv *d, int port)
 				char *h = rte_pktmbuf_prepend(dec[i],
 				    RTE_ETHER_HDR_LEN);
 				if (h == NULL) {   /* no headroom: drop */
-					DROP(d, DR_NOMEM, 1);
+					DROP(w, DR_NOMEM, 1);
 					rte_pktmbuf_free(dec[i]);
 					dec[i] = NULL;
 					continue;
@@ -265,9 +275,9 @@ worker_outer(struct dpdk_priv *d, int port)
 			for (uint16_t i = 0; i < ndec; i++)
 				if (dec[i])
 					txq[ntx++] = dec[i];
-			uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
-			d->n_tx += sent;
-			DROP(d, DR_TX_FULL, ntx - sent);
+			uint16_t sent = rte_eth_tx_burst(to, w->txq, txq, ntx);
+			w->n_tx += sent;
+			DROP(w, DR_TX_FULL, ntx - sent);
 			if (d->verbose)
 				fprintf(stderr, "r2dp-fwd: esp-tx ndec=%u ntx=%u sent=%u\n",
 				    ndec, ntx, sent);
@@ -287,14 +297,14 @@ worker_outer(struct dpdk_priv *d, int port)
 			if (is_ike_arp(exc[i]))
 				fwd[nf++] = exc[i];
 			else
-				DROP(d, DR_CLEAR_OUTER, 1);
+				DROP(w, DR_CLEAR_OUTER, 1);
 		}
 		if (nf) {
 			if (is_udp(fwd[0]))
-				d->n_ike += nf;   /* IKE */
-			uint16_t sent = rte_eth_tx_burst(to, 0, fwd, nf);
-			d->n_tx += sent;
-			DROP(d, DR_TX_FULL, nf - sent);
+				w->n_ike += nf;   /* IKE */
+			uint16_t sent = rte_eth_tx_burst(to, w->txq, fwd, nf);
+			w->n_tx += sent;
+			DROP(w, DR_TX_FULL, nf - sent);
 			for (uint16_t i = sent; i < nf; i++)
 				rte_pktmbuf_free(fwd[i]);
 		}
@@ -310,14 +320,9 @@ worker_outer(struct dpdk_priv *d, int port)
  * tap as ESP; non-protected (IKE/ARP, or no OUT policy -> bypass) crosses to
  * the outer (peer) tap on the exception path.  ESP arriving here is dropped. */
 static void
-worker_inner(struct dpdk_priv *d, int port)
+inner_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port)
 {
-	struct rte_mbuf *bufs[BURST_SZ];
-	uint16_t nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
-
-	if (nr == 0)
-		return;
-	d->n_rx += nr;
+	struct dpdk_priv *d = w->d;
 
 	/* 1. classify: ESP here is anomalous -> drop; non-ESP may be protected
 	 *    (encrypt) or unprotected (IKE/ARP -> exception path). */
@@ -325,7 +330,7 @@ worker_inner(struct dpdk_priv *d, int port)
 	uint16_t nnon = 0;
 	for (uint16_t i = 0; i < nr; i++) {
 		if (is_esp(bufs[i])) {
-			DROP(d, DR_ESP_ON_INNER, 1);
+			DROP(w, DR_ESP_ON_INNER, 1);
 			rte_pktmbuf_free(bufs[i]);
 		}
 		else
@@ -339,7 +344,7 @@ worker_inner(struct dpdk_priv *d, int port)
 	 *    leaves the unmatched ones (nby) untouched in nonesp[]. */
 	struct rte_mbuf *esp_out[BURST_SZ];
 	uint16_t nout = 0, nby = 0;
-	esp_outbound(d, nonesp, nnon, esp_out, &nout, &nby);
+	esp_outbound(w, nonesp, nnon, esp_out, &nout, &nby);
 
 	/* 3. prepend L2 to the ESP datagrams and tx to the outer (peer) tap */
 	if (nout) {
@@ -349,7 +354,7 @@ worker_inner(struct dpdk_priv *d, int port)
 		for (uint16_t i = 0; i < nout; i++) {
 			struct rte_ether_hdr *eh;
 			char *h = rte_pktmbuf_prepend(esp_out[i], RTE_ETHER_HDR_LEN);
-			if (!h) { DROP(d, DR_NOMEM, 1); rte_pktmbuf_free(esp_out[i]); continue; }
+			if (!h) { DROP(w, DR_NOMEM, 1); rte_pktmbuf_free(esp_out[i]); continue; }
 			eh = rte_pktmbuf_mtod(esp_out[i], struct rte_ether_hdr *);
 			/* Egress ESP is unicast to the tunnel peer's learned
 			 * next hop (keyed by the outer destination IP).  With
@@ -362,7 +367,7 @@ worker_inner(struct dpdk_priv *d, int port)
 				uint8_t nmac[6];
 				memcpy(&odst, &oip->dst_addr, 4);
 				if (!r2dp_nh_lookup(&d->nh, odst, nmac)) {
-					DROP(d, DR_NO_NEXTHOP, 1);
+					DROP(w, DR_NO_NEXTHOP, 1);
 					rte_pktmbuf_free(esp_out[i]);
 					continue;
 				}
@@ -382,9 +387,9 @@ worker_inner(struct dpdk_priv *d, int port)
 			}
 			txq[ntx++] = esp_out[i];
 		}
-		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
-		d->n_tx += sent;
-		DROP(d, DR_TX_FULL, ntx - sent);
+		uint16_t sent = rte_eth_tx_burst(to, w->txq, txq, ntx);
+		w->n_tx += sent;
+		DROP(w, DR_TX_FULL, ntx - sent);
 		if (d->verbose)
 			fprintf(stderr, "r2dp-fwd: egress-tx nout=%u ntx=%u sent=%u\n",
 			    nout, ntx, sent);
@@ -405,113 +410,306 @@ worker_inner(struct dpdk_priv *d, int port)
 			if (nonesp[i] != NULL)
 				txq[ntx++] = nonesp[i];
 		if (ntx && is_udp(txq[0]))
-			d->n_ike += ntx;
-		uint16_t sent = rte_eth_tx_burst(to, 0, txq, ntx);
-		d->n_tx += sent;
-		DROP(d, DR_TX_FULL, ntx - sent);
+			w->n_ike += ntx;
+		uint16_t sent = rte_eth_tx_burst(to, w->txq, txq, ntx);
+		w->n_tx += sent;
+		DROP(w, DR_TX_FULL, ntx - sent);
 		for (uint16_t i = sent; i < ntx; i++)
 			rte_pktmbuf_free(txq[i]);
 	}
 }
 
-/* Weak so test programs that #include this file without dp.c link; the
- * forwarder's strong definition lives in dp.c. */
-__attribute__((weak)) volatile sig_atomic_t fwd_stats_req;
+/* SIGUSR1 dump and the ~1 s summary line; run by one lcore only (the
+ * worker with one worker, else the dispatcher). */
+static void
+housekeeping(struct dpdk_priv *d, uint64_t *last_t)
+{
+	uint64_t now = rte_rdtsc();
 
+	if (fwd_stats_req) {
+		fwd_stats_req = 0;
+		dpd_stats_dump(d, stderr);
+	}
+	if (!*last_t) {
+		*last_t = now;
+	} else if (now - *last_t >= rte_get_timer_hz()) {
+		struct dp_wk t;
+
+		dpd_stats_sum(d, &t);
+		fprintf(stderr,
+		    "r2dp-fwd: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu\n",
+		    (unsigned long long)t.n_rx, (unsigned long long)t.n_tx,
+		    (unsigned long long)t.n_esp, (unsigned long long)t.n_ike,
+		    (unsigned long long)t.n_drop);
+		*last_t = now;
+	}
+}
+
+static void
+qsbr_online(struct dpdk_priv *d, unsigned tid)
+{
+	if (!d->rcu)
+		return;
+	rte_rcu_qsbr_thread_register(d->rcu, tid);
+	rte_rcu_qsbr_thread_online(d->rcu, tid);
+}
+
+static void
+qsbr_offline(struct dpdk_priv *d, unsigned tid)
+{
+	if (d->rcu)
+		rte_rcu_qsbr_thread_offline(d->rcu, tid);
+}
+
+/* Packet worker.  With one worker it polls queue 0 of both ports itself
+ * (run to completion, as before multi-worker support).  With several, the
+ * dispatcher (below) feeds it through two SP/SC rings and it only ever
+ * handles packets for SAs it owns (dp_sa.owner), so every per-SA piece of
+ * mutable state -- the replay window, the outbound sequence number -- has
+ * exactly one writer. */
 static int
 worker_main(void *arg)
 {
-	struct dpdk_priv *d = arg;
-	uint16_t port = d->port_id;
+	struct dp_wk *w = arg;
+	struct dpdk_priv *d = w->d;
+	int port = d->port_id, single = d->nb_wk == 1;
+	struct rte_mbuf *bufs[BURST_SZ];
 	uint64_t last_t = 0;
 
-	fprintf(stderr, "r2dp-fwd: worker on lcore %u, outer=%u inner=%d\n",
-	    rte_lcore_id(), port, d->inner_port);
-	/* H5: register this worker as a QSBR reader so ctl can synchronize
-	 * before freeing SA/SP memory.  tid = its lcore id (< RTE_MAX_LCORE). */
-	{
-		struct rte_ether_addr ea;
-		if (rte_eth_macaddr_get(port, &ea) == 0)
-			memcpy(d->our_mac, ea.addr_bytes, 6);
-		if (d->inner_port >= 0 &&
-		    rte_eth_macaddr_get(d->inner_port, &ea) == 0)
-			memcpy(d->our_inner_mac, ea.addr_bytes, 6);
-	}
-	if (d->rcu) {
-		rte_rcu_qsbr_thread_register(d->rcu, d->worker_lcore);
-		rte_rcu_qsbr_thread_online(d->rcu, d->worker_lcore);
-	}
-	while (d->running) {
-		uint64_t now = rte_rdtsc();
+	fprintf(stderr, "r2dp-fwd: worker %u on lcore %u, outer=%d inner=%d "
+	    "txq=%u cqp=%u\n", w->id, rte_lcore_id(), port, d->inner_port,
+	    w->txq, w->cqp);
+	qsbr_online(d, w->lcore);
+	while (__atomic_load_n(&d->running, __ATOMIC_RELAXED)) {
+		uint16_t nr;
 
-		worker_outer(d, port);
-		if (d->inner_port >= 0)
-			worker_inner(d, d->inner_port);
-
-		/* report quiescent: ctl may now free anything read this iteration */
+		if (single) {
+			nr = rte_eth_rx_burst(port, 0, bufs, BURST_SZ);
+			if (nr) {
+				w->n_rx += nr;
+				outer_burst(w, bufs, nr, port, 1);
+			}
+			if (d->inner_port >= 0 &&
+			    (nr = rte_eth_rx_burst(d->inner_port, 0, bufs,
+			    BURST_SZ)) != 0) {
+				w->n_rx += nr;
+				inner_burst(w, bufs, nr, d->inner_port);
+			}
+		} else {
+			nr = rte_ring_sc_dequeue_burst(w->ring_o, (void **)bufs,
+			    BURST_SZ, NULL);
+			if (nr)
+				outer_burst(w, bufs, nr, port, 0);
+			nr = rte_ring_sc_dequeue_burst(w->ring_i, (void **)bufs,
+			    BURST_SZ, NULL);
+			if (nr)
+				inner_burst(w, bufs, nr,
+				    d->inner_port >= 0 ? d->inner_port : port);
+		}
+		/* quiescent: ctl may now free anything read this iteration */
 		if (d->rcu)
-			rte_rcu_qsbr_quiescent(d->rcu, d->worker_lcore);
-
-		if (fwd_stats_req) {
-			fwd_stats_req = 0;
-			dpd_stats_dump(d, stderr);
-		}
-		if (!last_t)
-			last_t = now;
-		else if (now - last_t >= rte_get_timer_hz()) {  /* ~1s */
-			fprintf(stderr,
-			    "r2dp-fwd: stats rx=%llu tx=%llu esp=%llu ike=%llu drop=%llu\n",
-			    (unsigned long long)d->n_rx,
-			    (unsigned long long)d->n_tx,
-			    (unsigned long long)d->n_esp,
-			    (unsigned long long)d->n_ike,
-			    (unsigned long long)d->n_drop);
-			last_t = now;
-		}
+			rte_rcu_qsbr_quiescent(d->rcu, w->lcore);
+		if (single)
+			housekeeping(d, &last_t);
 	}
-	if (d->rcu)
-		rte_rcu_qsbr_thread_offline(d->rcu, d->worker_lcore);
+	qsbr_offline(d, w->lcore);
 	return 0;
 }
 
-/* Exactly one worker owns the packet path.  Its per-SA state -- the
- * anti-replay window (rp_top/rp_map), byte counters, cq_stale and the drop
- * counters -- is written without locks or atomics.  Running a second
- * worker needs per-core SAs (RSS by SPI) or a per-SA lock first; until
- * then dpd_start launches one and refuses a second start. */
-#define DP_NB_WORKERS 1
-_Static_assert(DP_NB_WORKERS == 1,
-    "replay window and SA counters are single-writer worker state");
+/* Worker owning the inbound SA an outer frame is for: ESP or ESP-in-UDP is
+ * looked up in the SAD by (SPI, outer dst); everything else (IKE, ARP,
+ * clear, SAD misses) goes to worker 0, which forwards or drops it exactly
+ * as a single worker would. */
+static unsigned
+steer_outer(struct dpdk_priv *d, struct rte_mbuf *m)
+{
+	const uint8_t *p = rte_pktmbuf_mtod(m, const uint8_t *);
+	uint32_t len = rte_pktmbuf_data_len(m), off, spi;
+	const struct rte_ipv4_hdr *ip;
+	union rte_ipsec_sad_key k;
+	const union rte_ipsec_sad_key *kp = &k;
+	void *sa = NULL;
+	const struct dp_sa *ds;
 
+	if (len < RTE_ETHER_HDR_LEN + sizeof(*ip) || p[12] != 0x08 || p[13] != 0)
+		return 0;
+	ip = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
+	if ((ip->version_ihl >> 4) != 4)
+		return 0;
+	off = RTE_ETHER_HDR_LEN + (ip->version_ihl & 0x0f) * 4u;
+	if (ip->next_proto_id == IPPROTO_UDP) {
+		if (natt_class(p, len) != NT_ESP)
+			return 0;
+		off += 8;
+	} else if (ip->next_proto_id != IPPROTO_ESP) {
+		return 0;
+	}
+	if (len < off + 4)
+		return 0;
+	memcpy(&spi, p + off, 4);
+	memset(&k, 0, sizeof(k));
+	k.v4.spi = ntohl(spi);
+	k.v4.dip = ip->dst_addr;
+	if (rte_ipsec_sad_lookup(d->sad, &kp, &sa, 1) != 1 || !sa)
+		return 0;
+	ds = sa_of_sess(d, sa);
+	return ds ? ds->owner % d->nb_wk : 0;
+}
+
+/* Worker for an inner (plaintext) frame: the owner of the egress SA its
+ * OUT PROTECT policy is bound to; anything else (bypass, discard, no SA,
+ * non-IPv4) by a hash of the addresses, so a flow stays in order. */
+static unsigned
+steer_inner(struct dpdk_priv *d, struct rte_mbuf *m)
+{
+	const uint8_t *p = rte_pktmbuf_mtod(m, const uint8_t *);
+	uint32_t len = rte_pktmbuf_data_len(m);
+	const struct rte_ipv4_hdr *ip;
+	const struct r2dp_sp *sp;
+	struct dp_sa *ds;
+
+	if (len < RTE_ETHER_HDR_LEN + sizeof(*ip))
+		return 0;
+	ip = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
+	if ((ip->version_ihl >> 4) != 4)
+		return 0;
+	sp = sp_match_out(d, ip, len - RTE_ETHER_HDR_LEN, &ds);
+	if (sp && ds && sp->action == R2DP_ACT_PROTECT)
+		return ds->owner % d->nb_wk;
+	return rte_hash_crc_4byte(ip->dst_addr,
+	    rte_hash_crc_4byte(ip->src_addr, 0)) % d->nb_wk;
+}
+
+/* Hand per-worker batches to their rings; what does not fit is dropped
+ * and counted on the dispatcher (DR_STEER). */
+static void
+dispatch_flush(struct dp_wk *dw, struct rte_mbuf *q[][BURST_SZ],
+    uint16_t *nq, int outer)
+{
+	struct dpdk_priv *d = dw->d;
+
+	for (unsigned i = 0; i < d->nb_wk; i++) {
+		struct rte_ring *r = outer ? d->wk[i].ring_o : d->wk[i].ring_i;
+		unsigned sent;
+
+		if (!nq[i])
+			continue;
+		sent = rte_ring_sp_enqueue_burst(r, (void **)q[i], nq[i], NULL);
+		if (sent < nq[i]) {
+			DROP(dw, DR_STEER, nq[i] - sent);
+			rte_pktmbuf_free_bulk(&q[i][sent], nq[i] - sent);
+		}
+		nq[i] = 0;
+	}
+}
+
+/* Multi-worker dispatcher: the only lcore that receives.  It learns next
+ * hops and consumes NAT keepalives (so d->nh has one writer), then steers
+ * each frame to the worker that owns its SA.  It reads the SAD and the
+ * policy snapshot, so it is a QSBR reader like the workers. */
+static int
+dispatcher_main(void *arg)
+{
+	struct dp_wk *dw = arg;
+	struct dpdk_priv *d = dw->d;
+	struct rte_mbuf *bufs[BURST_SZ];
+	struct rte_mbuf *q[DP_MAX_WK][BURST_SZ];
+	uint16_t nq[DP_MAX_WK] = { 0 };
+	uint64_t last_t = 0;
+	unsigned qi = 0;
+
+	fprintf(stderr, "r2dp-fwd: dispatcher on lcore %u for %u workers\n",
+	    rte_lcore_id(), d->nb_wk);
+	qsbr_online(d, dw->lcore);
+	while (__atomic_load_n(&d->running, __ATOMIC_RELAXED)) {
+		uint16_t rq = qi++ % d->nb_wk;     /* round-robin the RX queues */
+		uint16_t nr = rte_eth_rx_burst(d->port_id, rq, bufs, BURST_SZ);
+
+		dw->n_rx += nr;
+		for (uint16_t i = 0; i < nr; i++) {
+			unsigned t;
+
+			nh_learn_frame(d, bufs[i]);
+			if (natt_class(rte_pktmbuf_mtod(bufs[i], const uint8_t *),
+			    rte_pktmbuf_data_len(bufs[i])) == NT_KEEPALIVE) {
+				dw->n_natt_keepalive++;   /* RFC 3948 s2.3 */
+				rte_pktmbuf_free(bufs[i]);
+				continue;
+			}
+			t = steer_outer(d, bufs[i]);
+			q[t][nq[t]++] = bufs[i];
+		}
+		dispatch_flush(dw, q, nq, 1);
+		if (d->inner_port >= 0) {
+			nr = rte_eth_rx_burst(d->inner_port, rq, bufs, BURST_SZ);
+			dw->n_rx += nr;
+			for (uint16_t i = 0; i < nr; i++) {
+				unsigned t = steer_inner(d, bufs[i]);
+				q[t][nq[t]++] = bufs[i];
+			}
+			dispatch_flush(dw, q, nq, 0);
+		}
+		if (d->rcu)
+			rte_rcu_qsbr_quiescent(d->rcu, dw->lcore);
+		housekeeping(d, &last_t);
+	}
+	qsbr_offline(d, dw->lcore);
+	return 0;
+}
+
+/* Port TX queues / cryptodev queue pairs available for workers. */
+static unsigned
+max_workers(struct dpdk_priv *d)
+{
+	unsigned n = DP_MAX_WK;
+	int ports[2] = { d->port_id, d->inner_port };
+
+	for (int i = 0; i < 2; i++) {
+		struct rte_eth_dev_info di;
+		if (ports[i] >= 0 && rte_eth_dev_info_get(ports[i], &di) == 0)
+			n = RTE_MIN(n, (unsigned)di.max_tx_queues);
+	}
+	if (d->have_cdev)
+		n = RTE_MIN(n, (unsigned)d->cdev_info.max_nb_queue_pairs);
+	return n ? n : 1;
+}
+
+/* Launch nb_wk workers (plus a dispatcher when nb_wk > 1) on the EAL
+ * worker lcores.  nb_wk was fixed at probe time, before any SA could be
+ * installed, because it decides dp_sa.owner. */
 static int
 dpd_start(struct fwd_dp *dp)
 {
 	struct dpdk_priv *d = dp->priv;
-	unsigned lcore;
+	unsigned lc[DP_MAX_WK + 1], nlc = 0, need, lcore;
 
 	if (d->port_id < 0)
 		return -ENODEV;
 	if (d->running)
-		return -EBUSY;        /* one worker only (DP_NB_WORKERS) */
-	/* pick a slave lcore, skipping the main (calling) lcore */
-	lcore = rte_get_next_lcore(-1, 1, 1);
-	if (lcore >= RTE_MAX_LCORE) {
-		fprintf(stderr, "r2dp-fwd: no spare lcore for the worker "
-		    "(run with -l 0,<n>, e.g. -l 0-1)\n");
+		return -EBUSY;
+	need = d->nb_wk + (d->nb_wk > 1);
+	RTE_LCORE_FOREACH_WORKER(lcore) {
+		if (nlc == need)
+			break;
+		lc[nlc++] = lcore;
+	}
+	if (nlc < need) {
+		fprintf(stderr, "r2dp-fwd: %u worker(s) need %u spare lcores, "
+		    "have %u (e.g. -l 0-%u)\n", d->nb_wk, need, nlc, need);
 		return -EAGAIN;
 	}
-	if (port_init(d, d->port_id) < 0)
+	if (port_init(d, d->port_id, d->nb_wk) < 0)
 		return -rte_errno;
 	/* inner (plaintext) tap is optional: single-tap mode (interop lab,
 	 * control-only) has only the outer port */
-	if (d->inner_port >= 0)
-		if (port_init(d, d->inner_port) < 0)
-			fprintf(stderr, "r2dp-fwd: inner tap init failed\n");
-	/* H5: QSBR so the ctl (main) thread can free SA/SP memory only after the
-	 * worker has passed a grace period -- the worker reads sa_tab/sp_tab and
-	 * holds session pointers across its crypto path with no lock, so a
-	 * synchronize here prevents a UAF when ctl deletes/rekeys under load.
-	 * This DPDK has no rte_rcu_qsbr_alloc: size it, then rte_zmalloc. */
+	if (d->inner_port >= 0 && port_init(d, d->inner_port, d->nb_wk) < 0) {
+		fprintf(stderr, "r2dp-fwd: inner port init failed\n");
+		d->inner_port = -1;
+	}
+	/* H5: QSBR so the ctl (main) thread can free SA/SP memory only after
+	 * every reader has passed a grace period -- the workers read
+	 * sa_tab/sp_tab and hold session pointers across their crypto path
+	 * with no lock.  tid = lcore id (< RTE_MAX_LCORE). */
 	{
 		size_t rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
 		d->rcu = rte_zmalloc("r2dp-rcu", rsz, RTE_CACHE_LINE_SIZE);
@@ -521,13 +719,43 @@ dpd_start(struct fwd_dp *dp)
 		}
 		rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
 	}
-	if (rte_lcore_count() > 1 + DP_NB_WORKERS)
-		fprintf(stderr, "r2dp-fwd: %u lcores given, using one worker "
-		    "(replay state is single-writer); the rest stay idle\n",
-		    rte_lcore_count());
+	for (unsigned i = 0; i <= d->nb_wk; i++) {
+		dp_wk_init(d, i);
+		if (i < need)
+			d->wk[i].lcore = lc[i];
+	}
+	if (d->nb_wk > 1)
+		for (unsigned i = 0; i < d->nb_wk; i++) {
+			char n[RTE_RING_NAMESIZE];
+			snprintf(n, sizeof(n), "r2dp_ro%u", i);
+			d->wk[i].ring_o = rte_ring_create(n, DP_RING_SZ,
+			    SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
+			snprintf(n, sizeof(n), "r2dp_ri%u", i);
+			d->wk[i].ring_i = rte_ring_create(n, DP_RING_SZ,
+			    SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
+			if (!d->wk[i].ring_o || !d->wk[i].ring_i) {
+				fprintf(stderr, "r2dp-fwd: worker ring: %s\n",
+				    rte_strerror(rte_errno));
+				return -ENOMEM;
+			}
+		}
+	{	/* our MACs, for the L2 headers the workers write */
+		struct rte_ether_addr ea;
+		if (rte_eth_macaddr_get(d->port_id, &ea) == 0)
+			memcpy(d->our_mac, ea.addr_bytes, 6);
+		if (d->inner_port >= 0 &&
+		    rte_eth_macaddr_get(d->inner_port, &ea) == 0)
+			memcpy(d->our_inner_mac, ea.addr_bytes, 6);
+	}
+	if (rte_lcore_count() > 1 + need)
+		fprintf(stderr, "r2dp-fwd: %u lcores given, %u used (-n %u)\n",
+		    rte_lcore_count(), 1 + need, d->nb_wk);
 	d->running = 1;
-	d->worker_lcore = lcore;
-	rte_eal_remote_launch(worker_main, d, lcore);
+	for (unsigned i = 0; i < d->nb_wk; i++)
+		rte_eal_remote_launch(worker_main, &d->wk[i], d->wk[i].lcore);
+	if (d->nb_wk > 1)
+		rte_eal_remote_launch(dispatcher_main, &d->wk[d->nb_wk],
+		    d->wk[d->nb_wk].lcore);
 	return 0;
 }
 
@@ -536,11 +764,25 @@ dpd_stop(struct fwd_dp *dp)
 {
 	struct dpdk_priv *d = dp->priv;
 
-	d->running = 0;
-	if (d->worker_lcore < RTE_MAX_LCORE)
-		rte_eal_wait_lcore(d->worker_lcore);
+	__atomic_store_n(&d->running, 0, __ATOMIC_RELAXED);
+	for (unsigned i = 0; i <= d->nb_wk; i++) {
+		struct dp_wk *w = &d->wk[i];
+		struct rte_mbuf *m;
+
+		if (w->lcore < RTE_MAX_LCORE) {
+			rte_eal_wait_lcore(w->lcore);
+			if (d->rcu)
+				rte_rcu_qsbr_thread_unregister(d->rcu, w->lcore);
+		}
+		while (w->ring_o && rte_ring_dequeue(w->ring_o, (void **)&m) == 0)
+			rte_pktmbuf_free(m);
+		while (w->ring_i && rte_ring_dequeue(w->ring_i, (void **)&m) == 0)
+			rte_pktmbuf_free(m);
+		rte_ring_free(w->ring_o);
+		rte_ring_free(w->ring_i);
+		w->ring_o = w->ring_i = NULL;
+	}
 	if (d->rcu) {
-		rte_rcu_qsbr_thread_unregister(d->rcu, d->worker_lcore);
 		rte_free(d->rcu);
 		d->rcu = NULL;
 	}
@@ -548,25 +790,125 @@ dpd_stop(struct fwd_dp *dp)
 }
 
 /* ------------------------------------------------------------------ */
+/* Lookaside crypto: AES-NI multi-buffer when the EAL was given one
+ * (--vdev=crypto_aesni_mb0), else OpenSSL.  One queue pair per worker. */
+static int
+crypto_init(struct dpdk_priv *d)
+{
+	static const char *const names[] = {
+		"crypto_aesni_mb0", "crypto_aesni_mb", "crypto_openssl0",
+		"crypto_openssl",
+	};
+	struct rte_cryptodev_config cconf;
+	struct rte_cryptodev_qp_conf qconf;
+	int id = -1;
+
+	for (size_t i = 0; i < RTE_DIM(names) && id < 0; i++)
+		id = rte_cryptodev_get_dev_id(names[i]);
+	if (id < 0) {
+		fprintf(stderr, "r2dp-fwd: warning: no crypto device; add "
+		    "--vdev crypto_openssl0 (or crypto_aesni_mb0) for AES-GCM\n");
+		return -ENODEV;
+	}
+	d->cdev_id = (uint8_t)id;
+	rte_cryptodev_info_get(d->cdev_id, &d->cdev_info);
+	if (d->cdev_info.max_nb_queue_pairs < d->nb_wk) {
+		fprintf(stderr, "r2dp-fwd: %s has %u queue pairs; -n %u clamped\n",
+		    rte_cryptodev_name_get(d->cdev_id),
+		    d->cdev_info.max_nb_queue_pairs, d->nb_wk);
+		d->nb_wk = RTE_MAX(1u, d->cdev_info.max_nb_queue_pairs);
+	}
+	memset(&cconf, 0, sizeof(cconf));
+	cconf.socket_id = SOCKET_ID_ANY;
+	cconf.nb_queue_pairs = (uint16_t)d->nb_wk;
+	memset(&qconf, 0, sizeof(qconf));
+	qconf.nb_descriptors = 2048;
+	if (rte_cryptodev_configure(d->cdev_id, &cconf) < 0) {
+		fprintf(stderr, "r2dp-fwd: cryptodev configure failed\n");
+		return -EIO;
+	}
+	for (uint16_t q = 0; q < d->nb_wk; q++)
+		if (rte_cryptodev_queue_pair_setup(d->cdev_id, q, &qconf,
+		    SOCKET_ID_ANY) < 0) {
+			fprintf(stderr, "r2dp-fwd: cryptodev qp %u setup failed\n", q);
+			return -EIO;
+		}
+	if (rte_cryptodev_start(d->cdev_id) < 0) {
+		fprintf(stderr, "r2dp-fwd: cryptodev start failed\n");
+		return -EIO;
+	}
+	d->sess_mp = rte_cryptodev_sym_session_pool_create("r2dp_sess", MAX_SA,
+	    rte_cryptodev_sym_get_private_session_size(d->cdev_id), 0, 0,
+	    SOCKET_ID_ANY);
+	/* each worker holds at most BURST_SZ ops in flight, plus whatever a
+	 * stuck device still owns */
+	d->cop_mp = rte_crypto_op_pool_create("r2dp_cop",
+	    RTE_CRYPTO_OP_TYPE_SYMMETRIC, RTE_MAX((unsigned)MAX_SA,
+	    4u * BURST_SZ * d->nb_wk), 0, sizeof(struct rte_crypto_op) +
+	    sizeof(struct rte_crypto_sym_op) + R2DP_GCM_IV_LEN, SOCKET_ID_ANY);
+	if (!d->sess_mp || !d->cop_mp) {
+		fprintf(stderr, "r2dp-fwd: crypto mempools failed\n");
+		return -ENOMEM;
+	}
+	d->have_cdev = 1;
+	fprintf(stderr, "r2dp-fwd: crypto %s, %u queue pair(s)\n",
+	    rte_cryptodev_name_get(d->cdev_id), d->nb_wk);
+	return 0;
+}
+
+/* Dataplane ports, in EAL order: the first is the outer (ESP) side, the
+ * second the inner (plaintext) side.  net_tap for the lab, net_memif and
+ * net_vhost for VM / container wiring. */
+static void
+ports_find(struct dpdk_priv *d)
+{
+	static const char *const drv[] = { "tap", "memif", "vhost" };
+	uint16_t port;
+
+	d->port_id = -1;
+	d->inner_port = -1;
+	RTE_ETH_FOREACH_DEV(port) {
+		struct rte_eth_dev_info di;
+		int ok = 0;
+
+		if (rte_eth_dev_info_get(port, &di) != 0)
+			continue;
+		for (size_t i = 0; i < RTE_DIM(drv); i++)
+			ok |= strstr(di.driver_name, drv[i]) != NULL;
+		if (!ok)
+			continue;
+		if (d->port_id < 0)
+			d->port_id = port;
+		else if (d->inner_port < 0)
+			d->inner_port = port;
+	}
+}
+
 int
 fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
-    const char *sockpath, int verbose)
+    const char *sockpath, int verbose, int nb_workers)
 {
 	struct dpdk_priv *d;
-	uint16_t port;
+	unsigned maxw;
 	int ret;
 
 	(void)sockpath;
+	if (nb_workers < 1 || nb_workers > DP_MAX_WK) {
+		fprintf(stderr, "r2dp-fwd: -n %d: 1..%d workers\n", nb_workers,
+		    DP_MAX_WK);
+		return -EINVAL;
+	}
 	/* sa_tab[] holds struct rte_ipsec_session (64-byte aligned); calloc only
-	 * guarantees natural (8-byte) alignment, which is UB (UBSan flags it in
-	 * gcm_kat too).  rte_zmalloc can't be used here: this struct is allocated
-	 * BEFORE rte_eal_init (no DPDK heap yet, so rte_zmalloc fails with
-	 * ENOMEM and the dataplane is silently lost).  aligned_alloc from the C
-	 * library gives the required alignment without the EAL heap (M3). */
+	 * guarantees natural (8-byte) alignment.  rte_zmalloc can't be used: the
+	 * EAL heap does not exist yet.  aligned_alloc + memset (M3). */
 	d = aligned_alloc(RTE_CACHE_LINE_SIZE, sizeof(*d));
 	if (!d)
 		return -ENOMEM;
+	memset(d, 0, sizeof(*d));
 	d->verbose = verbose;
+	d->nb_wk = (unsigned)nb_workers;
+	for (unsigned i = 0; i <= DP_MAX_WK; i++)
+		dp_wk_init(d, i);
 	snprintf(d->tap_if, sizeof(d->tap_if), "%s",
 	    getenv("R2DP_TAP_IF") ? getenv("R2DP_TAP_IF") : TAP_IF_DEFAULT);
 
@@ -586,54 +928,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		free(d);
 		return -ENOMEM;
 	}
-
-	ret = rte_cryptodev_get_dev_id("crypto_openssl0");
-	if (ret < 0)
-		ret = rte_cryptodev_get_dev_id("crypto_openssl");
-	if (ret >= 0) {
-		d->cdev_id = (uint8_t)ret;
-		rte_cryptodev_info_get(d->cdev_id, &d->cdev_info);
-		d->have_cdev = 1;
-		/* configure + start the crypto device with one qp */
-		struct rte_cryptodev_config cconf;
-		struct rte_cryptodev_qp_conf qconf;
-		memset(&cconf, 0, sizeof(cconf));
-		cconf.socket_id = SOCKET_ID_ANY;
-		cconf.nb_queue_pairs = 1;
-		cconf.ff_disable = 0;
-		if (rte_cryptodev_configure(d->cdev_id, &cconf) < 0) {
-			fprintf(stderr, "r2dp-fwd: cryptodev configure failed\n");
-			d->have_cdev = 0;
-		} else {
-			memset(&qconf, 0, sizeof(qconf));
-			qconf.nb_descriptors = 2048;
-			if (rte_cryptodev_queue_pair_setup(d->cdev_id, 0, &qconf,
-			    SOCKET_ID_ANY) < 0)
-				fprintf(stderr, "r2dp-fwd: cryptodev qp setup failed\n");
-			else if (rte_cryptodev_start(d->cdev_id) < 0)
-				fprintf(stderr, "r2dp-fwd: cryptodev start failed\n");
-		}
-		if (d->have_cdev) {
-			/* crypto session + op mempools */
-			d->sess_mp = rte_cryptodev_sym_session_pool_create(
-			    "r2dp_sess", MAX_SA,
-			    rte_cryptodev_sym_get_private_session_size(d->cdev_id),
-			    0, 0, SOCKET_ID_ANY);
-			if (!d->sess_mp)
-				fprintf(stderr, "r2dp-fwd: sess pool failed\n");
-			d->cop_mp = rte_crypto_op_pool_create(
-			    "r2dp_cop", RTE_CRYPTO_OP_TYPE_SYMMETRIC, MAX_SA, 0,
-			    sizeof(struct rte_crypto_op) +
-			      sizeof(struct rte_crypto_sym_op) +
-			      R2DP_GCM_IV_LEN,
-			    SOCKET_ID_ANY);
-			if (!d->cop_mp)
-				fprintf(stderr, "r2dp-fwd: crypto-op pool failed\n");
-		}
-	} else {
-		fprintf(stderr, "r2dp-fwd: warning: no crypto device; add "
-		    "--vdev crypto_openssl0 for AES-GCM\n");
-	}
+	(void)crypto_init(d);      /* none: ESP is dropped, IKE still flows */
 
 	{
 		struct rte_ipsec_sad_conf conf;
@@ -653,30 +948,24 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 			return -ENOMEM;
 		}
 	}
-
 	rte_spinlock_init(&d->lock);
 
-	d->port_id = -1;
-	d->inner_port = -1;
-	RTE_ETH_FOREACH_DEV(port) {
-		struct rte_eth_dev_info di;
-		if (rte_eth_dev_info_get(port, &di) == 0 &&
-		    strstr(di.driver_name, "tap")) {
-			if (d->port_id < 0) {
-				d->port_id = port;                /* outer = ESP side */
-			} else if (d->inner_port < 0) {
-				d->inner_port = port;             /* inner = plaintext side */
-			}
-		}
-	}
+	ports_find(d);
 	if (d->port_id < 0) {
-		fprintf(stderr, "r2dp-fwd: no tap port found "
-		    "(add --vdev=net_tap0,iface=r2dp-tap)\n");
+		fprintf(stderr, "r2dp-fwd: no dataplane port found (add "
+		    "--vdev=net_tap0,iface=r2dp-tap, or net_memif/net_vhost)\n");
 		return -ENODEV;
+	}
+	/* Fix the worker count now, before any SA exists: it decides
+	 * dp_sa.owner.  Clamp to the TX queues the ports offer. */
+	maxw = max_workers(d);
+	if (d->nb_wk > maxw) {
+		fprintf(stderr, "r2dp-fwd: -n %u clamped to %u (port tx queues)\n",
+		    d->nb_wk, maxw);
+		d->nb_wk = maxw;
 	}
 
 	dp->priv = d;
-	/* wire the vtable: caps/sa/sp plus the worker start/stop */
 	dpdk_ops.caps   = dpdk_caps;
 	dpdk_ops.sa_add = dpd_sa_add;
 	dpdk_ops.sa_bytes = dpd_sa_bytes;
@@ -687,10 +976,13 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	dp->ops = &dpdk_ops;
 	if (dp->ops->caps)
 		dp->ops->caps(dp);
-	if (dp->ops->start)
-		dp->ops->start(dp);   /* bring up the worker + port */
-	fprintf(stderr, "r2dp-fwd: DPDK dataplane ready (port=%d cdev=%d sad=%p)\n",
-	    d->port_id, d->cdev_id, (void *)d->sad);
+	ret = dp->ops->start(dp);   /* bring up the ports and workers */
+	if (ret < 0)
+		fprintf(stderr, "r2dp-fwd: dataplane start failed: %s\n",
+		    strerror(-ret));
+	fprintf(stderr, "r2dp-fwd: DPDK dataplane %s (port=%d inner=%d cdev=%d "
+	    "workers=%u)\n", ret < 0 ? "NOT running" : "ready", d->port_id,
+	    d->inner_port, d->have_cdev ? d->cdev_id : -1, d->nb_wk);
 	return 0;
 }
 

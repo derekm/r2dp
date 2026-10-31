@@ -8,7 +8,11 @@
  * driving racoon2 and the test suite.
  *
  * Usage:
- *   r2dp-fwd [-s sockpath] [-v] [-n nprocessing_lcores]
+ *   r2dp-fwd [-s sockpath] [-v] [-n workers] [--dp dpdk|kernel] [EAL args]
+ *
+ * -n: DPDK packet workers (default 1).  With more than one, an extra lcore
+ * dispatches packets to the worker owning each tunnel, so give the EAL
+ * -n + 2 lcores (main + dispatcher + workers), e.g. -n 2 -l 0-3.
  */
 #include <getopt.h>
 #include <signal.h>
@@ -37,6 +41,7 @@ main(int argc, char **argv)
 	int verbose = 0;
 	const char *dpname = "dpdk";   /* --dp dpdk|kernel */
 	int dp_cleanup = 0;
+	int nb_workers = 1;
 	/* DPDK EAL args (everything not one of our own) go to rte_eal_init */
 	char **eal_argv, **eal_base;
 	int eal_argc = 1, i;
@@ -65,7 +70,7 @@ main(int argc, char **argv)
 		} else if (strcmp(a, "--dp-cleanup") == 0) {
 			dp_cleanup = 1;
 		} else if (strcmp(a, "-n") == 0 && i + 1 < argc) {
-			i++;               /* processing lcores; probe claims it */
+			nb_workers = atoi(argv[++i]);   /* DPDK packet workers */
 		} else {
 			eal_argv[eal_argc++] = argv[i];
 		}
@@ -95,7 +100,7 @@ main(int argc, char **argv)
 	 * the control socket (racoon2 bring-up + M0 tests). */
 	{
 		int r = fwd_dp_dpdk_probe(&ctl.dp, &eal_argc, &eal_argv,
-		    sockpath, verbose);
+		    sockpath, verbose, nb_workers);
 		if (r < 0)
 			fprintf(stderr, "r2dp-fwd: DPDK dataplane unavailable (%s); "
 			    "serving control-only\n", r == -2 ? "no DPDK build" : strerror(-r));

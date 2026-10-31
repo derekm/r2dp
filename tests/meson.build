@@ -76,6 +76,20 @@ if dpdk.found()
       link_with: libr2dp,
       c_args: ['-DR2DP_HAVE_DPDK=1']),
     is_parallel: false, timeout: 60)
+
+  # dp_mt: three workers hammer shared SAs concurrently; each SA must be
+  # processed by its owner only (unique sequence numbers, exactly-once
+  # inbound acceptance, replay refused).
+  test('dp_mt',
+    executable('dp_mt', 'dp_mt.c', '../fwd/dpdk_sad.c', '../fwd/dpdk_spd.c',
+      '../fwd/dpdk_esp.c', '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c',
+      '../fwd/dp_nh.c', '../fwd/dp_sel.c',
+      include_directories: [include_directories('../include'),
+                            include_directories('../fwd')],
+      dependencies: dpdk,
+      link_with: libr2dp,
+      c_args: ['-DR2DP_HAVE_DPDK=1']),
+    is_parallel: false, timeout: 60)
 endif
 
 # ctl_poll: regression for the accept/poll desync in fwd_ctl_run (0bb71e1):

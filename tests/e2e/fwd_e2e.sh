@@ -12,6 +12,7 @@
 #        R2DP_E2E_DIR scratch dir (default: a fresh mktemp -d)
 #        PHASES="positive window negative natt" (subset => counters not asserted)
 #        BACKEND=dpdk|kernel  (kernel: r2dp-fwd with the XFRM data plane)
+#        FWD_WORKERS=n (dpdk: packet workers, default 1; same exact counters)
 #
 # Needs root in its own network namespace.  Unprivileged:
 #   unshare -Urnm --propagation private bash -c \
@@ -55,7 +56,13 @@ if [ "$BACKEND" = kernel ]; then
 	ip addr add 192.0.2.1/24 dev r2ok
 	"$FWD" -s "$D/fwd.sock" --dp kernel --dp-cleanup -v >"$D/fwd.out" 2>&1 &
 else
-	"$FWD" -s "$D/fwd.sock" -l 0,1 --no-huge -m 512 --no-pci --no-telemetry \
+	# FWD_WORKERS=n: n packet workers (+ a dispatcher lcore when n > 1)
+	W=${FWD_WORKERS:-1}
+	# main + workers (+ dispatcher), floating over every CPU so -n 3 also
+	# runs on a small CI runner
+	LC=$((W > 1 ? W + 1 : 1)); CPUS="0-$(($(nproc) - 1))"; LCORES=
+	for l in $(seq 0 $LC); do LCORES="$LCORES${LCORES:+,}$l@($CPUS)"; done
+	"$FWD" -s "$D/fwd.sock" -n "$W" --lcores "$LCORES" --no-huge -m 512 --no-pci --no-telemetry \
 	    --file-prefix "r2e2e$$" --vdev=net_tap0,iface=r2o --vdev=net_tap1,iface=r2i \
 	    --vdev=crypto_openssl0 >"$D/fwd.out" 2>&1 &
 fi
@@ -67,7 +74,7 @@ for _ in $(seq 100); do
 done
 [ -S "$D/fwd.sock" ] || { cat "$D/fwd.out"; fail "control socket never appeared"; }
 if [ "$BACKEND" = dpdk ]; then
-	grep -q "DPDK dataplane ready" "$D/fwd.out" || { cat "$D/fwd.out"; fail "DPDK data plane did not come up"; }
+	grep -q "DPDK dataplane ready.*workers=${FWD_WORKERS:-1})" "$D/fwd.out" || { cat "$D/fwd.out"; fail "DPDK data plane did not come up"; }
 	# the plaintext host behind the forwarder: answers pings, routes the
 	# far subnet into the inner tap
 	ip addr add 10.2.0.2/24 dev r2i
@@ -139,10 +146,11 @@ if [ -z "${PHASES:-}" ] && [ "$BACKEND" = dpdk ]; then
 	eq rx 60; eq tx 49; eq esp 57; eq ike 1
 	eq replay 2; eq ipsec_reject 2; eq crypto_fail 2; eq no_sa_in 1
 	eq inner_sel 1; eq clear_outer 1; eq encap 1; eq natt_keepalive 1
-	for z in malformed no_sa_out policy_discard crypto_enq crypto_stuck nomem no_nexthop esp_on_inner tx_full spd_fail; do eq $z 0; done
+	for z in malformed no_sa_out policy_discard crypto_enq crypto_stuck nomem no_nexthop esp_on_inner tx_full steer spd_fail; do eq $z 0; done
 	eq drop 10
 fi
 kill -0 $FPID 2>/dev/null || { echo "  FAIL forwarder crashed"; cat "$D/fwd.out"; rc=1; }
-[ $rc = 0 ] && echo "PASS ($BACKEND): ESP tunnel interoperates with an independent implementation" ||
+[ "$BACKEND" = dpdk ] && WDESC=", workers=${FWD_WORKERS:-1}" || WDESC=
+[ $rc = 0 ] && echo "PASS ($BACKEND$WDESC): ESP tunnel interoperates with an independent implementation" ||
 	echo "FAILED (logs in $D)"
 exit $rc

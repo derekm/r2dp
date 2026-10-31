@@ -33,6 +33,8 @@ mk_priv(void)
 	if (!d)
 		return NULL;
 	memset(d, 0, sizeof(*d));
+	d->nb_wk = 1;
+	dp_wk_init(d, 0);
 	if ((id = rte_cryptodev_get_dev_id("crypto_openssl0")) < 0)
 		return NULL;
 	d->cdev_id = (uint8_t)id;
@@ -91,8 +93,8 @@ reader(void *arg)
 {
 	struct dpdk_priv *d = arg;
 
-	rte_rcu_qsbr_thread_register(d->rcu, d->worker_lcore);
-	rte_rcu_qsbr_thread_online(d->rcu, d->worker_lcore);
+	rte_rcu_qsbr_thread_register(d->rcu, d->wk[0].lcore);
+	rte_rcu_qsbr_thread_online(d->rcu, d->wk[0].lcore);
 	while (!rd_stop) {
 		for (int i = 0; i < 8; i++) {
 			const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
@@ -120,10 +122,10 @@ reader(void *arg)
 			}
 		}
 		rd_iters++;
-		rte_rcu_qsbr_quiescent(d->rcu, d->worker_lcore);
+		rte_rcu_qsbr_quiescent(d->rcu, d->wk[0].lcore);
 	}
-	rte_rcu_qsbr_thread_offline(d->rcu, d->worker_lcore);
-	rte_rcu_qsbr_thread_unregister(d->rcu, d->worker_lcore);
+	rte_rcu_qsbr_thread_offline(d->rcu, d->wk[0].lcore);
+	rte_rcu_qsbr_thread_unregister(d->rcu, d->wk[0].lcore);
 	return 0;
 }
 
@@ -136,7 +138,7 @@ t_sp_concurrency(struct dpdk_priv *d)
 	size_t rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
 
 	if (lc >= RTE_MAX_LCORE) { CHECK(0, "need a worker lcore (-l 0-1)"); return; }
-	d->worker_lcore = lc;      /* same tid convention as dpd_start */
+	d->wk[0].lcore = lc;      /* same tid convention as dpd_start */
 	d->rcu = rte_zmalloc("t_rcu", rsz, RTE_CACHE_LINE_SIZE);
 	if (!d->rcu) { CHECK(0, "rcu alloc"); return; }
 	rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);

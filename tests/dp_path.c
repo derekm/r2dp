@@ -39,6 +39,8 @@ mk_priv(const char *tag)
 	if (!d)
 		return NULL;
 	memset(d, 0, sizeof(*d));
+	d->nb_wk = 1;
+	dp_wk_init(d, 0);
 	d->cdev_id = (uint8_t)cdev;
 	d->have_cdev = 1;
 	d->cdeq = test_deq;
@@ -154,7 +156,7 @@ run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
 	struct rte_mbuf *in[1] = { m }, *esp[1] = { NULL }, *dec[BURST_SZ];
 	uint16_t nout = 0, nb = 0, ndec = 0;
 
-	esp_outbound(a, in, 1, esp, &nout, &nb);
+	esp_outbound(&a->wk[0], in, 1, esp, &nout, &nb);
 	*encrypted = nout == 1;
 	if (nb && in[0])
 		rte_pktmbuf_free(in[0]);          /* bypass: caller would forward */
@@ -167,7 +169,7 @@ run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
 		if (tamper_at >= 0 && (uint32_t)tamper_at + 14 < rte_pktmbuf_data_len(esp[0]))
 			f[14 + tamper_at] ^= 0x01;
 	}
-	esp_inbound(b, esp, 1, dec, &ndec);
+	esp_inbound(&b->wk[0], esp, 1, dec, &ndec);
 	if (ndec != 1)
 		return 0;
 	memcpy(got, rte_pktmbuf_mtod(dec[0], uint8_t *),
@@ -281,16 +283,16 @@ main(void)
 		deq_stuck = 1;
 		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
 		CHECK(!run(a, b, m, &enc, g) && !enc, "stuck cryptodev: batch dropped");
-		CHECK(a->n_dropr[DR_CRYPTO_STUCK] == 1 && a->n_crypto_stuck == 1 &&
-		    a->cq_stale == 1, "stuck cryptodev: counted, one op quarantined");
+		CHECK(a->wk[0].n_dropr[DR_CRYPTO_STUCK] == 1 && a->wk[0].n_crypto_stuck == 1 &&
+		    a->wk[0].cq_stale == 1, "stuck cryptodev: counted, one op quarantined");
 		CHECK(rte_mempool_avail_count(a->cop_mp) == cops - 1,
 		    "stuck cryptodev: quarantined op not returned to the pool");
 		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
-		CHECK(!run(a, b, m, &enc, g) && a->n_dropr[DR_CRYPTO_STUCK] == 2 &&
-		    a->cq_stale == 1, "still stuck: nothing new enqueued behind it");
+		CHECK(!run(a, b, m, &enc, g) && a->wk[0].n_dropr[DR_CRYPTO_STUCK] == 2 &&
+		    a->wk[0].cq_stale == 1, "still stuck: nothing new enqueued behind it");
 		deq_stuck = 0;
 		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
-		CHECK(run(a, b, m, &enc, g) && memcmp(g, w, 64) == 0 && a->cq_stale == 0,
+		CHECK(run(a, b, m, &enc, g) && memcmp(g, w, 64) == 0 && a->wk[0].cq_stale == 0,
 		    "device back: stale op reclaimed, path recovers");
 		CHECK(rte_mempool_avail_count(a->cop_mp) == cops &&
 		    rte_mempool_avail_count(mp) == mbs,
@@ -340,7 +342,7 @@ main(void)
 			in[k] = inner_frame(src, "10.0.2.5", 17, 1000 + k, w[k]);
 			nprot += k % 8 != 7;
 		}
-		esp_outbound(a, in, N, esp, &nout, &nb);
+		esp_outbound(&a->wk[0], in, N, esp, &nout, &nb);
 		CHECK(nout == nprot && nb == N - nprot, "burst: one batched encrypt, bypass left alone");
 		for (int k = 0; k < N; k++)
 			if (in[k]) rte_pktmbuf_free(in[k]);
@@ -349,7 +351,7 @@ main(void)
 			memset(f, 0, 14); f[12] = 0x08;
 			if (k == 5) f[14 + 40] ^= 1;
 		}
-		esp_inbound(b, esp, nout, dec, &ndec);
+		esp_inbound(&b->wk[0], esp, nout, dec, &ndec);
 		CHECK(ndec == nout - 1, "burst: forged packet dropped, the rest decrypt");
 		for (uint16_t k = 0, src = 0; k < ndec; k++, src++) {
 			while (src % 8 == 7 || src == 5) src++;   /* skip bypass + forged */
@@ -375,26 +377,26 @@ main(void)
 		static uint8_t w[64];
 		struct rte_mbuf *in[2], *esp[2], *dup[2], *dec[BURST_SZ];
 		uint16_t nout = 0, nb = 0, n1 = 0, n2 = 0, n3 = 0, n4 = 0;
-		uint64_t rej = b->n_dropr[DR_REPLAY];
+		uint64_t rej = b->wk[0].n_dropr[DR_REPLAY];
 		in[0] = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
 		in[1] = inner_frame("10.0.1.6", "10.0.2.5", 1, 0, w);
-		esp_outbound(a, in, 2, esp, &nout, &nb);
+		esp_outbound(&a->wk[0], in, 2, esp, &nout, &nb);
 		for (int k = 0; k < 2; k++) {
 			uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(esp[k], 14);
 			memset(f, 0, 14); f[12] = 0x08;
 			dup[k] = rte_pktmbuf_copy(esp[k], mp, 0, UINT32_MAX);
 		}
-		esp_inbound(b, &esp[1], 1, dec, &n1);           /* seq N+1 */
+		esp_inbound(&b->wk[0], &esp[1], 1, dec, &n1);           /* seq N+1 */
 		for (uint16_t k = 0; k < n1; k++) rte_pktmbuf_free(dec[k]);
-		esp_inbound(b, &esp[0], 1, dec, &n2);           /* seq N, older */
+		esp_inbound(&b->wk[0], &esp[0], 1, dec, &n2);           /* seq N, older */
 		for (uint16_t k = 0; k < n2; k++) rte_pktmbuf_free(dec[k]);
-		esp_inbound(b, &dup[0], 1, dec, &n3);           /* replay N */
+		esp_inbound(&b->wk[0], &dup[0], 1, dec, &n3);           /* replay N */
 		for (uint16_t k = 0; k < n3; k++) rte_pktmbuf_free(dec[k]);
-		esp_inbound(b, &dup[1], 1, dec, &n4);           /* replay N+1 */
+		esp_inbound(&b->wk[0], &dup[1], 1, dec, &n4);           /* replay N+1 */
 		for (uint16_t k = 0; k < n4; k++) rte_pktmbuf_free(dec[k]);
 		printf("     replay: n1=%u n2=%u n3=%u n4=%u\n", n1, n2, n3, n4);
 		CHECK(nout == 2 && n1 == 1 && n2 == 1, "replay: in-window reordering accepted");
-		CHECK(n3 == 0 && n4 == 0 && b->n_dropr[DR_REPLAY] == rej + 2,
+		CHECK(n3 == 0 && n4 == 0 && b->wk[0].n_dropr[DR_REPLAY] == rej + 2,
 		    "replay: duplicates dropped (replay)");
 	}
 
@@ -403,12 +405,12 @@ main(void)
 		uint64_t sa = 0, sb = 0;
 		char buf[1024] = "";
 		FILE *f = tmpfile();
-		for (int r = 0; r < DR_NUM; r++) { sa += a->n_dropr[r]; sb += b->n_dropr[r]; }
-		CHECK(sa == a->n_drop && sb == b->n_drop, "drops: reasons sum to n_drop");
-		CHECK(a->n_dropr[DR_NO_SA_OUT] == 1, "drops: PROTECT without SA -> no_sa_out");
-		CHECK(a->n_dropr[DR_POLICY_DISCARD] == 1, "drops: TCP/23 -> policy_discard");
-		CHECK(b->n_dropr[DR_CRYPTO_FAIL] == 3, "drops: 3 forged datagrams -> crypto_fail");
-		CHECK(b->n_dropr[DR_INNER_SEL] == 1, "drops: off-selector inner -> inner_sel");
+		for (int r = 0; r < DR_NUM; r++) { sa += a->wk[0].n_dropr[r]; sb += b->wk[0].n_dropr[r]; }
+		CHECK(sa == a->wk[0].n_drop && sb == b->wk[0].n_drop, "drops: reasons sum to n_drop");
+		CHECK(a->wk[0].n_dropr[DR_NO_SA_OUT] == 1, "drops: PROTECT without SA -> no_sa_out");
+		CHECK(a->wk[0].n_dropr[DR_POLICY_DISCARD] == 1, "drops: TCP/23 -> policy_discard");
+		CHECK(b->wk[0].n_dropr[DR_CRYPTO_FAIL] == 3, "drops: 3 forged datagrams -> crypto_fail");
+		CHECK(b->wk[0].n_dropr[DR_INNER_SEL] == 1, "drops: off-selector inner -> inner_sel");
 		if (f) {
 			size_t n;
 			dpd_stats_dump(b, f);

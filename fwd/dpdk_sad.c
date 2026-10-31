@@ -174,11 +174,12 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
     const void *key, size_t keylen, int remove, int inbound)
 {
 	union rte_ipsec_sad_key keyv;
-	uint32_t dip = 0;
+	uint32_t dip = 0, sip = 0;
 	int idx = -1, ret;
 
 	if (addr4_to_u32(&rsa->dst, &dip) < 0)
 		return -EAFNOSUPPORT;
+	(void)addr4_to_u32(&rsa->src, &sip);
 
 	rte_spinlock_lock(&d->lock);
 
@@ -243,6 +244,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	d->sa_tab[newidx].dip = dip;
 	d->sa_tab[newidx].inbound = inbound;
 	d->sa_tab[newidx].natt = rsa->natt_type;
+	d->sa_tab[newidx].owner = dp_owner(d->nb_wk, sip, dip);
 	/* iked's NAT-T ports (the peer's may be NAT-mapped); 0 -> 4500 */
 	d->sa_tab[newidx].natt_sport = rsa->natt_sport ? rsa->natt_sport :
 	    rte_cpu_to_be_16(NATT_PORT);

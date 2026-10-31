@@ -13,7 +13,12 @@
  * Building the test frames is outside the timed region.
  *
  *   fwd_bench [--check] [--json FILE|-] [--runs N] [--sizes a,b,..]
- *             [--tunnels a,b,..] [--pmd auto|openssl|aesni_mb]
+ *             [--tunnels a,b,..] [--pmd auto|openssl|aesni_mb] [--workers N]
+ *
+ * --workers N (N > 1): N lcores run the same enc/dec loop at once, each on
+ * a tunnel it owns (dp_owner), sharing the cryptodev (one queue pair
+ * each), the SAD and the policy snapshot; reports mean cycles/pkt and the
+ * summed Mpps.  No --check gate in this mode.
  *
  * EAL runs with --no-huge.  --pmd auto (default) uses crypto_aesni_mb when
  * the ipsec_mb PMD is available and falls back to crypto_openssl.
@@ -39,7 +44,7 @@
 static uint8_t key[20] = { 9,8,7,6,5,4,3,2,1,0,1,2,3,4,5,6, 0xde,0xad,0xbe,0xef };
 static struct rte_mempool *mp;
 static int cdev = -1;
-static struct rte_mbuf *espq[NPKT];
+static struct rte_mbuf *espq[DP_MAX_WK][NPKT];
 
 static struct dpdk_priv *
 mk_priv(const char *tag)
@@ -51,6 +56,8 @@ mk_priv(const char *tag)
 	if (!d)
 		return NULL;
 	memset(d, 0, sizeof(*d));
+	d->nb_wk = 1;
+	dp_wk_init(d, 0);
 	d->cdev_id = (uint8_t)cdev;
 	d->have_cdev = 1;
 	snprintf(n, sizeof(n), "%s_sess", tag);
@@ -137,7 +144,7 @@ add_tunnel(struct dpdk_priv *a, struct dpdk_priv *b, int i)
 }
 
 static void
-mk_inner(struct rte_mbuf *m, unsigned iplen)
+mk_inner(struct rte_mbuf *m, unsigned iplen, uint32_t src, uint32_t dst)
 {
 	uint8_t *f = (uint8_t *)rte_pktmbuf_append(m, 14 + iplen);
 	struct rte_ipv4_hdr *ip = (void *)(f + 14);
@@ -146,8 +153,8 @@ mk_inner(struct rte_mbuf *m, unsigned iplen)
 	f[0] = 2; f[5] = 1; f[12] = 0x08;
 	ip->version_ihl = 0x45; ip->total_length = rte_cpu_to_be_16(iplen);
 	ip->time_to_live = 64; ip->next_proto_id = 17;
-	inet_pton(AF_INET, "10.2.0.5", &ip->src_addr);
-	inet_pton(AF_INET, "10.1.0.5", &ip->dst_addr);
+	ip->src_addr = src;
+	ip->dst_addr = dst;
 	f[34] = 0x30; f[35] = 0x39; f[36] = 0x00; f[37] = 0x35;
 	ip->hdr_checksum = rte_ipv4_cksum(ip);
 }
@@ -162,9 +169,12 @@ dblcmp(const void *x, const void *y)
 
 /* One untimed warmup pass, then `rep` timed enc + dec passes; the median
  * of each (robust against a preempted run in either direction). */
+/* inner addresses of the traffic each worker sends (wire order) */
+static uint32_t flow_src[DP_MAX_WK], flow_dst[DP_MAX_WK];
+
 static int
-measure(struct dpdk_priv *a, struct dpdk_priv *b, unsigned sz, int rep,
-    double *enc, double *dec)
+measure(struct dpdk_priv *a, struct dpdk_priv *b, unsigned w, unsigned sz,
+    int rep, double *enc, double *dec)
 {
 	double re[MAXRUNS], rd[MAXRUNS];
 
@@ -179,14 +189,14 @@ measure(struct dpdk_priv *a, struct dpdk_priv *b, unsigned sz, int rep,
 			if (rte_pktmbuf_alloc_bulk(mp, in, BURST))
 				return -1;
 			for (int i = 0; i < BURST; i++)
-				mk_inner(in[i], sz);
+				mk_inner(in[i], sz, flow_src[w], flow_dst[w]);
 			t = rte_rdtsc_precise();
-			esp_outbound(a, in, BURST, out, &no, &nb);
+			esp_outbound(&a->wk[w], in, BURST, out, &no, &nb);
 			ce += rte_rdtsc_precise() - t;
 			for (int i = 0; i < no; i++) {
 				uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(out[i], 14);
 				memset(f, 0, 14); f[12] = 8;
-				espq[got++] = out[i];
+				espq[w][got++] = out[i];
 			}
 			for (int i = 0; i < BURST; i++)
 				if (in[i]) rte_pktmbuf_free(in[i]);
@@ -195,7 +205,7 @@ measure(struct dpdk_priv *a, struct dpdk_priv *b, unsigned sz, int rep,
 			struct rte_mbuf *o[BURST_SZ];
 			uint16_t n = RTE_MIN((unsigned)BURST, got - i), k = 0;
 			uint64_t t = rte_rdtsc_precise();
-			esp_inbound(b, &espq[i], n, o, &k);
+			esp_inbound(&b->wk[w], &espq[w][i], n, o, &k);
 			cd += rte_rdtsc_precise() - t;
 			ok += k;
 			rte_pktmbuf_free_bulk(o, k);
@@ -261,22 +271,122 @@ pick_cdev(const char *pmd, const char **name)
 	return rte_cryptodev_get_dev_id("crypto_openssl0");
 }
 
+/* ---- multi-worker mode (--workers N) ---------------------------------- */
+static struct dpdk_priv *mt_a, *mt_b;
+static unsigned mt_sz;
+static int mt_runs, mt_err;
+static double mt_enc[DP_MAX_WK], mt_dec[DP_MAX_WK];
+static volatile int mt_go;
+
+static int
+mt_worker(void *arg)
+{
+	unsigned w = (unsigned)(uintptr_t)arg;
+
+	while (!mt_go)
+		rte_pause();
+	if (measure(mt_a, mt_b, w, mt_sz, mt_runs, &mt_enc[w], &mt_dec[w]))
+		mt_err = 1;
+	return 0;
+}
+
+/* One tunnel per worker, chosen so that worker owns it (dp_owner), each
+ * worker encrypting and then decrypting its own traffic at the same time
+ * as the others.  Aggregate Mpps = sum of the per-worker rates. */
+static int
+mt_tunnels(struct dpdk_priv *a, struct dpdk_priv *b, unsigned nw)
+{
+	uint32_t us, peer;
+	unsigned have = 0;
+
+	inet_pton(AF_INET, "192.0.2.1", &us);
+	for (unsigned p = 1; p < 250 && have != (1u << nw) - 1; p++) {
+		char ps[32], s[32], t[32];
+		struct r2dp_sa r;
+		unsigned w;
+
+		snprintf(ps, sizeof(ps), "203.0.113.%u", p);
+		inet_pton(AF_INET, ps, &peer);
+		w = dp_owner(nw, us, peer);
+		if (have & (1u << w))
+			continue;
+		have |= 1u << w;
+		snprintf(s, sizeof(s), "172.20.%u.0", w);
+		snprintf(t, sizeof(t), "172.21.%u.0", w);
+		mk_sa(&r, 0x6000 + w, "192.0.2.1", ps); r.dir = R2DP_DIR_OUT;
+		if (sa_install(a, &r, key, 20, 0, 0)) return -1;
+		r.dir = R2DP_DIR_IN;
+		if (sa_install(b, &r, key, 20, 0, 1) ||
+		    add_sp(a, 100 + w, R2DP_DIR_OUT, s, t, "192.0.2.1", ps) ||
+		    add_sp(b, 100 + w, R2DP_DIR_IN, s, t, "192.0.2.1", ps))
+			return -1;
+		snprintf(s, sizeof(s), "172.20.%u.5", w);
+		snprintf(t, sizeof(t), "172.21.%u.5", w);
+		inet_pton(AF_INET, s, &flow_src[w]);
+		inet_pton(AF_INET, t, &flow_dst[w]);
+	}
+	return have == (1u << nw) - 1 ? 0 : -1;
+}
+
+static int
+mt_run(struct dpdk_priv *a, struct dpdk_priv *b, unsigned nw, const int *sizes,
+    int nsz, int runs, double hz, FILE *jf, const char *pmdname)
+{
+	printf("  size workers  enc cyc/pkt  enc Mpps (sum)  dec cyc/pkt  "
+	    "dec Mpps (sum)\n");
+	if (jf)
+		fprintf(jf, "{\"bench\":\"fwd_bench\",\"pmd\":\"%s\",\"workers\":%u,"
+		    "\"burst\":%d,\"packets\":%d,\"runs\":%d,\"tsc_hz\":%.0f,"
+		    "\"results\":[", pmdname, nw, BURST, NPKT, runs, hz);
+	for (int z = 0; z < nsz; z++) {
+		unsigned w = 0, lc;
+		double ce = 0, cd = 0, me = 0, md = 0;
+
+		mt_a = a; mt_b = b; mt_sz = (unsigned)sizes[z]; mt_runs = runs;
+		mt_go = 0;
+		RTE_LCORE_FOREACH_WORKER(lc) {
+			if (w == nw)
+				break;
+			rte_eal_remote_launch(mt_worker, (void *)(uintptr_t)w++, lc);
+		}
+		mt_go = 1;
+		rte_eal_mp_wait_lcore();
+		if (mt_err) { puts("FAIL measure"); return -1; }
+		for (w = 0; w < nw; w++) {
+			ce += mt_enc[w] / nw; cd += mt_dec[w] / nw;
+			me += hz / mt_enc[w] / 1e6; md += hz / mt_dec[w] / 1e6;
+		}
+		printf("  %4d %7u  %11.0f  %14.2f  %11.0f  %14.2f\n", sizes[z], nw,
+		    ce, me, cd, md);
+		if (jf)
+			fprintf(jf, "%s\n {\"size\":%d,\"workers\":%u,"
+			    "\"enc_cyc_pkt\":%.1f,\"enc_mpps\":%.3f,"
+			    "\"dec_cyc_pkt\":%.1f,\"dec_mpps\":%.3f}", z ? "," : "",
+			    sizes[z], nw, ce, me, cd, md);
+	}
+	if (jf)
+		fprintf(jf, "\n]}\n");
+	return 0;
+}
+
 static void
 usage(void)
 {
 	fprintf(stderr, "usage: fwd_bench [--check] [--json FILE|-] [--runs N] "
 	    "[--sizes 64,512,1400] [--tunnels 1,65,201] "
-	    "[--pmd auto|openssl|aesni_mb]\n");
+	    "[--pmd auto|openssl|aesni_mb] [--workers N]\n");
 }
 
 int
 main(int argc, char **argv)
 {
-	char *ea[] = { "fwd_bench", "-l", "0", "--no-huge", "-m", "1024",
+	char lcl[16] = "0";
+	char *ea[] = { "fwd_bench", "-l", lcl, "--no-huge", "-m", "1024",
 	    "--no-pci", "--no-telemetry", "--vdev=crypto_openssl0",
 	    "--log-level=1", NULL };
 	int sizes[MAXN] = { 64, 512, 1400 }, tunnels[MAXN] = { 1, 65, 201 };
 	int nsz = 3, ntun = 3, runs = 5, check = 0, have = 1, fails = 0;
+	int nw = 1;
 	double enc[MAXN][MAXN], dec[MAXN][MAXN], hz;
 	const char *json = NULL, *pmd = "auto", *pmdname = "?";
 	struct rte_cryptodev_config cc;
@@ -296,6 +406,8 @@ main(int argc, char **argv)
 			nsz = parse_list(argv[++i], sizes, 28, 1400);
 		else if (!strcmp(argv[i], "--tunnels") && v)
 			ntun = parse_list(argv[++i], tunnels, 1, MAX_SA / 2 - 1);
+		else if (!strcmp(argv[i], "--workers") && v)
+			nw = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--pmd") && v)
 			pmd = argv[++i];
 		else {
@@ -303,7 +415,8 @@ main(int argc, char **argv)
 			return 2;
 		}
 	}
-	if (nsz < 1 || ntun < 1 || runs < 1 || runs > MAXRUNS ||
+	if (nsz < 1 || ntun < 1 || runs < 1 || runs > MAXRUNS || nw < 1 ||
+	    nw > DP_MAX_WK ||
 	    (strcmp(pmd, "auto") && strcmp(pmd, "openssl") &&
 	     strcmp(pmd, "aesni_mb"))) {
 		usage();
@@ -314,21 +427,55 @@ main(int argc, char **argv)
 			fprintf(stderr, "fwd_bench: --tunnels must increase\n");
 			return 2;
 		}
+	if (nw > 1)
+		snprintf(lcl, sizeof(lcl), "0-%d", nw);
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (rte_eal_init(10, ea) < 0 || (cdev = pick_cdev(pmd, &pmdname)) < 0) {
 		if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
 		puts("SKIP: EAL/cryptodev"); return 77;
 	}
 	hz = (double)rte_get_tsc_hz();
-	memset(&cc, 0, sizeof(cc)); cc.socket_id = SOCKET_ID_ANY; cc.nb_queue_pairs = 1;
+	memset(&cc, 0, sizeof(cc)); cc.socket_id = SOCKET_ID_ANY;
+	cc.nb_queue_pairs = (uint16_t)nw;
 	memset(&qc, 0, sizeof(qc)); qc.nb_descriptors = 2048;
-	if (rte_cryptodev_configure(cdev, &cc) < 0 ||
-	    rte_cryptodev_queue_pair_setup(cdev, 0, &qc, SOCKET_ID_ANY) < 0 ||
-	    rte_cryptodev_start(cdev) < 0) { puts("cryptodev FAILED"); return 1; }
-	mp = rte_pktmbuf_pool_create("bench_mb", NPKT * 2 + 4096, 256, 0,
-	    RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
+	if (rte_cryptodev_configure(cdev, &cc) < 0) { puts("cryptodev FAILED"); return 1; }
+	for (int q = 0; q < nw; q++)
+		if (rte_cryptodev_queue_pair_setup(cdev, (uint16_t)q, &qc,
+		    SOCKET_ID_ANY) < 0) { puts("cryptodev qp FAILED"); return 1; }
+	if (rte_cryptodev_start(cdev) < 0) { puts("cryptodev FAILED"); return 1; }
+	mp = rte_pktmbuf_pool_create("bench_mb", nw * (NPKT + 4 * BURST) + 4096,
+	    256, 0, RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
 	a = mk_priv("A"); b = mk_priv("B");
 	if (!mp || !a || !b) { puts("setup FAILED"); return 1; }
+	inet_pton(AF_INET, "10.2.0.5", &flow_src[0]);
+	inet_pton(AF_INET, "10.1.0.5", &flow_dst[0]);
+	if (nw > 1) {
+		FILE *jf = NULL;
+		int rc;
+
+		if (rte_lcore_count() < (unsigned)nw + 1) { puts("lcores FAILED"); return 1; }
+		a->nb_wk = b->nb_wk = (unsigned)nw;   /* before any SA: owners */
+		for (int w = 0; w < nw; w++) {
+			dp_wk_init(a, (unsigned)w);
+			dp_wk_init(b, (unsigned)w);
+		}
+		if (mt_tunnels(a, b, (unsigned)nw)) { puts("tunnel setup FAILED"); return 1; }
+		printf("fwd_bench: crypto_%s, %d workers, %d-packet bursts, %d "
+		    "packets/worker, warmup + median of %d, TSC %.2f GHz\n",
+		    pmdname, nw, BURST, NPKT, runs, hz / 1e9);
+		if (json && !(jf = strcmp(json, "-") ? fopen(json, "w") : stdout)) {
+			perror(json); return 1;
+		}
+		rc = mt_run(a, b, (unsigned)nw, sizes, nsz, runs, hz, jf, pmdname);
+		if (jf && jf != stdout)
+			fclose(jf);
+		free_priv(a); free_priv(b);
+		rte_mempool_free(mp);
+		rte_cryptodev_stop(cdev);
+		rte_cryptodev_close(cdev);
+		rte_eal_cleanup();
+		return rc ? 1 : 0;
+	}
 
 	/* the measured tunnel: 10.2.0.0/24 -> 10.1.0.0/24 */
 	mk_sa(&r, 0x5001, "192.0.2.1", "192.0.2.2"); r.dir = R2DP_DIR_OUT;
@@ -347,7 +494,7 @@ main(int argc, char **argv)
 		while (have < tunnels[k])
 			if (add_tunnel(a, b, have++)) { puts("tunnel setup FAILED"); return 1; }
 		for (int z = 0; z < nsz; z++) {
-			if (measure(a, b, (unsigned)sizes[z], runs, &enc[z][k], &dec[z][k])) {
+			if (measure(a, b, 0, (unsigned)sizes[z], runs, &enc[z][k], &dec[z][k])) {
 				puts("FAIL measure"); return 1;
 			}
 			printf("  %4d %7d   %11.0f  %8.2f   %11.0f  %8.2f\n",

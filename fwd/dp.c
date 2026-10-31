@@ -14,9 +14,10 @@ volatile sig_atomic_t fwd_stats_req;
 #include <errno.h>
 int
 fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
-    const char *sockpath, int verbose)
+    const char *sockpath, int verbose, int nb_workers)
 {
 	(void)dp; (void)argc; (void)argv; (void)sockpath; (void)verbose;
+	(void)nb_workers;
 	return -2;      /* "no DPDK build" */
 }
 #endif

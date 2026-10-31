@@ -97,38 +97,42 @@ replay_accept(struct dp_sa *ds, uint32_t lo)
 #define DP_CRYPTO_SPIN_DEFAULT (1u << 24)
 
 static inline uint16_t
-crypto_deq(struct dpdk_priv *d, struct rte_crypto_op **ops, uint16_t n)
+crypto_deq(struct dp_wk *w, struct rte_crypto_op **ops, uint16_t n)
 {
+	struct dpdk_priv *d = w->d;
+
 	if (unlikely(d->cdeq != NULL))
-		return d->cdeq(d->cdev_id, 0, ops, n);
-	return rte_cryptodev_dequeue_burst(d->cdev_id, 0, ops, n);
+		return d->cdeq(d->cdev_id, w->cqp, ops, n);
+	return rte_cryptodev_dequeue_burst(d->cdev_id, w->cqp, ops, n);
 }
 
 /* Reclaim ops a stuck device has since completed: their packets belong to
  * an abandoned batch (already counted as dropped), so free them.  Returns
  * the number still outstanding. */
 static uint32_t
-crypto_drain_stale(struct dpdk_priv *d)
+crypto_drain_stale(struct dp_wk *w)
 {
+	struct dpdk_priv *d = w->d;
 	struct rte_crypto_op *cop[BURST_SZ];
 
-	while (d->cq_stale) {
-		uint16_t got = crypto_deq(d, cop,
-		    (uint16_t)RTE_MIN(d->cq_stale, (uint32_t)BURST_SZ));
+	while (w->cq_stale) {
+		uint16_t got = crypto_deq(w, cop,
+		    (uint16_t)RTE_MIN(w->cq_stale, (uint32_t)BURST_SZ));
 		if (!got)
 			break;
 		for (uint16_t i = 0; i < got; i++)
 			rte_pktmbuf_free(cop[i]->sym->m_src);
 		rte_mempool_put_bulk(d->cop_mp, (void **)cop, got);
-		d->cq_stale -= got;
+		w->cq_stale -= got;
 	}
-	return d->cq_stale;
+	return w->cq_stale;
 }
 
 uint16_t
-crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
+crypto_run(struct dp_wk *w, struct rte_ipsec_session *ss,
     struct rte_mbuf *mb[], uint16_t n, struct rte_mbuf *ok[])
 {
+	struct dpdk_priv *d = w->d;
 	struct rte_crypto_op *cop[BURST_SZ];
 	uint16_t k, enq, dq = 0, ng = 0, proc;
 	unsigned spins = 0;
@@ -137,8 +141,8 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 
 	/* A device still holding an abandoned batch gets nothing new: its next
 	 * completions would be indistinguishable from this batch's. */
-	if (d->cq_stale && crypto_drain_stale(d)) {
-		DROP(d, DR_CRYPTO_STUCK, n);
+	if (w->cq_stale && crypto_drain_stale(w)) {
+		DROP(w, DR_CRYPTO_STUCK, n);
 		for (uint16_t i = 0; i < n; i++)
 			rte_pktmbuf_free(mb[i]);
 		return 0;
@@ -146,7 +150,7 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	if (rte_crypto_op_bulk_alloc(d->cop_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 	    cop, n) == 0) {
 		for (uint16_t i = 0; i < n; i++) {
-			DROP(d, DR_NOMEM, 1);
+			DROP(w, DR_NOMEM, 1);
 			rte_pktmbuf_free(mb[i]);
 		}
 		return 0;
@@ -156,19 +160,19 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	/* prepare moves the mbufs it rejected to the tail */
 	k = rte_ipsec_pkt_crypto_prepare(ss, mb, cop, n);
 	for (uint16_t i = k; i < n; i++) {
-		DROP(d, DR_IPSEC_REJECT, 1);
+		DROP(w, DR_IPSEC_REJECT, 1);
 		rte_pktmbuf_free(mb[i]);
 	}
-	enq = k ? rte_cryptodev_enqueue_burst(d->cdev_id, 0, cop, k) : 0;
+	enq = k ? rte_cryptodev_enqueue_burst(d->cdev_id, w->cqp, cop, k) : 0;
 	for (uint16_t i = enq; i < k; i++) {
-		DROP(d, DR_CRYPTO_ENQ, 1);
+		DROP(w, DR_CRYPTO_ENQ, 1);
 		rte_pktmbuf_free(mb[i]);
 	}
 	if (enq < n)
 		rte_mempool_put_bulk(d->cop_mp, (void **)&cop[enq], n - enq);
 	/* own every op before touching any mbuf again (async PMDs) */
 	while (dq < enq) {
-		uint16_t got = crypto_deq(d, &cop[dq], enq - dq);
+		uint16_t got = crypto_deq(w, &cop[dq], enq - dq);
 		dq += got;
 		if (!got && ++spins > (d->spin_max ? d->spin_max : DP_CRYPTO_SPIN_DEFAULT))
 			break;
@@ -177,9 +181,9 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 		/* Stuck device: the undequeued ops (and their mbufs) still belong
 		 * to it.  Quarantine them -- never back to cop_mp, never touched --
 		 * until crypto_drain_stale reclaims them. */
-		d->cq_stale += enq - dq;
-		d->n_crypto_stuck++;
-		DROP(d, DR_CRYPTO_STUCK, enq - dq);
+		w->cq_stale += enq - dq;
+		w->n_crypto_stuck++;
+		DROP(w, DR_CRYPTO_STUCK, enq - dq);
 	}
 	ds = rp ? sa_of_sess(d, ss) : NULL;
 	for (uint16_t i = 0; i < dq; i++) {
@@ -190,14 +194,14 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 				const struct rte_esp_hdr *eh = rte_pktmbuf_mtod_offset(
 				    m, const struct rte_esp_hdr *, m->l2_len + m->l3_len);
 				if (!replay_accept(ds, rte_be_to_cpu_32(eh->seq))) {
-					DROP(d, DR_REPLAY, 1);
+					DROP(w, DR_REPLAY, 1);
 					rte_pktmbuf_free(m);
 					continue;
 				}
 			}
 			ok[ng++] = m;
 		} else {
-			DROP(d, DR_CRYPTO_FAIL, 1);
+			DROP(w, DR_CRYPTO_FAIL, 1);
 			rte_pktmbuf_free(m);
 		}
 	}
@@ -208,16 +212,17 @@ crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	/* process moves the mbufs it rejected (e.g. replay) to the tail */
 	proc = rte_ipsec_pkt_process(ss, ok, ng);
 	for (uint16_t i = proc; i < ng; i++) {
-		DROP(d, DR_IPSEC_REJECT, 1);
+		DROP(w, DR_IPSEC_REJECT, 1);
 		rte_pktmbuf_free(ok[i]);
 	}
 	return proc;
 }
 
 uint16_t
-esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
+esp_inbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout)
 {
+	struct dpdk_priv *d = w->d;
 	union rte_ipsec_sad_key kkey[BURST_SZ];
 	const union rte_ipsec_sad_key *keys[BURST_SZ];
 	struct rte_mbuf *pm[BURST_SZ];
@@ -339,7 +344,7 @@ bad:
 		/* malformed/undersized frame: drop it and move on so the rest of
 		 * the burst is still processed (a `break` here would leak every
 		 * remaining mbuf -- a remote pool-exhaustion DoS). */
-		DROP(d, DR_MALFORMED, 1);
+		DROP(w, DR_MALFORMED, 1);
 		rte_pktmbuf_free(bufs[i]);
 	}
 	if (nk == 0) {
@@ -356,7 +361,7 @@ bad:
 
 	if (nlook == 0) {
 		/* no SA matched -- drop the whole burst */
-		DROP(d, DR_NO_SA_IN, nk);
+		DROP(w, DR_NO_SA_IN, nk);
 		for (uint32_t i = 0; i < nk; i++)
 			rte_pktmbuf_free(pm[i]);
 		if (nout) *nout = 0;
@@ -371,7 +376,13 @@ bad:
 			continue;
 		ds = sa_of_sess(d, sas[i]);
 		if (ds && (ds->natt == R2DP_NATT_ESPINUDP) != pnat[i]) {
-			DROP(d, DR_ENCAP, 1);
+			DROP(w, DR_ENCAP, 1);
+			rte_pktmbuf_free(pm[i]);
+			pm[i] = NULL;
+			sas[i] = NULL;
+		} else if (ds && ds->owner != w->id) {
+			/* another worker owns this SA's replay window */
+			DROP(w, DR_STEER, 1);
 			rte_pktmbuf_free(pm[i]);
 			pm[i] = NULL;
 			sas[i] = NULL;
@@ -388,7 +399,7 @@ bad:
 
 		if (ss == NULL) {
 			if (pm[i]) {               /* no SA: drop */
-				DROP(d, DR_NO_SA_IN, 1);
+				DROP(w, DR_NO_SA_IN, 1);
 				rte_pktmbuf_free(pm[i]);
 			}
 			i++;
@@ -396,7 +407,7 @@ bad:
 		}
 		while (j < nk && sas[j] == ss)
 			j++;
-		ng = crypto_run(d, ss, &pm[i], (uint16_t)(j - i), ok);
+		ng = crypto_run(w, ss, &pm[i], (uint16_t)(j - i), ok);
 		for (uint16_t k = 0; k < ng; k++) {
 			/* D8: RFC 4301 s5.2 IN selector check + trim to inner IP */
 			if (out && no < BURST_SZ && in_inner_ok(d, ss, ok[k])) {
@@ -405,7 +416,7 @@ bad:
 			} else {
 				if (d->verbose)
 					fprintf(stderr, "r2dp-fwd: inner SEL reject\n");
-				DROP(d, DR_INNER_SEL, 1);
+				DROP(w, DR_INNER_SEL, 1);
 				rte_pktmbuf_free(ok[k]);
 			}
 		}
@@ -449,9 +460,10 @@ in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
  * the resulting ESP datagram (outer IP + ESP, L2 NOT yet re-added) into `out`.
  * Non-protected packets are left alone (returned as unchanged bypass). */
 void
-esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
+esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout, uint16_t *nbypass)
 {
+	struct dpdk_priv *d = w->d;
 	uint16_t no = 0, nb = 0, nm = 0;
 	struct rte_mbuf *pm[BURST_SZ];
 	struct dp_sa *pds[BURST_SZ];
@@ -488,6 +500,9 @@ esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
 		if (sp->action == R2DP_ACT_PROTECT && !ds)
 			goto drop;
 		if (sp->action != R2DP_ACT_PROTECT) { nb++; continue; } /* BYPASS */
+		why = DR_STEER;          /* SA (and its sequence) owned elsewhere */
+		if (ds->owner != w->id)
+			goto drop;
 
 		/* Once the packet matched a policy, failure below must DROP it, never
 		 * leak it back as cleartext: the L2 header is about to be stripped,
@@ -522,7 +537,7 @@ drop:
 		/* Single drop path: never forward cleartext after a policy matched,
 		 * and never leak the mbuf (H4).  Count and mark the slot NULL so
 		 * worker_inner does not forward or free it again. */
-		DROP(d, why, 1);
+		DROP(w, why, 1);
 		rte_pktmbuf_free(bufs[i]);
 		bufs[i] = NULL;
 	}
@@ -535,13 +550,13 @@ drop:
 
 		while (j < nm && pds[j] == ds)
 			j++;
-		ng = crypto_run(d, &ds->sess, &pm[i], j - i, ok);
+		ng = crypto_run(w, &ds->sess, &pm[i], j - i, ok);
 		for (uint16_t k = 0; k < ng; k++) {
 			struct rte_mbuf *m = ok[k];
 			uint16_t proc = 1;
 
 			if (!out || no >= BURST_SZ) {
-				DROP(d, DR_NOMEM, 1);
+				DROP(w, DR_NOMEM, 1);
 				rte_pktmbuf_free(m);
 				continue;
 			}
@@ -576,7 +591,7 @@ drop:
 						oip->hdr_checksum = 0;
 					} else {
 						/* no tailroom: never send it as bare ESP */
-						DROP(d, DR_NOMEM, 1);
+						DROP(w, DR_NOMEM, 1);
 						rte_pktmbuf_free(m);
 						continue;
 					}
@@ -598,7 +613,7 @@ drop:
 				}
 			}
 			(void)proc;
-			d->n_esp++;
+			w->n_esp++;
 			out[no++] = m;
 		}
 		i = j;

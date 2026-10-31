@@ -35,6 +35,8 @@
 #include <rte_mempool.h>
 #include <rte_rcu_qsbr.h>
 #include <rte_acl.h>
+#include <rte_ring.h>
+#include <rte_hash_crc.h>
 
 #include "r2dp/client.h"
 #include "dp.h"
@@ -47,8 +49,7 @@
 #define MEMPOOL_CACHE 256
 #define MEMPOOL_SIZE  16384
 #define MAX_SA        FWD_MAXSA
-#define NB_RX_QUEUE   1
-#define NB_TX_QUEUE   1
+#define DP_RING_SZ    1024  /* dispatcher -> worker ring, per direction */
 #define BURST_SZ      128
 #define TAP_IF_DEFAULT "r2dp-tap"
 
@@ -75,6 +76,7 @@ struct dp_sa {
 	uint8_t            used;
 	uint8_t            inbound;  /* in the inbound SAD (our GETSPI) */
 	uint8_t            natt;     /* R2DP_NATT_*; ESP-in-UDP demux (NAT-T) */
+	uint8_t            owner;    /* the only worker that processes it */
 	uint16_t           natt_sport, natt_dport; /* network order; egress UDP */
 	uint64_t           gen;      /* install generation (monotonic): the
 	                              * newest of several SAs for one tunnel is
@@ -135,10 +137,39 @@ enum dp_drop {
 	DR_TX_FULL,         /* tx ring full */
 	DR_CRYPTO_STUCK,    /* cryptodev stopped completing ops (see crypto_run) */
 	DR_ENCAP,           /* ESP vs ESP-in-UDP framing does not match the SA */
+	DR_STEER,           /* SA owned by another worker, or worker ring full */
 	DR_NUM
 };
-#define DROP(d, r, n) do { uint64_t n_ = (n); (d)->n_drop += n_; \
-	(d)->n_dropr[(r)] += n_; } while (0)
+#define DROP(w, r, n) do { uint64_t n_ = (n); (w)->n_drop += n_; \
+	(w)->n_dropr[(r)] += n_; } while (0)
+
+#define DP_MAX_WK 8       /* packet workers (-n); + 1 dispatcher slot */
+
+struct dpdk_priv;
+
+/* One packet worker (or, at index nb_wk, the dispatcher).  Everything here
+ * is written by that lcore only; the stats dump sums the counters.  Each
+ * worker has its own port TX queue and cryptodev queue pair, and in
+ * multi-worker mode receives its packets on two SP/SC rings filled by the
+ * dispatcher (see dp_dpdk.c). */
+struct dp_wk {
+	struct dpdk_priv   *d;
+	unsigned            id;
+	unsigned            lcore;
+	uint16_t            txq;      /* port TX queue */
+	uint16_t            cqp;      /* cryptodev queue pair */
+	struct rte_ring    *ring_o;   /* outer (ESP side) frames, multi-worker */
+	struct rte_ring    *ring_i;   /* inner (plaintext) frames, multi-worker */
+	uint64_t            n_rx, n_tx, n_esp, n_ike, n_drop;
+	uint64_t            n_dropr[DR_NUM]; /* n_drop split by reason */
+	/* Ops a stuck cryptodev still owns.  They are never put back to cop_mp
+	 * while the device holds them; crypto_run drains them (freeing their
+	 * mbufs) before it enqueues anything new, so a late completion can
+	 * never be mistaken for the current batch. */
+	uint32_t            cq_stale;
+	uint64_t            n_crypto_stuck;  /* times the device stopped completing */
+	uint64_t            n_natt_keepalive; /* RFC 3948 keepalives consumed */
+} __rte_cache_aligned;
 
 #define PEER_HSZ 4096     /* power of two, > 2 * (2 * MAX_SA) */
 
@@ -224,23 +255,42 @@ struct dpdk_priv {
 
 	char                tap_if[IFNAMSIZ];
 	volatile int        running;
-	unsigned            worker_lcore;
-	/* per-queue counters for the worker (single rx/tx queue) */
-	uint64_t            n_rx, n_tx, n_esp, n_ike, n_drop;
-	uint64_t            n_dropr[DR_NUM]; /* n_drop split by reason */
-	/* Ops a stuck cryptodev still owns (worker-only).  They are never put
-	 * back to cop_mp while the device holds them; crypto_run drains them
-	 * (freeing their mbufs) before it enqueues anything new, so a late
-	 * completion can never be mistaken for the current batch. */
-	uint32_t            cq_stale;
-	uint64_t            n_crypto_stuck;  /* times the device stopped completing */
+	unsigned            nb_wk;        /* packet workers, 1..DP_MAX_WK */
+	struct dp_wk        wk[DP_MAX_WK + 1]; /* [nb_wk] = dispatcher */
 	/* Test hooks: cryptodev dequeue override and the drain spin bound
 	 * (NULL / 0 = rte_cryptodev_dequeue_burst / DP_CRYPTO_SPIN_DEFAULT). */
 	uint16_t (*cdeq)(uint8_t dev, uint16_t qp, struct rte_crypto_op **ops,
 	    uint16_t n);
 	uint32_t            spin_max;
-	uint64_t            n_natt_keepalive; /* RFC 3948 keepalives consumed */
 };
+
+/* Worker owning a tunnel's SAs: a hash of its two endpoints (raw wire
+ * order), order-independent so both directions and every rekey of the
+ * tunnel stay on one worker -- no state hand-over, no reordering. */
+static inline uint8_t
+dp_owner(unsigned nb_wk, uint32_t a, uint32_t b)
+{
+	uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+
+	if (nb_wk <= 1)
+		return 0;
+	return (uint8_t)(rte_hash_crc_4byte(hi, rte_hash_crc_4byte(lo, 0))
+	    % nb_wk);
+}
+
+/* Reset worker slot `id` (counters, queues) for priv `d`. */
+static inline void
+dp_wk_init(struct dpdk_priv *d, unsigned id)
+{
+	struct dp_wk *w = &d->wk[id];
+
+	memset(w, 0, sizeof(*w));
+	w->d = d;
+	w->id = id;
+	w->txq = (uint16_t)id;
+	w->cqp = (uint16_t)id;
+	w->lcore = RTE_MAX_LCORE;
+}
 
 /* The inbound SAD stores &dp_sa.sess as its value, so a session handed back
  * from rte_ipsec_sad_lookup is the sess member of a dp_sa; recover the owner
@@ -306,19 +356,21 @@ natt_class(const uint8_t *p, uint32_t len);
 int
 replay_accept(struct dp_sa *ds, uint32_t lo);
 uint16_t
-crypto_run(struct dpdk_priv *d, struct rte_ipsec_session *ss,
+crypto_run(struct dp_wk *w, struct rte_ipsec_session *ss,
     struct rte_mbuf *mb[], uint16_t n, struct rte_mbuf *ok[]);
 uint16_t
-esp_inbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
+esp_inbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout);
 int
 in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
     struct rte_mbuf *mb);
 void
-esp_outbound(struct dpdk_priv *d, struct rte_mbuf *bufs[], uint16_t nr,
+esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout, uint16_t *nbypass);
 
 /* dpdk_stats.c */
+void
+dpd_stats_sum(const struct dpdk_priv *d, struct dp_wk *t);
 void
 dpd_stats_dump(struct dpdk_priv *d, FILE *f);
 
