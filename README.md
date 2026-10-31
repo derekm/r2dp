@@ -23,6 +23,7 @@ verified and what is not, and `MILESTONES.md` for the plan.
 | `include/r2dp/client.h`, `libr2dp/` | transport, validation, address helpers (client + server side) |
 | `fwd/` | `r2dp-fwd`: control server (`ctl.c`) and data planes: DPDK (`dp_dpdk.c` ports/workers/dispatcher, `dpdk_sad.c` SA table, `dpdk_spd.c` policy/ACL, `dpdk_esp.c` ESP path, `dpdk_stats.c`) or kernel XFRM (`dp_xfrm.c`) |
 | `bench/fwd_bench.c` | ESP path cycles/pkt and Mpps (sizes, tunnel counts, `--workers N`, `--json`) |
+| `bench/e2e_bench.sh` | end-to-end Gbps/Mpps through two `r2dp-fwd` over memif (`W`, `NTUN` up to 1000, `NATT`, `SIZES`) |
 | `tools/mockfwd.c` | `r2dp-mockfwd`: protocol-faithful forwarder with no dataplane |
 | `patches/racoon2-r2dp-backend.patch` | applies to racoon2 `93e3511` (pre-r2dp base): the r2dp backend, generated from derekm/racoon2 `feat/r2dp-km-backend` @ `baf7094` (`git diff 93e3511 baf7094`) |
 | `tests/` | protocol/client: `test_proto`, `test_mock`, `shim_contract` (spin `r2dp-mockfwd`); control server: `ctl_unit`, `ctl_poll`, `smoke_fwd`; data plane (DPDK, crypto_openssl vdev): `gcm_kat`, `dp_sa`, `dp_path` (encrypt→decrypt round trip + policy dispositions), `dp_mt` (concurrent workers on shared SAs); interop: `tests/e2e/fwd_e2e.sh`; pure logic: `sel_test`, `nh_test` |

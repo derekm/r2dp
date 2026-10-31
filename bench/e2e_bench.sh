@@ -8,7 +8,8 @@
 # Usage: bench/e2e_bench.sh BUILD_DIR
 #   W=1|2|4 workers per forwarder (W > 1 adds a dispatcher lcore); both
 #   forwarders get W, since their memif link needs equal queue counts
-#   NTUN=1..200 tunnels (each its own peer address, so they spread over
+#   NTUN=1..1000 tunnels (each its own peer address 203.0.113.1 + t, so
+#   they spread over
 #   workers), NATT=1 ESP-in-UDP SAs, SIZES=64,512,1400,1514 (Ethernet
 #   frame bytes), SECS=2 per trial, LOSS=0.001 (no-loss threshold)
 #   CPU placement: TG_CPUS="0,1" (tx,rx) A_CPUS="2" B_CPUS="3" (workers then
@@ -60,12 +61,14 @@ done
 K=000102030405060708090a0b0c0d0e0f10111213
 NT=""; [ "$NATT" = 1 ] && NT="natt=4500:4500"
 for t in $(seq 0 $((NTUN - 1))); do
-	P=203.0.113.$((t + 1)); [ $t -ge 200 ] && { echo "NTUN <= 200"; exit 2; }
+	[ $t -ge 1000 ] && { echo "NTUN <= 1000"; exit 2; }
+	n=$((0xcb007101 + t)); P=$((n >> 24 & 255)).$((n >> 16 & 255)).$((n >> 8 & 255)).$((n & 255))
+	S=10.$((2 + 2 * (t >> 8))).$((t & 255)).0/24; R=10.$((1 + 2 * (t >> 8))).$((t & 255)).0/24
 	SPI=$(printf 0x%x $((0x2000 + t)))
 	"$CTL" "$D/a.sock" sa-add dir=out spi=$SPI src=192.0.2.1 dst=$P enc=aes-gcm-16 key=$K $NT >/dev/null &&
-	"$CTL" "$D/a.sock" sp-add slid=$((t + 1)) dir=out action=protect src=10.2.$t.0/24 dst=10.1.$t.0/24 tsrc=192.0.2.1 tdst=$P >/dev/null &&
+	"$CTL" "$D/a.sock" sp-add slid=$((t + 1)) dir=out action=protect src=$S dst=$R tsrc=192.0.2.1 tdst=$P >/dev/null &&
 	"$CTL" "$D/b.sock" sa-add dir=in spi=$SPI src=192.0.2.1 dst=$P enc=aes-gcm-16 key=$K $NT >/dev/null &&
-	"$CTL" "$D/b.sock" sp-add slid=$((t + 1)) dir=in action=protect src=10.2.$t.0/24 dst=10.1.$t.0/24 tsrc=192.0.2.1 tdst=$P >/dev/null ||
+	"$CTL" "$D/b.sock" sp-add slid=$((t + 1)) dir=in action=protect src=$S dst=$R tsrc=192.0.2.1 tdst=$P >/dev/null ||
 	{ echo "tunnel $t setup failed"; exit 1; }
 done
 fi

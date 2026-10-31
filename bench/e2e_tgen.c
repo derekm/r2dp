@@ -5,7 +5,7 @@
  *   gen port (port 0) --plaintext--> r2dp A --ESP--> r2dp B --plaintext--> sink port (port 1)
  *
  * Port 0 transmits IPv4/UDP frames of one size, flows 10.2.t.5 ->
- * 10.1.t.5 for tunnel t (a burst of 32 per tunnel, tunnels round-robin),
+ * 10.1.t.5 for tunnel t (t >= 256: 10.4/10.3, 10.6/10.5, ...) (a burst of 32 per tunnel, tunnels round-robin),
  * each carrying a magic, its sequence number and a byte pattern.  Port 1
  * polls every RX queue and counts a frame as valid only if the inner IP
  * header checksums, the length is what was sent and the magic + pattern
@@ -39,7 +39,7 @@
 #include <rte_lcore.h>
 
 #define BURST   32
-#define MAXTUN  256
+#define MAXTUN  1024
 #define MAGIC   0x52324450u          /* "R2DP" */
 #define PL_OFF  (14 + 20 + 8)        /* payload offset in the frame */
 
@@ -92,14 +92,16 @@ build_templates(void)
 
 		if (!m || !(f = (uint8_t *)rte_pktmbuf_append(m, (uint16_t)frame)))
 			return -1;
-		snprintf(s, sizeof(s), "10.2.%u.5", t);
-		snprintf(d, sizeof(d), "10.1.%u.5", t);
+		/* tunnel t: 10.(2+2*(t/256)).(t%256).5 -> 10.(1+2*(t/256)).(t%256).5 */
+		snprintf(s, sizeof(s), "10.%u.%u.5", 2 + 2 * (t >> 8), t & 255);
+		snprintf(d, sizeof(d), "10.%u.%u.5", 1 + 2 * (t >> 8), t & 255);
 		inet_pton(AF_INET, s, &sa);
 		inet_pton(AF_INET, d, &da);
 		mk_frame(f, frame, sa, da, 1024, 9);
 		if (frame >= PL_OFF + 8) {   /* (64 B: 22 payload bytes) */
 			memcpy(f + PL_OFF, &mg, 4);
 			f[PL_OFF + 4] = (uint8_t)t;
+			f[PL_OFF + 5] = (uint8_t)(t >> 8);
 			for (unsigned i = PL_OFF + 8; i < frame; i++)
 				f[i] = pat(i);
 		}
@@ -126,7 +128,8 @@ valid(const struct rte_mbuf *m)
 	if (frame < PL_OFF + 8)
 		return 1;
 	memcpy(&mg, f + PL_OFF, 4);
-	if (ntohl(mg) != MAGIC || f[PL_OFF + 4] >= ntun)
+	if (ntohl(mg) != MAGIC ||
+	    (unsigned)(f[PL_OFF + 4] | f[PL_OFF + 5] << 8) >= ntun)
 		return 0;
 	for (unsigned i = PL_OFF + 8; i < frame && i < PL_OFF + 24; i++)
 		if (f[i] != pat(i))
