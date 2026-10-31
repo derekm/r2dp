@@ -326,6 +326,48 @@ main(void)
 		uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(all[i], 14);
 		if (f) { memset(f, 0, 14); f[12] = 8; }
 	}
+	/* dispatcher steering (batched): every ESP frame to its SA's owner,
+	 * every protected inner frame to its egress SA's owner, a non-ESP
+	 * outer frame to worker 0 */
+	{
+		unsigned bad = 0;
+		for (unsigned i = 0; i < nall; i += BURST_SZ) {
+			uint16_t c = (uint16_t)RTE_MIN((unsigned)BURST_SZ, nall - i);
+			uint8_t t[BURST_SZ];
+
+			dp_steer_outer(B, &all[i], c, t);
+			for (uint16_t j = 0; j < c; j++) {
+				const uint8_t *p = rte_pktmbuf_mtod(all[i + j],
+				    const uint8_t *);
+				uint32_t spi;
+				memcpy(&spi, p + 14 + 20, 4);
+				if (t[j] + 1u != seen[ntohl(spi) - 0x7000][0])
+					bad++;
+			}
+		}
+		CHECK(bad == 0, "steer: ESP frames go to the owner of their SA");
+		bad = 0;
+		{
+			struct rte_mbuf *in[BURST_SZ];
+			uint8_t t[BURST_SZ];
+			if (rte_pktmbuf_alloc_bulk(mp, in, BURST_SZ) == 0) {
+				for (int j = 0; j < BURST_SZ; j++)
+					mk_inner(in[j], (j / 3) % NT, (uint16_t)j);
+				dp_steer_inner(A, in, BURST_SZ, t);
+				for (int j = 0; j < BURST_SZ; j++)
+					if (t[j] + 1u != seen[(j / 3) % NT][0])
+						bad++;
+				/* an ARP-looking frame on the outer side: worker 0 */
+				rte_pktmbuf_mtod(in[0], uint8_t *)[12] = 0x08;
+				rte_pktmbuf_mtod(in[0], uint8_t *)[13] = 0x06;
+				dp_steer_outer(B, in, 1, t);
+				bad += t[0] != 0;
+				rte_pktmbuf_free_bulk(in, BURST_SZ);
+			} else
+				bad++;
+		}
+		CHECK(bad == 0, "steer: inner frames go to their egress SA's owner");
+	}
 	{
 		unsigned acc = offer_all(all, nall);
 		CHECK(acc == nall, "inbound: every datagram accepted exactly once");

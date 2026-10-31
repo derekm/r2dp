@@ -657,4 +657,118 @@ drop:
 }
 
 
+/* ---- multi-worker steering (the dispatcher lcore) -------------------- */
+
+/* SAD key of an outer frame that is ESP or ESP-in-UDP; 0 for anything
+ * else (IKE, ARP, clear, malformed). */
+static int
+steer_key(const struct rte_mbuf *m, union rte_ipsec_sad_key *k)
+{
+	const uint8_t *p = rte_pktmbuf_mtod(m, const uint8_t *);
+	uint32_t len = rte_pktmbuf_data_len(m), off, spi;
+	const struct rte_ipv4_hdr *ip;
+
+	if (len < RTE_ETHER_HDR_LEN + sizeof(*ip) || p[12] != 0x08 || p[13] != 0)
+		return 0;
+	ip = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
+	if ((ip->version_ihl >> 4) != 4)
+		return 0;
+	off = RTE_ETHER_HDR_LEN + (ip->version_ihl & 0x0f) * 4u;
+	if (ip->next_proto_id == IPPROTO_UDP) {
+		if (natt_class(p, len) != NT_ESP)
+			return 0;
+		off += 8;
+	} else if (ip->next_proto_id != IPPROTO_ESP) {
+		return 0;
+	}
+	if (len < off + 4)
+		return 0;
+	memcpy(&spi, p + off, 4);
+	memset(k, 0, sizeof(*k));
+	k->v4.spi = ntohl(spi);
+	k->v4.dip = ip->dst_addr;
+	return 1;
+}
+
+/* Worker owning the inbound SA each outer frame is for: ESP or
+ * ESP-in-UDP is looked up in the SAD by (SPI, outer dst), one lookup per
+ * distinct consecutive key; everything else (IKE, ARP, clear, SAD misses)
+ * goes to worker 0, which forwards or drops it exactly as a single worker
+ * would. */
+void
+dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
+    uint8_t t[])
+{
+	union rte_ipsec_sad_key k[BURST_SZ];
+	const union rte_ipsec_sad_key *kp[BURST_SZ];
+	void *sa[BURST_SZ];
+	int16_t ux[BURST_SZ];
+	uint32_t nu = 0;
+
+	if (n > BURST_SZ)
+		n = BURST_SZ;
+	for (uint16_t i = 0; i < n; i++) {
+		t[i] = 0;
+		ux[i] = -1;
+		if (!steer_key(m[i], &k[nu]))
+			continue;
+		if (!nu || k[nu].v4.spi != kp[nu - 1]->v4.spi ||
+		    k[nu].v4.dip != kp[nu - 1]->v4.dip) {
+			kp[nu] = &k[nu];
+			nu++;
+		}
+		ux[i] = (int16_t)(nu - 1);
+	}
+	if (!nu || rte_ipsec_sad_lookup(d->sad, kp, sa, nu) <= 0)
+		return;
+	for (uint16_t i = 0; i < n; i++) {
+		const struct dp_sa *ds;
+
+		if (ux[i] < 0 || !sa[ux[i]])
+			continue;
+		ds = sa_of_sess(d, sa[ux[i]]);
+		t[i] = ds ? (uint8_t)(ds->owner % d->nb_wk) : 0;
+	}
+}
+
+/* Worker for each inner (plaintext) frame: the owner of the egress SA its
+ * OUT PROTECT policy is bound to (one ACL classify for the burst);
+ * anything else (bypass, discard, no SA, non-IPv4) by a hash of the
+ * addresses, so a flow stays in order. */
+void
+dp_steer_inner(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
+    uint8_t t[])
+{
+	const struct rte_ipv4_hdr *ip[BURST_SZ] = { NULL };
+	size_t av[BURST_SZ] = { 0 };
+	const struct r2dp_sp *sp[BURST_SZ];
+	struct dp_sa *ds[BURST_SZ];
+
+	if (n > BURST_SZ)
+		n = BURST_SZ;
+	for (uint16_t i = 0; i < n; i++) {
+		const uint8_t *p = rte_pktmbuf_mtod(m[i], const uint8_t *);
+		uint32_t len = rte_pktmbuf_data_len(m[i]);
+		const struct rte_ipv4_hdr *h;
+
+		if (len < RTE_ETHER_HDR_LEN + sizeof(*h))
+			continue;
+		h = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
+		if ((h->version_ihl >> 4) != 4)
+			continue;
+		ip[i] = h;
+		av[i] = len - RTE_ETHER_HDR_LEN;
+	}
+	sp_match_out_burst(d, ip, av, n, sp, ds);
+	for (uint16_t i = 0; i < n; i++) {
+		if (!ip[i])
+			t[i] = 0;
+		else if (sp[i] && ds[i] && sp[i]->action == R2DP_ACT_PROTECT)
+			t[i] = (uint8_t)(ds[i]->owner % d->nb_wk);
+		else
+			t[i] = (uint8_t)(rte_hash_crc_4byte(ip[i]->dst_addr,
+			    rte_hash_crc_4byte(ip[i]->src_addr, 0)) % d->nb_wk);
+	}
+}
+
 #endif /* R2DP_HAVE_DPDK */

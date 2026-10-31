@@ -542,70 +542,6 @@ worker_main(void *arg)
 	return 0;
 }
 
-/* Worker owning the inbound SA an outer frame is for: ESP or ESP-in-UDP is
- * looked up in the SAD by (SPI, outer dst); everything else (IKE, ARP,
- * clear, SAD misses) goes to worker 0, which forwards or drops it exactly
- * as a single worker would. */
-static unsigned
-steer_outer(struct dpdk_priv *d, struct rte_mbuf *m)
-{
-	const uint8_t *p = rte_pktmbuf_mtod(m, const uint8_t *);
-	uint32_t len = rte_pktmbuf_data_len(m), off, spi;
-	const struct rte_ipv4_hdr *ip;
-	union rte_ipsec_sad_key k;
-	const union rte_ipsec_sad_key *kp = &k;
-	void *sa = NULL;
-	const struct dp_sa *ds;
-
-	if (len < RTE_ETHER_HDR_LEN + sizeof(*ip) || p[12] != 0x08 || p[13] != 0)
-		return 0;
-	ip = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
-	if ((ip->version_ihl >> 4) != 4)
-		return 0;
-	off = RTE_ETHER_HDR_LEN + (ip->version_ihl & 0x0f) * 4u;
-	if (ip->next_proto_id == IPPROTO_UDP) {
-		if (natt_class(p, len) != NT_ESP)
-			return 0;
-		off += 8;
-	} else if (ip->next_proto_id != IPPROTO_ESP) {
-		return 0;
-	}
-	if (len < off + 4)
-		return 0;
-	memcpy(&spi, p + off, 4);
-	memset(&k, 0, sizeof(k));
-	k.v4.spi = ntohl(spi);
-	k.v4.dip = ip->dst_addr;
-	if (rte_ipsec_sad_lookup(d->sad, &kp, &sa, 1) != 1 || !sa)
-		return 0;
-	ds = sa_of_sess(d, sa);
-	return ds ? ds->owner % d->nb_wk : 0;
-}
-
-/* Worker for an inner (plaintext) frame: the owner of the egress SA its
- * OUT PROTECT policy is bound to; anything else (bypass, discard, no SA,
- * non-IPv4) by a hash of the addresses, so a flow stays in order. */
-static unsigned
-steer_inner(struct dpdk_priv *d, struct rte_mbuf *m)
-{
-	const uint8_t *p = rte_pktmbuf_mtod(m, const uint8_t *);
-	uint32_t len = rte_pktmbuf_data_len(m);
-	const struct rte_ipv4_hdr *ip;
-	const struct r2dp_sp *sp;
-	struct dp_sa *ds;
-
-	if (len < RTE_ETHER_HDR_LEN + sizeof(*ip))
-		return 0;
-	ip = (const struct rte_ipv4_hdr *)(p + RTE_ETHER_HDR_LEN);
-	if ((ip->version_ihl >> 4) != 4)
-		return 0;
-	sp = sp_match_out(d, ip, len - RTE_ETHER_HDR_LEN, &ds);
-	if (sp && ds && sp->action == R2DP_ACT_PROTECT)
-		return ds->owner % d->nb_wk;
-	return rte_hash_crc_4byte(ip->dst_addr,
-	    rte_hash_crc_4byte(ip->src_addr, 0)) % d->nb_wk;
-}
-
 /* Hand per-worker batches to their rings; what does not fit is dropped
  * and counted on the dispatcher (DR_STEER). */
 static void
@@ -641,6 +577,7 @@ dispatcher_main(void *arg)
 	struct rte_mbuf *bufs[BURST_SZ];
 	struct rte_mbuf *q[DP_MAX_WK][BURST_SZ];
 	uint16_t nq[DP_MAX_WK] = { 0 };
+	uint8_t tw[BURST_SZ];                 /* target worker per frame */
 	uint64_t last_t = 0;
 	unsigned qi = 0;
 
@@ -653,10 +590,10 @@ dispatcher_main(void *arg)
 
 		struct nh_memo mo = { .now = nr ? rte_get_tsc_cycles() : 0 };
 
+		uint16_t nk = 0;
+
 		dw->n_rx += nr;
 		for (uint16_t i = 0; i < nr; i++) {
-			unsigned t;
-
 			nh_learn_frame(d, bufs[i], &mo);
 			if (natt_class(rte_pktmbuf_mtod(bufs[i], const uint8_t *),
 			    rte_pktmbuf_data_len(bufs[i])) == NT_KEEPALIVE) {
@@ -664,17 +601,18 @@ dispatcher_main(void *arg)
 				rte_pktmbuf_free(bufs[i]);
 				continue;
 			}
-			t = steer_outer(d, bufs[i]);
-			q[t][nq[t]++] = bufs[i];
+			bufs[nk++] = bufs[i];
 		}
+		dp_steer_outer(d, bufs, nk, tw);
+		for (uint16_t i = 0; i < nk; i++)
+			q[tw[i]][nq[tw[i]]++] = bufs[i];
 		dispatch_flush(dw, q, nq, 1);
 		if (d->inner_port >= 0) {
 			nr = rte_eth_rx_burst(d->inner_port, rq, bufs, BURST_SZ);
 			dw->n_rx += nr;
-			for (uint16_t i = 0; i < nr; i++) {
-				unsigned t = steer_inner(d, bufs[i]);
-				q[t][nq[t]++] = bufs[i];
-			}
+			dp_steer_inner(d, bufs, nr, tw);
+			for (uint16_t i = 0; i < nr; i++)
+				q[tw[i]][nq[tw[i]]++] = bufs[i];
 			dispatch_flush(dw, q, nq, 0);
 		}
 		if (d->rcu)

@@ -14,7 +14,11 @@
  *
  *   fwd_bench [--check] [--json FILE|-] [--runs N] [--sizes a,b,..]
  *             [--tunnels a,b,..] [--pmd auto|openssl|aesni_mb] [--workers N]
- *             [--natt]
+ *             [--natt] [--steer]
+ *
+ * --steer: also time the multi-worker dispatcher's classification
+ * (dp_steer_inner on the plaintext frames, dp_steer_outer on the ESP
+ * frames), reported as cycles per packet; no crypto in it.
  *
  * --natt: every SA is RFC 3948 ESP-in-UDP (UDP/4500 encapsulation on
  * encrypt, the UDP header removed again on decrypt).
@@ -50,6 +54,7 @@ static struct rte_mempool *mp;
 static int cdev = -1;
 static struct rte_mbuf *espq[DP_MAX_WK][NPKT];
 static int natt;              /* --natt: ESP-in-UDP SAs */
+static int steer;             /* --steer: time the dispatcher steering */
 
 static struct dpdk_priv *
 mk_priv(const char *tag)
@@ -233,6 +238,67 @@ measure(struct dpdk_priv *a, struct dpdk_priv *b, unsigned w, unsigned sz,
 	return 0;
 }
 
+/* Dispatcher steering cost: one untimed + `rep` timed passes over NPKT
+ * plaintext frames (dp_steer_inner on A) and the ESP frames they encrypt
+ * to (dp_steer_outer on B), median cycles/pkt of each.  Steering is
+ * computed as for 4 workers. */
+static int
+measure_steer(struct dpdk_priv *a, struct dpdk_priv *b, unsigned sz, int rep,
+    double *sin, double *sout)
+{
+	static struct rte_mbuf *pin[NPKT];
+	double ri[MAXRUNS], ro[MAXRUNS];
+	unsigned got = 0, na = a->nb_wk, nb = b->nb_wk;
+	uint8_t t[BURST];
+
+	if (rte_pktmbuf_alloc_bulk(mp, pin, NPKT / 2))
+		return -1;
+	for (unsigned i = 0; i < NPKT / 2; i++)
+		mk_inner(pin[i], sz, flow_src[0], flow_dst[0]);
+	for (unsigned i = 0; i < NPKT / 2; i += BURST) {
+		struct rte_mbuf *in[BURST], *out[BURST];
+		uint16_t no = 0, nbp = 0;
+		if (rte_pktmbuf_alloc_bulk(mp, in, BURST))
+			return -1;
+		for (int j = 0; j < BURST; j++)
+			mk_inner(in[j], sz, flow_src[0], flow_dst[0]);
+		esp_outbound(&a->wk[0], in, BURST, out, &no, &nbp);
+		for (int j = 0; j < BURST; j++)
+			if (in[j]) rte_pktmbuf_free(in[j]);
+		for (int j = 0; j < no; j++) {
+			uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(out[j], 14);
+			memset(f, 0, 14); f[12] = 8;
+			espq[0][got++] = out[j];
+		}
+	}
+	a->nb_wk = b->nb_wk = 4;
+	for (int r = -1; r < rep; r++) {
+		uint64_t ci = 0, co = 0, x;
+		for (unsigned i = 0; i < NPKT / 2; i += BURST) {
+			x = rte_rdtsc_precise();
+			dp_steer_inner(a, &pin[i], BURST, t);
+			ci += rte_rdtsc_precise() - x;
+		}
+		for (unsigned i = 0; i + BURST <= got; i += BURST) {
+			x = rte_rdtsc_precise();
+			dp_steer_outer(b, &espq[0][i], BURST, t);
+			co += rte_rdtsc_precise() - x;
+		}
+		if (r >= 0) {
+			ri[r] = (double)ci / (NPKT / 2);
+			ro[r] = (double)co / (got / BURST * BURST);
+		}
+	}
+	a->nb_wk = na; b->nb_wk = nb;
+	rte_pktmbuf_free_bulk(pin, NPKT / 2);
+	rte_pktmbuf_free_bulk(espq[0], got);
+	qsort(ri, rep, sizeof(ri[0]), dblcmp);
+	qsort(ro, rep, sizeof(ro[0]), dblcmp);
+	*sin = ri[rep / 2];
+	*sout = ro[rep / 2];
+	return got ? 0 : -1;
+}
+
 static double
 envf(const char *n, double def)
 {
@@ -381,7 +447,7 @@ usage(void)
 {
 	fprintf(stderr, "usage: fwd_bench [--check] [--json FILE|-] [--runs N] "
 	    "[--sizes 64,512,1400] [--tunnels 1,65,201] "
-	    "[--pmd auto|openssl|aesni_mb] [--workers N] [--natt]\n");
+	    "[--pmd auto|openssl|aesni_mb] [--workers N] [--natt] [--steer]\n");
 }
 
 int
@@ -413,6 +479,8 @@ main(int argc, char **argv)
 			nsz = parse_list(argv[++i], sizes, 28, 1400);
 		else if (!strcmp(argv[i], "--tunnels") && v)
 			ntun = parse_list(argv[++i], tunnels, 1, MAX_SA / 2 - 1);
+		else if (!strcmp(argv[i], "--steer"))
+			steer = 1;
 		else if (!strcmp(argv[i], "--natt"))
 			natt = 1;
 		else if (!strcmp(argv[i], "--workers") && v)
@@ -509,6 +577,14 @@ main(int argc, char **argv)
 			printf("  %4d %7d   %11.0f  %8.2f   %11.0f  %8.2f\n",
 			    sizes[z], tunnels[k], enc[z][k], hz / enc[z][k] / 1e6,
 			    dec[z][k], hz / dec[z][k] / 1e6);
+			if (steer) {
+				double si, so;
+				if (measure_steer(a, b, (unsigned)sizes[z], runs, &si, &so)) {
+					puts("FAIL steer"); return 1;
+				}
+				printf("               steer: inner %.0f outer %.0f cyc/pkt\n",
+				    si, so);
+			}
 		}
 	}
 	if (check) {

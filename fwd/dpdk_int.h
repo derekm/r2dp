@@ -372,6 +372,13 @@ void
 esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout, uint16_t *nbypass);
 
+void
+dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
+    uint8_t t[]);
+void
+dp_steer_inner(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
+    uint8_t t[]);
+
 /* dpdk_stats.c */
 void
 dpd_stats_sum(const struct dpdk_priv *d, struct dp_wk *t);
