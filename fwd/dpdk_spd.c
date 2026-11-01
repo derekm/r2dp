@@ -52,7 +52,7 @@ dpd_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 		__atomic_store_n(&sp_at(d, (uint32_t)slot)->sp, old,
 		    __ATOMIC_RELEASE);
 		if (d->rcu)
-			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+			r2dp_qsbr_sync(d->rcu);
 		rte_spinlock_unlock(&d->lock);
 		free(nsp);
 		return -ENOMEM;
@@ -732,7 +732,7 @@ spd_rebuild_ex(struct dpdk_priv *d, int policies_changed)
 	__atomic_store_n(&d->spd, ns, __ATOMIC_RELEASE);
 	if (old) {
 		if (d->rcu)
-			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+			r2dp_qsbr_sync(d->rcu);
 		spd_peers_gone(d, old, ns);
 		/* the next-hop maintenance thread reads the published snapshot
 		 * (is_tunnel_peer via nh.wanted) under nh.lock and is no QSBR

@@ -12,6 +12,7 @@
 #include <rte_malloc.h>
 
 #include "dpdk_nh.h"
+#include "qsbr_sync.h"
 
 static uint64_t
 mac_pack(const uint8_t mac[6])
@@ -280,7 +281,7 @@ r2dp_nh_maint(struct r2dp_nh_tab *t)
 		/* readers that loaded the old pointer finish with it before
 		 * it goes; this thread is not a reader, so it may wait */
 		if (t->rcu)
-			rte_rcu_qsbr_synchronize(t->rcu, RTE_QSBR_THRID_INVALID);
+			r2dp_qsbr_sync(t->rcu);
 		rte_hash_free(old);
 	}
 }

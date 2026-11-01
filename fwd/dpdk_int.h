@@ -34,6 +34,7 @@
 #include <rte_lcore.h>
 #include <rte_mempool.h>
 #include <rte_rcu_qsbr.h>
+#include "qsbr_sync.h"
 #include <rte_acl.h>
 #include <rte_ring.h>
 #include <rte_hash_crc.h>

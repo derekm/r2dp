@@ -212,7 +212,7 @@ sad_grow(struct dpdk_priv *d)
 	d->sad_cap = ncap;
 	d->n_grow++;
 	if (d->rcu)
-		rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+		r2dp_qsbr_sync(d->rcu);
 	rte_ipsec_sad_destroy(old);
 	return 0;
 }
@@ -357,7 +357,7 @@ sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds, int sad_del)
 			d->sad_n--;
 	}
 	if (d->rcu)
-		rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+		r2dp_qsbr_sync(d->rcu);
 	sa_slot_free(d, ds);
 }
 
