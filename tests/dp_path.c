@@ -149,6 +149,8 @@ inner_frame(const char *src, const char *dst, uint8_t proto, uint16_t dport,
 /* A -> encrypt -> B -> decrypt.  Returns 1 if an inner packet came out of
  * B (copied to `got`), 0 if dropped; *encrypted says whether A emitted ESP. */
 static int tamper_at = -1;   /* >= 0: flip this byte of the ESP datagram */
+static int pad_outer;        /* append this many junk bytes to the ESP frame */
+static int grow_outer_len;   /* add this to the outer IP total length */
 
 static int
 run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
@@ -169,6 +171,14 @@ run_len(struct dpdk_priv *a, struct dpdk_priv *b, struct rte_mbuf *m,
 		memset(f, 0, 14); f[12] = 0x08;
 		if (tamper_at >= 0 && (uint32_t)tamper_at + 14 < rte_pktmbuf_data_len(esp[0]))
 			f[14 + tamper_at] ^= 0x01;
+		if (grow_outer_len) {
+			uint16_t tl = (uint16_t)((f[16] << 8 | f[17]) + grow_outer_len);
+			f[16] = (uint8_t)(tl >> 8); f[17] = (uint8_t)tl;
+		}
+		if (pad_outer) {
+			uint8_t *t = (uint8_t *)rte_pktmbuf_append(esp[0], (uint16_t)pad_outer);
+			if (t) memset(t, 0xa5, (size_t)pad_outer);
+		}
 	}
 	esp_inbound(&b->wk[0], esp, 1, dec, &ndec);
 	if (ndec != 1)
@@ -314,6 +324,65 @@ main(void)
 		tamper_at = -1;
 	}
 
+	/* Inner IPv6: this data path has no IPv6 ESP, so with an IPv6
+	 * PROTECT policy present inner IPv6 must be dropped, not bypassed in
+	 * the clear; with no IPv6 policy it still bypasses. */
+	{
+		struct fwd_dp dp = { .priv = a };
+		struct r2dp_sp sp;
+		struct rte_mbuf *in[1], *esp[1] = { NULL };
+		uint16_t nout, nb;
+		uint64_t v6 = a->wk[0].n_dropr[DR_V6_POLICY];
+		int bypass_before, dropped;
+
+		for (int pass = 0; pass < 2; pass++) {
+			uint8_t *f;
+			in[0] = rte_pktmbuf_alloc(mp);
+			f = in[0] ? (uint8_t *)rte_pktmbuf_append(in[0], 14 + 60) : NULL;
+			if (!f) { CHECK(0, "v6 frame alloc"); break; }
+			memset(f, 0, 74);
+			f[12] = 0x86; f[13] = 0xdd; f[14] = 0x60; f[20] = 59; f[21] = 64;
+			nout = nb = 0;
+			esp_outbound(&a->wk[0], in, 1, esp, &nout, &nb);
+			if (pass == 0) {
+				bypass_before = nb == 1 && in[0] != NULL;
+				if (in[0]) rte_pktmbuf_free(in[0]);
+				memset(&sp, 0, sizeof(sp));
+				sp.slid = 66; sp.dir = R2DP_DIR_OUT; sp.action = R2DP_ACT_PROTECT;
+				sp.ul_proto = R2DP_PROTO_ANY;
+				sp.sel_src.family = sp.sel_dst.family = R2DP_AF_INET6;
+				sp.tun_src.family = sp.tun_dst.family = R2DP_AF_INET4;
+				dpd_sp_add(&dp, &sp);
+			} else {
+				dropped = in[0] == NULL && nout == 0 &&
+				    a->wk[0].n_dropr[DR_V6_POLICY] == v6 + 1;
+				if (in[0]) rte_pktmbuf_free(in[0]);
+				CHECK(bypass_before, "inner IPv6 with no IPv6 policy -> bypass");
+				CHECK(dropped, "inner IPv6 with an IPv6 PROTECT policy -> dropped, never clear");
+				dpd_sp_del(&dp, &sp);
+			}
+		}
+	}
+
+	/* Outer frame longer than its IP datagram (L2 padding, trailing junk):
+	 * the ICV is found at the IP total length, so it still decrypts; an
+	 * outer total length the frame does not carry is malformed (ported
+	 * from the upstream prototype's ip_check). */
+	{
+		static uint8_t w[64], g[64];
+		struct rte_mbuf *m;
+		pad_outer = 10;
+		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		CHECK(run(a, b, m, &enc, g) && !memcmp(g, w, 64),
+		    "ESP frame with 10 trailing bytes decrypts (trimmed to the IP length)");
+		pad_outer = 0;
+		grow_outer_len = 4;
+		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		CHECK(!run(a, b, m, &enc, g) && enc,
+		    "outer total length beyond the frame -> dropped");
+		grow_outer_len = 0;
+	}
+
 	/* Inner lengths whose low byte is < 20 (256, 512, 513, 270...) were
 	 * dropped by an 8-bit truncation of the mbuf length in the IHL check. */
 	{
@@ -326,6 +395,41 @@ main(void)
 			if (!ok) { printf("     len %u failed\n", lens[k]); allok = 0; }
 		}
 		CHECK(allok, "inner lengths 255..1400 incl. 256/512/513 round-trip");
+	}
+
+	/* Outer MTU (ported from the upstream prototype's too-big check):
+	 * at 1500, 20 + 8 + 8 + pad4(len + 2) + 16 must fit, so a 1446-byte
+	 * inner packet goes and a 1447-byte one is dropped and counted, not
+	 * handed to TX oversized.  An IP total length longer than the frame
+	 * (or shorter than the header) is malformed, never encrypted. */
+	{
+		static uint8_t w[1500], g[1500];
+		uint64_t tb = a->wk[0].n_dropr[DR_TOO_BIG], mf = a->wk[0].n_dropr[DR_MALFORMED];
+		struct rte_mbuf *m;
+		a->out_mtu = 1500;
+		m = inner_frame_len("10.0.1.5", "10.0.2.5", 1, 0, w, 1446);
+		CHECK(m && run_len(a, b, m, &enc, g, 1446) && !memcmp(g, w, 1446),
+		    "MTU 1500: 1446-byte inner packet fits after ESP encapsulation");
+		m = inner_frame_len("10.0.1.5", "10.0.2.5", 1, 0, w, 1447);
+		CHECK(m && !run_len(a, b, m, &enc, g, 1447) && !enc &&
+		    a->wk[0].n_dropr[DR_TOO_BIG] == tb + 1,
+		    "MTU 1500: 1447-byte inner packet dropped as too_big");
+		a->out_mtu = 0;
+		m = inner_frame_len("10.0.1.5", "10.0.2.5", 1, 0, w, 100);
+		if (m) {
+			uint8_t *ip = rte_pktmbuf_mtod(m, uint8_t *) + 14;
+			ip[2] = 0; ip[3] = 120;              /* claims 20 more bytes */
+		}
+		CHECK(m && !run_len(a, b, m, &enc, g, 100) && !enc,
+		    "total length beyond the frame -> not encrypted");
+		m = inner_frame_len("10.0.1.5", "10.0.2.5", 1, 0, w, 100);
+		if (m) {
+			uint8_t *ip = rte_pktmbuf_mtod(m, uint8_t *) + 14;
+			ip[2] = 0; ip[3] = 12;               /* shorter than the header */
+		}
+		CHECK(m && !run_len(a, b, m, &enc, g, 100) && !enc &&
+		    a->wk[0].n_dropr[DR_MALFORMED] == mf + 2,
+		    "total length below the header -> malformed");
 	}
 
 	/* Batched crypto: a 32-packet burst (every 8th outside A's policy ->

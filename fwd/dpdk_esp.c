@@ -280,6 +280,15 @@ esp_inbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 		 * ciphertext/AAD/IV are read from the wrong bytes -> AUTH_FAILED
 		 * on every real packet. */
 		(void)rte_pktmbuf_adj(bufs[i], RTE_ETHER_HDR_LEN);
+		/* The ICV sits at the end of the IP datagram, not of the frame:
+		 * drop L2 padding / trailing bytes beyond the outer total
+		 * length (else every padded frame fails authentication), and
+		 * refuse a total length the frame does not carry. */
+		if (ipsize > rte_pktmbuf_pkt_len(bufs[i]))
+			goto bad;
+		if (ipsize < rte_pktmbuf_pkt_len(bufs[i]))
+			rte_pktmbuf_trim(bufs[i],
+			    (uint16_t)(rte_pktmbuf_pkt_len(bufs[i]) - ipsize));
 		ip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
 		if (natlen) {
 			/* NAT-T: after the eth strip the frame is IP + UDP(8) +
@@ -463,6 +472,10 @@ in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	/* trim any trailing bytes beyond the inner IP length (padding/NAT-T) */
 	iplen = rte_be_to_cpu_16(ip->total_length);
 	cur = rte_pktmbuf_pkt_len(mb);
+	/* an inner length beyond what was decrypted (or below the header)
+	 * is not a packet we can deliver as received */
+	if (iplen < ihl || iplen > cur)
+		return 0;
 	if (iplen < cur)
 		rte_pktmbuf_trim(mb, cur - iplen);
 	return inbound_policy_ok(d, ds, (const uint8_t *)ip,
@@ -489,6 +502,23 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 	size_t cav[BURST_SZ] = { 0 };
 
 	if (nr > BURST_SZ) nr = BURST_SZ;
+	/* This data path carries IPv4 only.  Inner IPv6 used to fall through
+	 * to bypass -- cleartext even when an IPv6 PROTECT/DISCARD policy
+	 * asked otherwise.  Fail closed: with such a policy present, inner
+	 * IPv6 is dropped (no policy at all: forwarded, as the kernel does). */
+	{
+		const struct dp_spd *s = __atomic_load_n(&d->spd, __ATOMIC_ACQUIRE);
+		if (s && s->v6_out)
+			for (uint16_t i = 0; i < nr; i++) {
+				const uint8_t *f = rte_pktmbuf_mtod(bufs[i], const uint8_t *);
+				if (rte_pktmbuf_data_len(bufs[i]) >= RTE_ETHER_HDR_LEN &&
+				    f[12] == 0x86 && f[13] == 0xdd) {
+					DROP(w, DR_V6_POLICY, 1);
+					rte_pktmbuf_free(bufs[i]);
+					bufs[i] = NULL;
+				}
+			}
+	}
 	/* inner tap delivers Ethernet: parse the inner IP at the L2 offset for
 	 * policy matching (one ACL classify for the whole burst); only STRIP
 	 * L2 below for a matched packet so the unconsumed (bypass) mbufs keep
@@ -498,7 +528,7 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 
 		cip[i] = NULL;
 		cav[i] = 0;
-		if (rte_pktmbuf_data_len(bufs[i]) <
+		if (!bufs[i] || rte_pktmbuf_data_len(bufs[i]) <
 		    RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
 			continue;
 		ip = (const struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(bufs[i],
@@ -515,6 +545,8 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 		uint8_t ihl;
 		struct rte_ipv4_hdr *lip;
 
+		if (!bufs[i])
+			continue;              /* dropped above (inner IPv6) */
 		if (!sp) { nb++; continue; }   /* no matching OUT policy: bypass */
 
 		/* A matched policy decides the disposition (H2, RFC 4301 5.1):
@@ -550,9 +582,23 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 		 * the IP length so the ESP payload carries exactly the inner packet. */
 		{
 			uint16_t iplen = rte_be_to_cpu_16(lip->total_length);
-			uint16_t cur = rte_pktmbuf_pkt_len(bufs[i]);
+			uint32_t cur = rte_pktmbuf_pkt_len(bufs[i]);
+			/* a total length shorter than the header or longer than
+			 * what arrived would make us encrypt (and the peer
+			 * deliver) a packet that is not the one received */
+			if (iplen < ihl || iplen > cur)
+				goto drop;
 			if (iplen < cur)
-				rte_pktmbuf_trim(bufs[i], cur - iplen);
+				rte_pktmbuf_trim(bufs[i], (uint16_t)(cur - iplen));
+			/* outer IPv4 [+UDP] + ESP hdr + GCM IV + payload padded
+			 * to 4 with pad-length/next-header + ICV.  We do not
+			 * fragment: an ESP packet the outer link cannot carry is
+			 * dropped and counted here, not silently lost at TX. */
+			why = DR_TOO_BIG;
+			if (d->out_mtu && 20u +
+			    (ds->natt == R2DP_NATT_ESPINUDP ? 8u : 0u) + 8u + 8u +
+			    ((iplen + 2u + 3u) & ~3u) + 16u > d->out_mtu)
+				goto drop;
 		}
 
 		/* matched + PROTECT + SA: queue for the batched crypto pass */

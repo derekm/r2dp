@@ -149,6 +149,8 @@ enum dp_drop {
 	DR_CRYPTO_STUCK,    /* cryptodev stopped completing ops (see crypto_run) */
 	DR_ENCAP,           /* ESP vs ESP-in-UDP framing does not match the SA */
 	DR_STEER,           /* SA owned by another worker, or worker ring full */
+	DR_TOO_BIG,         /* ESP packet would exceed the outer port's MTU */
+	DR_V6_POLICY,       /* inner IPv6 while IPv6 policies exist (no v6 ESP) */
 	DR_NUM
 };
 #define DROP(w, r, n) do { uint64_t n_ = (n); (w)->n_drop += n_; \
@@ -227,6 +229,7 @@ struct dp_spd {
 	uint32_t       ndead;     /* dead acl rules */
 	uint32_t       ndelta;
 	uint32_t      *delta;     /* out[] indices not in the classifier */
+	int            v6_out;    /* some OUT PROTECT/DISCARD has an IPv6 selector */
 	/* Inbound (RFC 4301 s5.2) check, indexed by SA slot: the IN/FWD PROTECT
 	 * policies whose tunnel endpoints/reqid fit that SA are
 	 * in_pol[in_off[slot] .. in_off[slot+1]), valid while the slot's gen
@@ -302,6 +305,7 @@ struct dpdk_priv {
 	uint64_t            n_acl_reuse;  /* snapshots that kept the classifier */
 	uint64_t            n_nh_unref;   /* next hops removed with their last SA/SP */
 	uint64_t            sp_ver;       /* dp_sp_ent.ver source */
+	uint16_t            out_mtu;      /* outer port MTU (0: unchecked) */
 	uint64_t            spd_dirty_tsc; /* last policy change (0: compacted) */
 	int                 verbose;
 	uint64_t            sa_gen;       /* last dp_sa.gen handed out */

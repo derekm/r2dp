@@ -693,6 +693,10 @@ spd_rebuild_ex(struct dpdk_priv *d, int policies_changed)
 		p->sa_idx = -1;
 		p->ver = sp_at(d, i)->ver;
 		pol_compile(p);
+		if (sp->action != R2DP_ACT_BYPASS &&
+		    (sp->sel_src.family == R2DP_AF_INET6 ||
+		    sp->sel_dst.family == R2DP_AF_INET6))
+			ns->v6_out = 1;
 		if (sp->action == R2DP_ACT_PROTECT &&
 		    (ds = sa_by_policy_ix(d, ov, nov, sp)) != NULL) {
 			p->sa_idx = (int32_t)ds->idx;

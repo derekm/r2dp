@@ -686,6 +686,11 @@ dpd_start(struct fwd_dp *dp)
 	}
 	if (port_init(d, d->port_id, d->nb_wk) < 0)
 		return -rte_errno;
+	{
+		uint16_t mtu = 0;
+		if (rte_eth_dev_get_mtu(d->port_id, &mtu) == 0)
+			d->out_mtu = mtu;
+	}
 	/* inner (plaintext) tap is optional: single-tap mode (interop lab,
 	 * control-only) has only the outer port */
 	if (d->inner_port >= 0 && port_init(d, d->inner_port, d->nb_wk) < 0) {
