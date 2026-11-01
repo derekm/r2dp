@@ -17,3 +17,8 @@ endif
 if dpdk.found()
   e2e_tgen = executable('e2e_tgen', 'e2e_tgen.c', dependencies: dpdk)
 endif
+
+# Reproducible sweep (build dir = this one): `meson compile -C BUILD bench`
+# or bench/run.sh directly; see bench/README.md.
+run_target('bench', command: [find_program('run.sh'), '--no-build'],
+  env: {'BUILD': meson.project_build_root()})

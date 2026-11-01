@@ -39,7 +39,7 @@
 #include <rte_lcore.h>
 
 #define BURST   32
-#define MAXTUN  1024
+#define MAXTUN  16384
 #define MAGIC   0x52324450u          /* "R2DP" */
 #define PL_OFF  (14 + 20 + 8)        /* payload offset in the frame */
 
@@ -311,7 +311,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "e2e_tgen: need 2 ports and 1..%d tunnels\n", MAXTUN);
 		return 2;
 	}
-	mp = rte_pktmbuf_pool_create("tg", 16383, 256, 0, 2048 + 128, rte_socket_id());
+	mp = rte_pktmbuf_pool_create("tg", 16383 + (unsigned)ntun, 256, 0, 2048 + 128, rte_socket_id());
 	if (!mp) { fprintf(stderr, "mempool\n"); return 1; }
 	memset(&conf, 0, sizeof(conf));
 	for (uint16_t p = 0; p < 2; p++) {

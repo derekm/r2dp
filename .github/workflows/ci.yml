@@ -76,11 +76,17 @@ jobs:
             build-dpdk/bench/fwd_bench --pmd $pmd --json bench-$pmd.json
           done
           build-dpdk/bench/fwd_bench --workers 2 --json bench-workers2.json
+      - name: Benchmark entry point smoke (bench/run.sh --quick)
+        run: |
+          BUILD=build-dpdk OUT=bench-smoke bench/run.sh --quick --no-build
+          test -s bench-smoke/summary.csv && test -s bench-smoke/env.json
       - name: Upload benchmark JSON
         uses: actions/upload-artifact@v4
         with:
           name: fwd-bench
-          path: bench-*.json
+          path: |
+            bench-*.json
+            bench-smoke/
       - name: ASan+UBSan data plane
         run: |
           meson setup build-dpkasan --buildtype=debug -Denable_dpdk=enabled \

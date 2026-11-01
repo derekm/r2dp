@@ -8,9 +8,9 @@
 # Usage: bench/e2e_bench.sh BUILD_DIR
 #   W=1|2|4 workers per forwarder (W > 1 adds a dispatcher lcore); both
 #   forwarders get W, since their memif link needs equal queue counts
-#   NTUN=1..1000 tunnels (each its own peer address 203.0.113.1 + t, so
+#   NTUN=1..16384 tunnels (each its own peer address 203.0.113.1 + t, so
 #   they spread over
-#   workers), NATT=1 ESP-in-UDP SAs, SIZES=64,512,1400,1514 (Ethernet
+#   workers), NATT=1 ESP-in-UDP SAs, SIZES=64,512,1400 (Ethernet
 #   frame bytes), SECS=2 per trial, LOSS=0.001 (no-loss threshold)
 #   CPU placement: TG_CPUS="0,1" (tx,rx) A_CPUS="2" B_CPUS="3" (workers then
 #   dispatcher, one CPU each) MAIN_CPUS="6-7" (control threads, idle)
@@ -22,7 +22,7 @@
 set -u
 B=${1:?build dir}
 FWD=$B/fwd/r2dp-fwd; CTL=$B/r2dpctl; TG=$B/bench/e2e_tgen
-W=${W:-1}; B_W=$W; NTUN=${NTUN:-1}; NATT=${NATT:-0}; SIZES=${SIZES:-64,512,1400,1514}
+W=${W:-1}; B_W=$W; NTUN=${NTUN:-1}; NATT=${NATT:-0}; SIZES=${SIZES:-64,512,1400}
 SECS=${SECS:-2}; LOSS=${LOSS:-0.001}
 TG_CPUS=${TG_CPUS:-0,1}; MAIN_CPUS=${MAIN_CPUS:-6-7}
 A_CPUS=${A_CPUS:-2}; B_CPUS=${B_CPUS:-3}
@@ -41,7 +41,9 @@ for x in "$W:$A_CPUS" "$B_W:$B_CPUS"; do
 	w=${x%%:*}; need=$(( w > 1 ? w + 1 : 1 ))
 	[ "$(echo "${x#*:}" | tr ',' ' ' | wc -w)" -ge $need ] || { echo "need $need CPUs for $w workers (A_CPUS/B_CPUS)"; exit 2; }
 done
-EAL="--no-huge -m 1024 --no-pci --no-telemetry --vdev=crypto_aesni_mb0 --log-level=lib.*:error"
+# PMD=aesni_mb|openssl (crypto PMD), HUGE=1: use hugepages (default --no-huge)
+PMD=${PMD:-aesni_mb}; MEM="--no-huge -m 1024"; [ "${HUGE:-0}" = 1 ] && MEM="-m 1024"
+EAL="$MEM --no-pci --no-telemetry --vdev=crypto_${PMD}0 --log-level=lib.*:error"
 if [ "${LOOP:-0}" != 1 ]; then
 "$FWD" -s "$D/a.sock" -n "$W" --lcores "$(lcores "$A_CPUS")" $EAL --file-prefix r2a$$ \
 	--vdev=net_memif0,role=server,socket=$D/ab.sock \
@@ -61,7 +63,7 @@ done
 K=000102030405060708090a0b0c0d0e0f10111213
 NT=""; [ "$NATT" = 1 ] && NT="natt=4500:4500"
 for t in $(seq 0 $((NTUN - 1))); do
-	[ $t -ge 1000 ] && { echo "NTUN <= 1000"; exit 2; }
+	[ $t -ge 16384 ] && { echo "NTUN <= 16384"; exit 2; }
 	n=$((0xcb007101 + t)); P=$((n >> 24 & 255)).$((n >> 16 & 255)).$((n >> 8 & 255)).$((n & 255))
 	S=10.$((2 + 2 * (t >> 8))).$((t & 255)).0/24; R=10.$((1 + 2 * (t >> 8))).$((t & 255)).0/24
 	SPI=$(printf 0x%x $((0x2000 + t)))
@@ -91,7 +93,7 @@ fi
 TC=${TG_CPUS%%,*}; RC=${TG_CPUS##*,}
 for SZ in ${SIZES//,/ }; do
 	[ "${LOOP:-0}" = 1 ] || { CA0=($(ctr a)); CB0=($(ctr b)); }
-	J=$("$TG" --lcores "0@$TC,1@$RC" --no-huge -m 1024 --no-pci --no-telemetry --file-prefix r2t$$ \
+	J=$("$TG" --lcores "0@$TC,1@$RC" $MEM --no-pci --no-telemetry --file-prefix r2t$$ \
 		--log-level=lib.*:error $TGV -- \
 		--sizes "$SZ" --tunnels "$NTUN" --secs "$SECS" --loss "$LOSS" --rxq "$(( W > B_W ? W : B_W ))" ${TG_ARGS:-} 2>"$D/tg.err" | grep "^{")
 	X=""
