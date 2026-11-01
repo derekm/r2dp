@@ -238,6 +238,13 @@ main(void)
 		CHECK(!run(a, b, m, &enc, got) && !enc, "PROTECT without SA -> drop");
 	}
 
+	/* AH / IPComp SAs are refused, not installed as ESP (upstream
+	 * prototype's check) */
+	mk_sa(&r, 0x5abc); r.dir = R2DP_DIR_OUT; r.proto = R2DP_PROTO_AH;
+	CHECK(sa_install(a, &r, key, 20, 0, 0) == -EOPNOTSUPP && a->sa_n == 0,
+	    "AH SA refused (EOPNOTSUPP), nothing installed");
+	r.proto = R2DP_PROTO_IPCOMP;
+	CHECK(sa_install(a, &r, key, 20, 0, 0) == -EOPNOTSUPP, "IPComp SA refused");
 	mk_sa(&r, 0x5001); r.dir = R2DP_DIR_OUT;
 	CHECK(sa_install(a, &r, key, 20, 0, 0) == 0, "A: egress SA installed");
 	mk_sa(&r, 0x5001); r.dir = R2DP_DIR_IN;

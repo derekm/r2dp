@@ -242,6 +242,11 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 	 * and silently misbehaving.  M1 is IPv4 AES-GCM tunnel; NAT-T (ESP-in-UDP
 	 * 4500) is now handled by the outer-tap demux (uf1), so a NAT-T SA is
 	 * acceptable -- its ESP decrypts the same way after the encap is stripped. */
+	/* only ESP: an AH (or IPComp) SA would otherwise be installed as
+	 * ESP-GCM -- different protection than asked for (the upstream
+	 * prototype refuses it the same way) */
+	if (rsa->proto != R2DP_PROTO_ESP)
+		return -EOPNOTSUPP;
 	if (rsa->natt_type != R2DP_NATT_NONE &&
 	    rsa->natt_type != R2DP_NATT_ESPINUDP)
 		return -EOPNOTSUPP;              /* unknown NAT-T encapsulation */
