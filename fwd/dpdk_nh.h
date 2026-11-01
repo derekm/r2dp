@@ -7,8 +7,8 @@
  * lcore, with no limit on the number of tunnels: it grows.
  *
  * Loss-free by construction -- a learned entry is never removed by
- * capacity pressure, only by an explicit r2dp_nh_del (peer deleted by the
- * control plane) or replaced in place by a MAC change:
+ * capacity pressure, only by an explicit r2dp_nh_del (the policy snapshot
+ * rebuild calls it when the last SA/policy naming the peer is deleted) or replaced in place by a MAC change:
  *
  *   - Readers (packet workers) acquire-load the published table pointer
  *     once per burst and look up lock-free (rte_hash with

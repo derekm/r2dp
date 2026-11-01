@@ -624,6 +624,38 @@ sa_by_policy_ix(struct dpdk_priv *d, const struct ep_ent *v, uint32_t n,
 	return by_reqid ? by_reqid : by_endpoint;
 }
 
+static int
+peer_has(const struct dp_spd *s, uint32_t ip)
+{
+	if (ip == 0)
+		return s->peer_zero;
+	for (uint32_t h = peer_hash(ip) & s->peer_mask; s->peer[h];
+	    h = (h + 1) & s->peer_mask)
+		if (s->peer[h] == ip)
+			return 1;
+	return 0;
+}
+
+/* Next hops follow tunnel peers: a peer that the previous snapshot had
+ * (some live SA or PROTECT policy referenced it) and the new one lacks has
+ * lost its last reference, so its learned MAC goes.  The peer set is
+ * recomputed from the tables on every rebuild, which is the reference
+ * count without one to drift; a peer still used by any SA or policy is
+ * never touched.  The table recycles the slot after a QSBR grace period;
+ * a worker that still resolves the peer finds the old MAC or none. */
+static void
+spd_peers_gone(struct dpdk_priv *d, const struct dp_spd *old,
+    const struct dp_spd *ns)
+{
+	if (!d->nh.h)
+		return;
+	for (uint32_t h = 0; h <= old->peer_mask; h++) {
+		uint32_t ip = old->peer[h];
+		if (ip && !peer_has(ns, ip) && r2dp_nh_del(&d->nh, ip) > 0)
+			d->n_nh_unref++;
+	}
+}
+
 int
 spd_rebuild_ex(struct dpdk_priv *d, int policies_changed)
 {
@@ -697,6 +729,7 @@ spd_rebuild_ex(struct dpdk_priv *d, int policies_changed)
 	if (old) {
 		if (d->rcu)
 			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+		spd_peers_gone(d, old, ns);
 		spd_free(old);       /* drops its classifier reference */
 	}
 	return 0;
@@ -865,15 +898,7 @@ is_tunnel_peer(struct dpdk_priv *d, uint32_t ip)
 {
 	const struct dp_spd *s = __atomic_load_n(&d->spd, __ATOMIC_ACQUIRE);
 
-	if (!s)
-		return 0;
-	if (ip == 0)
-		return s->peer_zero;
-	for (uint32_t h = peer_hash(ip) & s->peer_mask; s->peer[h];
-	    h = (h + 1) & s->peer_mask)
-		if (s->peer[h] == ip)
-			return 1;
-	return 0;
+	return s ? peer_has(s, ip) : 0;
 }
 
 #endif /* R2DP_HAVE_DPDK */

@@ -26,6 +26,7 @@ static struct rte_mempool *mp;
 static int cdev = -1;
 static struct dpdk_priv *A, *B;
 static uint32_t ready;              /* tunnels [0, ready) installed */
+static uint32_t lo;                 /* ... and not yet deleted below lo */
 static volatile int stop;
 static uint64_t n_ok, n_bad;
 
@@ -73,6 +74,9 @@ mk_priv(const char *tag)
 	d->sad_cap = 64;                    /* grows from here */
 	if (!d->sess_mp || !d->cop_mp || !d->sad)
 		return NULL;
+	snprintf(n, sizeof(n), "%s_nh", tag);
+	if (r2dp_nh_init(&d->nh, n, 8, d->rcu, SOCKET_ID_ANY))
+		return NULL;
 	rte_spinlock_init(&d->lock);
 	return d;
 }
@@ -84,6 +88,7 @@ free_priv(struct dpdk_priv *d)
 		if (sa_at(d, i)->used)
 			sa_slot_free(d, sa_at(d, i));
 	spd_teardown(d);
+	r2dp_nh_free(&d->nh);
 	rte_ipsec_sad_destroy(d->sad);
 	rte_mempool_free(d->sess_mp);
 	dp_tables_free(d);
@@ -134,6 +139,37 @@ add_tunnel(uint32_t t)
 	sp.dir = R2DP_DIR_IN;
 	e = e ? e : dpd_sp_add(&db, &sp);
 	return e;
+}
+
+/* Remove tunnel t: both SAs and both policies (sa_only: A's SA only). */
+static void
+del_tunnel(uint32_t t, int sa_only)
+{
+	struct fwd_dp da = { .priv = A }, db = { .priv = B };
+	struct r2dp_sa r;
+	struct r2dp_sp sp;
+	uint32_t p = peer_of(t);
+
+	memset(&r, 0, sizeof(r));
+	r.proto = R2DP_PROTO_ESP; r.spi = htonl(0x10000 + t);
+	r.src.family = r.dst.family = R2DP_AF_INET4;
+	inet_pton(AF_INET, "192.0.2.1", r.src.addr);
+	memcpy(r.dst.addr, &p, 4);
+	memset(&sp, 0, sizeof(sp));
+	sp.slid = t + 1;
+	sa_install(A, &r, NULL, 0, 1, 0);
+	if (sa_only)
+		return;
+	dpd_sp_del(&da, &sp);
+	sa_install(B, &r, NULL, 0, 1, 1);
+	dpd_sp_del(&db, &sp);
+}
+
+static int
+nh_known(uint32_t t)
+{
+	uint8_t mac[6];
+	return r2dp_nh_lookup(&A->nh, peer_of(t), mac);
 }
 
 /* one packet of tunnel t, A -> B; 1 if it came out intact */
@@ -190,9 +226,10 @@ traffic(void *arg)
 	rte_rcu_qsbr_thread_online(B->rcu, me);
 	while (!__atomic_load_n(&stop, __ATOMIC_ACQUIRE)) {
 		uint32_t n = __atomic_load_n(&ready, __ATOMIC_ACQUIRE);
-		if (n) {
+		uint32_t l = __atomic_load_n(&lo, __ATOMIC_ACQUIRE);
+		if (n > l) {
 			x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-			if (send_one((uint32_t)(x % n)))
+			if (send_one(l + (uint32_t)(x % (n - l))))
 				n_ok++;
 			else
 				n_bad++;
@@ -292,6 +329,58 @@ main(void)
 		int r = add_tunnel(t);
 		if (r == -EEXIST || r == 0) r = 0;
 		CHECK(r == 0 || r == -EEXIST, "install succeeds again once memory is back");
+	}
+	/* Next hops follow their peers' last reference.  Learn a MAC for
+	 * every peer (the table grows from 8), then, with traffic running on
+	 * the rest: delete tunnels [0, 1000) entirely and only the SA of
+	 * tunnel 1000 (its OUT policy still names the peer). */
+	{
+		static const uint8_t mac[6] = { 2, 0, 0, 0, 0, 1 };
+		uint32_t n = ready, gone = 0, kept = 0, del = n > 2000 ? 1000 : n / 2;
+		uint64_t ok0, bad0, unref0 = A->n_nh_unref;
+
+		for (uint32_t t = 0; t < n; t++)
+			while (r2dp_nh_learn(&A->nh, peer_of(t), mac) == 4 ||
+			    A->nh.npend)
+				r2dp_nh_maint(&A->nh);
+		for (int i = 0; i < 4; i++)
+			r2dp_nh_maint(&A->nh);
+		snprintf(msg, sizeof(msg), "next hops learned for all %u peers "
+		    "(table grown to %u)", n, A->nh.cap);
+		CHECK(A->nh.n == n, msg);
+		__atomic_store_n(&lo, del + 1, __ATOMIC_RELEASE);
+		t0 = now_s();
+		while (now_s() - t0 < 0.05)
+			rte_pause();
+		ok0 = n_ok; bad0 = n_bad;
+		for (uint32_t t = 0; t < del; t++)
+			del_tunnel(t, 0);
+		del_tunnel(del, 1);
+		for (uint32_t t = 0; t < del; t++)
+			gone += !nh_known(t);
+		for (uint32_t t = del; t < n; t++)
+			kept += nh_known(t);
+		snprintf(msg, sizeof(msg), "deleting %u tunnels removed exactly "
+		    "their %u next hops (unref_del %llu)", del, gone,
+		    (unsigned long long)(A->n_nh_unref - unref0));
+		CHECK(gone == del && A->n_nh_unref - unref0 == del, msg);
+		snprintf(msg, sizeof(msg), "peers still referenced keep their "
+		    "next hop (%u/%u, incl. one with only a policy left)", kept,
+		    n - del);
+		CHECK(kept == n - del, msg);
+		snprintf(msg, sizeof(msg), "live tunnels forwarded throughout the "
+		    "deletes (%llu intact, %llu lost)",
+		    (unsigned long long)(n_ok - ok0),
+		    (unsigned long long)(n_bad - bad0));
+		CHECK(n_ok > ok0 && n_bad == bad0, msg);
+		{
+			struct fwd_dp da = { .priv = A };
+			struct r2dp_sp sp;
+			memset(&sp, 0, sizeof(sp));
+			sp.slid = del + 1;
+			dpd_sp_del(&da, &sp);
+		}
+		CHECK(!nh_known(del), "last reference (the policy) gone -> next hop gone");
 	}
 	__atomic_store_n(&stop, 1, __ATOMIC_RELEASE);
 	rte_eal_mp_wait_lcore();

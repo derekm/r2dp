@@ -183,7 +183,12 @@ into per-backend protocol forks.
   after a QSBR grace period.  If growth cannot allocate, the current table
   keeps serving and the new peer waits on a retried pending list.
   `--nh-size` sets the initial size (default 1024).  Stats:
-  `nexthop peers/cap/grows/grow_fail/pending/q_drop`.  (Replaced a
+  `nexthop peers/cap/grows/grow_fail/pending/q_drop/unref_del`.  A next
+  hop is deleted when its peer loses its last reference: every policy
+  snapshot rebuild compares the old and new tunnel-peer sets (computed
+  from the live SAs and PROTECT policies, so the count cannot drift) and
+  removes the MACs of peers that dropped out; the slot is recycled after a
+  QSBR grace period.  (Replaced a
   64-entry linear-scan table under a seqlock, which blackholed the 65th
   peer's egress.)
 - **SA/SP capacity**: no fixed SA or policy limit (was 1024 each).  The

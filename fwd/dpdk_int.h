@@ -300,6 +300,7 @@ struct dpdk_priv {
 	uint64_t            n_spd_fail; /* snapshot rebuilds that failed (ENOMEM) */
 	uint64_t            n_acl_build;  /* OUT classifier (re)builds */
 	uint64_t            n_acl_reuse;  /* snapshots that kept the classifier */
+	uint64_t            n_nh_unref;   /* next hops removed with their last SA/SP */
 	uint64_t            sp_ver;       /* dp_sp_ent.ver source */
 	uint64_t            spd_dirty_tsc; /* last policy change (0: compacted) */
 	int                 verbose;
