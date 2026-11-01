@@ -13,6 +13,7 @@
  *
  * SKIP (77) without EAL/crypto_openssl unless R2DP_REQUIRE_DPDK is set.
  */
+#include "lc_sync.h"
 #include "dpdk_int.h"
 
 static int fails;
@@ -95,7 +96,7 @@ reader(void *arg)
 
 	rte_rcu_qsbr_thread_register(d->rcu, d->wk[0].lcore);
 	rte_rcu_qsbr_thread_online(d->rcu, d->wk[0].lcore);
-	while (!rd_stop) {
+	while (!__atomic_load_n(&rd_stop, __ATOMIC_ACQUIRE)) {
 		for (int i = 0; i < 8 && i < (int)sp_cap(d); i++) {
 			const struct r2dp_sp *sp = sp_load(sp_at(d, (uint32_t)i));
 			uint8_t k;
@@ -121,7 +122,7 @@ reader(void *arg)
 					rd_torn++;
 			}
 		}
-		rd_iters++;
+		__atomic_fetch_add(&rd_iters, 1, __ATOMIC_RELAXED);
 		rte_rcu_qsbr_quiescent(d->rcu, d->wk[0].lcore);
 	}
 	rte_rcu_qsbr_thread_offline(d->rcu, d->wk[0].lcore);
@@ -144,7 +145,7 @@ t_sp_concurrency(struct dpdk_priv *d)
 	rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
 	rd_stop = 0;
 	/* run the reader on a real EAL worker lcore, like worker_main */
-	rte_eal_remote_launch(reader, d, lc);
+	lc_launch(reader, d, lc);
 	while (!__atomic_load_n(&rd_iters, __ATOMIC_RELAXED))
 		;                       /* reader online before churn */
 	for (unsigned n = 0; n < 5000; n++) {
@@ -155,8 +156,8 @@ t_sp_concurrency(struct dpdk_priv *d)
 		else
 			dpd_sp_add(&dp, &sp);
 	}
-	rd_stop = 1;
-	rte_eal_wait_lcore(lc);
+	__atomic_store_n(&rd_stop, 1, __ATOMIC_RELEASE);
+	lc_wait_all();
 	CHECK(rd_iters > 0, "reader ran concurrently with policy churn");
 	CHECK(rd_torn == 0, "no torn policy reads under concurrent replace/delete");
 	spd_teardown(d);

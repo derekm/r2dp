@@ -14,6 +14,7 @@
  * Exit 77 (skip) without EAL/crypto_openssl or lcores unless
  * R2DP_REQUIRE_DPDK=1.
  */
+#include "lc_sync.h"
 #include "dpdk_int.h"
 
 #define NW     3
@@ -174,7 +175,7 @@ enc_worker(void *arg)
 	unsigned w = self_id();
 
 	(void)arg;
-	while (!go)
+	while (!__atomic_load_n(&go, __ATOMIC_ACQUIRE))
 		rte_pause();
 	for (int r = 0; r < ROUNDS; r++) {
 		struct rte_mbuf *in[BURST], *out[BURST];
@@ -200,7 +201,7 @@ dec_worker(void *arg)
 {
 	unsigned w = self_id(), n = *(unsigned *)arg;
 
-	while (!go)
+	while (!__atomic_load_n(&go, __ATOMIC_ACQUIRE))
 		rte_pause();
 	for (unsigned i = 0; i < n; i += BURST) {
 		struct rte_mbuf *o[BURST_SZ];
@@ -219,16 +220,16 @@ offer_all(struct rte_mbuf **all, unsigned nall)
 {
 	unsigned lc, tot = 0;
 
-	go = 0;
+	__atomic_store_n(&go, 0, __ATOMIC_RELAXED);
 	for (unsigned w = 0; w < NW; w++) {
 		n_acc[w] = 0;
 		for (unsigned i = 0; i < nall; i++)
 			esp_in[w][i] = rte_pktmbuf_copy(all[i], mp, 0, UINT32_MAX);
 	}
 	RTE_LCORE_FOREACH_WORKER(lc)
-		rte_eal_remote_launch(dec_worker, &nall, lc);
-	go = 1;
-	rte_eal_mp_wait_lcore();
+		lc_launch(dec_worker, &nall, lc);
+	__atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+	lc_wait_all();
 	for (unsigned w = 0; w < NW; w++)
 		tot += n_acc[w];
 	return tot;
@@ -283,11 +284,11 @@ main(void)
 	CHECK(owners_used == (1u << NW) - 1, "tunnels spread over every worker");
 
 	/* 1. concurrent encrypt: every worker offered every tunnel */
-	go = 0;
+	__atomic_store_n(&go, 0, __ATOMIC_RELAXED);
 	RTE_LCORE_FOREACH_WORKER(lc)
-		rte_eal_remote_launch(enc_worker, NULL, lc);
-	go = 1;
-	rte_eal_mp_wait_lcore();
+		lc_launch(enc_worker, NULL, lc);
+	__atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+	lc_wait_all();
 	for (unsigned w = 0; w < NW; w++)
 		for (unsigned i = 0; i < n_out[w]; i++) {
 			const uint8_t *p = rte_pktmbuf_mtod(esp_out[w][i], const uint8_t *);

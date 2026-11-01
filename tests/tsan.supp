@@ -1,0 +1,18 @@
+# ThreadSanitizer suppressions for the DPDK libraries (not instrumented).
+# Build: meson setup btsan -Db_sanitize=thread -Db_lundef=false -Dc_args=-DRTE_FORCE_INTRINSICS
+# Run:   TSAN_OPTIONS=suppressions=$PWD/tests/tsan.supp meson test -C btsan
+# librte_eal is left out on purpose: its frames sit at the bottom of every lcore stack.
+called_from_lib:librte_acl.so
+called_from_lib:librte_cryptodev.so
+called_from_lib:librte_hash.so
+called_from_lib:librte_ipsec.so
+called_from_lib:librte_kvargs.so
+called_from_lib:librte_log.so
+called_from_lib:librte_mbuf.so
+called_from_lib:librte_mempool.so
+called_from_lib:librte_net.so
+called_from_lib:librte_rcu.so
+called_from_lib:librte_ring.so
+called_from_lib:librte_security.so
+called_from_lib:librte_telemetry.so
+race:^rte_

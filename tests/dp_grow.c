@@ -15,6 +15,7 @@
  */
 #include <time.h>
 
+#include "lc_sync.h"
 #include "dpdk_int.h"
 
 static int fails;
@@ -28,7 +29,9 @@ static struct dpdk_priv *A, *B;
 static uint32_t ready;              /* tunnels [0, ready) installed */
 static uint32_t lo;                 /* ... and not yet deleted below lo */
 static volatile int stop;
-static uint64_t n_ok, n_bad;
+static uint64_t n_ok_, n_bad_;   /* worker-written, read live by main */
+#define n_ok  __atomic_load_n(&n_ok_, __ATOMIC_RELAXED)
+#define n_bad __atomic_load_n(&n_bad_, __ATOMIC_RELAXED)
 
 static double
 now_s(void)
@@ -236,9 +239,9 @@ traffic(void *arg)
 		if (n > l) {
 			x ^= x << 13; x ^= x >> 7; x ^= x << 17;
 			if (send_one(l + (uint32_t)(x % (n - l))))
-				n_ok++;
+				__atomic_fetch_add(&n_ok_, 1, __ATOMIC_RELAXED);
 			else
-				n_bad++;
+				__atomic_fetch_add(&n_bad_, 1, __ATOMIC_RELAXED);
 		}
 		rte_rcu_qsbr_quiescent(A->rcu, me);
 		rte_rcu_qsbr_quiescent(B->rcu, me);
@@ -281,7 +284,7 @@ main(void)
 	if (!mp || !A || !B) { puts("setup FAILED"); return 1; }
 
 	lc = rte_get_next_lcore(-1, 1, 0);
-	rte_eal_remote_launch(traffic, NULL, lc);
+	lc_launch(traffic, NULL, lc);
 	t0 = now_s();
 	for (uint32_t t = 0; t < nt && !e; t++) {
 		e = add_tunnel(t);
@@ -411,7 +414,7 @@ main(void)
 		}
 	}
 	__atomic_store_n(&stop, 1, __ATOMIC_RELEASE);
-	rte_eal_mp_wait_lcore();
+	lc_wait_all();
 	free_priv(A);
 	free_priv(B);
 	rte_mempool_free(mp);

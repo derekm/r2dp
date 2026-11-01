@@ -26,6 +26,7 @@
 #include <rte_cycles.h>
 #include <rte_rcu_qsbr.h>
 
+#include "lc_sync.h"
 #include "dpdk_nh.h"
 
 #define NR      3             /* reader lcores */
@@ -203,7 +204,7 @@ grow_under_traffic(void)
 	RTE_LCORE_FOREACH_WORKER(lc) {
 		if (nl == NR)
 			break;
-		rte_eal_remote_launch(reader, NULL, lc);
+		lc_launch(reader, NULL, lc);
 		nl++;
 	}
 	/* the learner is a QSBR reader too, like the dispatcher lcore */
@@ -241,7 +242,7 @@ grow_under_traffic(void)
 	rte_rcu_qsbr_thread_offline(rcu, me);
 	rte_rcu_qsbr_thread_unregister(rcu, me);
 	__atomic_store_n(&stop, 1, __ATOMIC_RELEASE);
-	rte_eal_mp_wait_lcore();
+	lc_wait_all();
 	r2dp_nh_stop(&gt);
 	for (unsigned i = 0; i < RTE_MAX_LCORE; i++) {
 		hits += r_hits[i];
