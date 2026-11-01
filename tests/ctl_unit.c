@@ -56,9 +56,20 @@ fk_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 	return fk_bytes;
 }
 
+static int fk_hard_calls;
+static uint64_t fk_hard;
+static int
+fk_sa_set_hard_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
+    uint64_t hard)
+{
+	(void)dp; (void)spi; (void)dip;
+	fk_hard_calls++; fk_hard = hard;
+	return 0;
+}
+
 static const struct fwd_dp_ops fk_ops = {
 	.sa_add = fk_sa_add, .sp_add = fk_sp_add, .sp_del = fk_sp_del,
-	.sa_bytes = fk_sa_bytes,
+	.sa_bytes = fk_sa_bytes, .sa_set_hard_bytes = fk_sa_set_hard_bytes,
 };
 
 static struct fwd_ctl ctl;
@@ -238,6 +249,15 @@ t_lifetime_clock(void)
 		mk_sa(&sa, 0x9001); sa.lft_hard_time = 300; sa.natt_sport = htons(500);
 		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == 0,
 		    "NAT-T ports ignored on a non-NAT-T SA (iked sends 500)");
+		/* the dataplane enforces the hard byte limit itself, so a
+		 * lifetime-only UPDATE that changes it must reach it */
+		fk_hard_calls = 0;
+		mk_sa(&sa, 0x9001); sa.lft_hard_time = 300; sa.lft_hard_bytes = 1u << 20;
+		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == 0 &&
+		    fk_hard_calls == 1 && fk_hard == (1u << 20),
+		    "lifetime-only UPDATE pushes a new hard byte limit to the dataplane");
+		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == 0 &&
+		    fk_hard_calls == 1, "unchanged hard byte limit is not pushed again");
 	}
 }
 

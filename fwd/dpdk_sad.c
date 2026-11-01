@@ -452,6 +452,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	    rte_cpu_to_be_16(NATT_PORT);
 	nd->natt_dport = rsa->natt_dport ? rsa->natt_dport :
 	    rte_cpu_to_be_16(NATT_PORT);
+	nd->hard_bytes = rsa->lft_hard_bytes;
 	nd->gen = ++d->sa_gen;
 	/* publish last: the worker only proceeds past `used` == 1 */
 	__atomic_store_n(&nd->used, 1, __ATOMIC_RELEASE);
@@ -528,6 +529,24 @@ dpd_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 	}
 	rte_spinlock_unlock(&d->lock);
 	return v;
+}
+
+int
+dpd_sa_set_hard_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
+    uint64_t hard)
+{
+	struct dpdk_priv *d = dp->priv;
+	int rc = -ENOENT;
+	rte_spinlock_lock(&d->lock);
+	for (uint32_t i = 0; i < d->sa_cap; i++) {
+		struct dp_sa *x = sa_at(d, i);
+		if (x->used && x->spi == spi && x->dip == dip) {
+			__atomic_store_n(&x->hard_bytes, hard, __ATOMIC_RELAXED);
+			rc = 0;
+		}
+	}
+	rte_spinlock_unlock(&d->lock);
+	return rc;
 }
 
 /* Recover the dp_sa owning an ipsec session handed back by the SAD. */

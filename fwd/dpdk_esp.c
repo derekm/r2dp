@@ -427,6 +427,16 @@ bad:
 		while (j < nk && sas[j] == ss)
 			j++;
 		uint64_t rb = 0;        /* this run's bytes, one counter update */
+		{
+			const struct dp_sa *xs = sa_of_sess(d, ss);
+			if (xs && sa_dead(xs)) {
+				DROP(w, DR_EXPIRED, j - i);
+				for (uint32_t k = i; k < j; k++)
+					rte_pktmbuf_free(pm[k]);
+				i = j;
+				continue;
+			}
+		}
 
 		ng = crypto_run(w, ss, &pm[i], (uint16_t)(j - i), ok);
 		for (uint16_t k = 0; k < ng; k++) {
@@ -624,6 +634,13 @@ drop:
 		while (j < nm && pds[j] == ds)
 			j++;
 		uint64_t rb = 0;        /* this run's bytes, one counter update */
+		if (sa_dead(ds)) {
+			DROP(w, DR_EXPIRED, j - i);
+			for (uint16_t k = i; k < j; k++)
+				rte_pktmbuf_free(pm[k]);
+			i = j;
+			continue;
+		}
 
 		ng = crypto_run(w, &ds->sess, &pm[i], j - i, ok);
 		for (uint16_t k = 0; k < ng; k++) {

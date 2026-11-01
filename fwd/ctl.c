@@ -525,6 +525,17 @@ do_sa(int fd, const struct r2dp_msg *m)
 				goto out;
 			}
 		}
+		/* the dataplane drops on an SA past its hard byte limit by
+		 * itself, so a new limit must reach it (or a raised one would
+		 * lose packets the SA may still carry) */
+		if (!e->larval && !blen &&
+		    rq->lft_hard_bytes != e->sa.lft_hard_bytes &&
+		    C->dp.ops && C->dp.ops->sa_set_hard_bytes) {
+			uint32_t ndip;
+			memcpy(&ndip, &e->sa.dst.addr, 4);
+			(void)C->dp.ops->sa_set_hard_bytes(&C->dp,
+			    ntohl(e->sa.spi), ndip, rq->lft_hard_bytes);
+		}
 		e->inbound = sa_is_inbound(e, rq);
 		/* The lifetime clock starts when key material is installed (the
 		 * larval promotion).  A lifetime-only UPDATE of a live SA must not

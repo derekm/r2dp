@@ -89,6 +89,9 @@ struct dp_sa {
 	uint64_t           gen;      /* install generation (monotonic): the
 	                              * newest of several SAs for one tunnel is
 	                              * the post-rekey SA egress must use */
+	uint64_t           hard_bytes; /* hard byte lifetime, 0 = none: past it
+	                              * the worker drops (SA dead), as the
+	                              * upstream prototype does, not only ctl */
 	uint64_t           bytes;    /* total bytes crypted on this SA (soft/hard
 	                              * byte lifetime accounting, young seq) */
 	/* Our own anti-replay window (inbound SAs, worker-only state), checked
@@ -151,6 +154,7 @@ enum dp_drop {
 	DR_STEER,           /* SA owned by another worker, or worker ring full */
 	DR_TOO_BIG,         /* ESP packet would exceed the outer port's MTU */
 	DR_V6_POLICY,       /* inner IPv6 while IPv6 policies exist (no v6 ESP) */
+	DR_EXPIRED,         /* SA past its hard byte lifetime (dead) */
 	DR_NUM
 };
 #define DROP(w, r, n) do { uint64_t n_ = (n); (w)->n_drop += n_; \
@@ -404,6 +408,15 @@ sa_bytes_add(struct dpdk_priv *d, struct rte_ipsec_session *ss, uint64_t n)
 }
 
 extern const char *const dp_drop_name[DR_NUM];
+
+/* Hard byte lifetime reached: the SA is dead in the data path at once,
+ * whatever the ctl poll interval (other SAs are unaffected). */
+static inline int
+sa_dead(const struct dp_sa *ds)
+{
+	uint64_t h = __atomic_load_n(&ds->hard_bytes, __ATOMIC_RELAXED);
+	return h && __atomic_load_n(&ds->bytes, __ATOMIC_RELAXED) >= h;
+}
 /* natt_class() results (dpdk_esp.c). */
 enum { NT_NONE, NT_ESP, NT_IKE, NT_KEEPALIVE };
 
@@ -425,6 +438,9 @@ dpd_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
     const void *blob, size_t blen);
 int64_t
 dpd_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip);
+int
+dpd_sa_set_hard_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
+    uint64_t hard);
 struct dp_sa *
 sa_of_sess(struct dpdk_priv *d, struct rte_ipsec_session *ss);
 

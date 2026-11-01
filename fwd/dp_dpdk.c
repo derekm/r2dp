@@ -1012,6 +1012,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	dpdk_ops.caps   = dpdk_caps;
 	dpdk_ops.sa_add = dpd_sa_add;
 	dpdk_ops.sa_bytes = dpd_sa_bytes;
+	dpdk_ops.sa_set_hard_bytes = dpd_sa_set_hard_bytes;
 	dpdk_ops.sp_add = dpd_sp_add;
 	dpdk_ops.sp_del = dpd_sp_del;
 	dpdk_ops.start  = dpd_start;

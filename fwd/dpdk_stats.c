@@ -9,7 +9,7 @@ const char *const dp_drop_name[DR_NUM] = {
 	"malformed", "no_sa_in", "no_sa_out", "policy_discard", "inner_sel",
 	"crypto_fail", "replay", "ipsec_reject", "crypto_enq", "nomem", "no_nexthop",
 	"clear_outer", "esp_on_inner", "tx_full", "crypto_stuck",
-	"encap", "steer", "too_big", "v6_policy",
+	"encap", "steer", "too_big", "v6_policy", "expired",
 };
 
 

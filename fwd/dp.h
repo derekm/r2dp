@@ -48,6 +48,12 @@ struct fwd_dp_ops {
 	 * for byte-lifetime EXPIRE.  Returns -1 if the SA is unknown. */
 	int64_t (*sa_bytes)(struct fwd_dp *dp, uint32_t spi, uint32_t dip);
 
+	/* Optional: set the hard byte lifetime (0 = none) the dataplane
+	 * enforces itself on the SA keyed by (spi, dip), after a
+	 * lifetime-only UPDATE.  Returns -ENOENT if the SA is unknown. */
+	int (*sa_set_hard_bytes)(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
+	    uint64_t hard);
+
 	/* Optional: start/stop the datapath packet threads. */
 	int (*start)(struct fwd_dp *dp);
 	void (*stop)(struct fwd_dp *dp);

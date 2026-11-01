@@ -390,6 +390,35 @@ main(void)
 		grow_outer_len = 0;
 	}
 
+	/* Hard byte lifetime in the data path (ported from the upstream
+	 * prototype): once an SA's crypted bytes reach lft_hard_bytes the
+	 * worker drops on it as expired, without waiting for the ctl poll. */
+	{
+		static uint8_t w[64], g[64];
+		struct rte_mbuf *m;
+		for (int side = 0; side < 2; side++) {
+			struct dpdk_priv *p = side ? b : a;
+			uint64_t ex = p->wk[0].n_dropr[DR_EXPIRED];
+			for (uint32_t k = 0; k < sa_cap(p); k++) {
+				struct dp_sa *x = sa_at(p, k);
+				if (x && sa_live(x)) x->hard_bytes = x->bytes + 1;
+			}
+			m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+			CHECK(run(a, b, m, &enc, g) && !memcmp(g, w, 64),
+			    side ? "inbound SA below its hard byte limit passes"
+			         : "egress SA below its hard byte limit passes");
+			m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+			CHECK(!run(a, b, m, &enc, g) &&
+			    p->wk[0].n_dropr[DR_EXPIRED] == ex + 1,
+			    side ? "inbound SA past its hard byte limit -> expired drop"
+			         : "egress SA past its hard byte limit -> expired drop");
+			for (uint32_t k = 0; k < sa_cap(p); k++) {
+				struct dp_sa *x = sa_at(p, k);
+				if (x && sa_live(x)) x->hard_bytes = 0;
+			}
+		}
+	}
+
 	/* Inner lengths whose low byte is < 20 (256, 512, 513, 270...) were
 	 * dropped by an 8-bit truncation of the mbuf length in the IHL check. */
 	{
