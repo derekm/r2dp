@@ -186,6 +186,29 @@ into per-backend protocol forks.
   `nexthop peers/cap/grows/grow_fail/pending/q_drop`.  (Replaced a
   64-entry linear-scan table under a seqlock, which blackholed the 65th
   peer's egress.)
+- **SA/SP capacity**: no fixed SA or policy limit (was 1024 each).  The
+  control table grows by doubling; the data plane's SA and policy tables
+  are 1024-entry chunks that never move (a new chunk is release-published
+  before the capacity that exposes it), grown ahead at 75% use.  The
+  inbound `rte_ipsec_sad` has a fixed size, so it is rebuilt 2x larger to
+  the side, re-populated, published, and the old one destroyed after a
+  QSBR grace period; crypto sessions spill into extra 2048-session pools.
+  Workers keep using the old structures throughout -- growth never drops a
+  packet of a live tunnel.  If growth cannot allocate, the install is
+  refused with `ENOMEM` (nothing is half-published) and existing tunnels
+  keep forwarding; stats: `tables sa/sp/sad/sess_pools/grows/grow_fail`.
+  An SA rekey adds the new SA to the SAD (same key, overwrite) before
+  retiring the old one, so there is no window where an inbound packet
+  misses both.
+- **OUT classifier**: the `rte_acl` context is reused across snapshots
+  while the policy set drifts by at most 32 policies -- new ones are
+  matched by a short linear delta list, a hit on a deleted policy's rule
+  falls back to a scan of the sorted policy list -- and rebuilt beyond
+  that, or after 200 ms without policy changes (control-loop idle hook).
+  Installing 10000 tunnels went from O(n) `rte_acl` builds to n/32.
+  (`acl_builds`/`acl_reuse` in the stats.)  `dp_grow` grows two
+  forwarders from empty to 10000 tunnels with traffic running (0 lost),
+  then injects allocation failures.
 - **CI**: `dp_path` runs outbound encrypt → inbound decrypt through the
   production code in the DPDK lanes.
 - **Benchmark gate**: `bench/fwd_bench` measures single-core

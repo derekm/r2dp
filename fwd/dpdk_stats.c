@@ -55,6 +55,18 @@ dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 	    (unsigned long long)t.n_crypto_stuck, t.cq_stale,
 	    (unsigned long long)t.n_natt_keepalive);
 	fprintf(f, "\n");
+	fprintf(f, "r2dp-fwd: tables sa=%u/%u sp=%u/%u sad=%u/%u sess_pools=%u "
+	    "grows=%llu grow_fail=%llu acl_builds=%llu acl_reuse=%llu\n",
+	    __atomic_load_n(&d->sa_n, __ATOMIC_RELAXED), sa_cap(d),
+	    __atomic_load_n(&d->sp_n, __ATOMIC_RELAXED), sp_cap(d),
+	    __atomic_load_n(&d->sad_n, __ATOMIC_RELAXED),
+	    __atomic_load_n(&d->sad_cap, __ATOMIC_RELAXED),
+	    1 + __atomic_load_n(&d->n_sess_more, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&d->n_grow, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&d->n_grow_fail,
+	    __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&d->n_acl_build, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&d->n_acl_reuse, __ATOMIC_RELAXED));
 	fprintf(f, "r2dp-fwd: nexthop peers=%u cap=%u grows=%llu grow_fail=%llu "
 	    "pending=%u q_drop=%llu\n",
 	    __atomic_load_n(&d->nh.n, __ATOMIC_RELAXED),

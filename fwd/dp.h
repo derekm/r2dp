@@ -51,6 +51,11 @@ struct fwd_dp_ops {
 	/* Optional: start/stop the datapath packet threads. */
 	int (*start)(struct fwd_dp *dp);
 	void (*stop)(struct fwd_dp *dp);
+
+	/* Optional: called from the control loop on every pass (at least
+	 * every 500 ms) for deferred control-side work, e.g. compacting
+	 * the policy classifier.  Never on a packet thread. */
+	void (*idle)(struct fwd_dp *dp);
 };
 
 struct fwd_dp {

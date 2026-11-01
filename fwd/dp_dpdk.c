@@ -838,13 +838,13 @@ crypto_init(struct dpdk_priv *d)
 		fprintf(stderr, "r2dp-fwd: cryptodev start failed\n");
 		return -EIO;
 	}
-	d->sess_mp = rte_cryptodev_sym_session_pool_create("r2dp_sess", MAX_SA,
+	d->sess_mp = rte_cryptodev_sym_session_pool_create("r2dp_sess", DP_SESS_POOL,
 	    rte_cryptodev_sym_get_private_session_size(d->cdev_id), 0, 0,
 	    SOCKET_ID_ANY);
 	/* each worker holds at most BURST_SZ ops in flight, plus whatever a
 	 * stuck device still owns */
 	d->cop_mp = rte_crypto_op_pool_create("r2dp_cop",
-	    RTE_CRYPTO_OP_TYPE_SYMMETRIC, RTE_MAX((unsigned)MAX_SA,
+	    RTE_CRYPTO_OP_TYPE_SYMMETRIC, RTE_MAX(4096u,
 	    4u * BURST_SZ * d->nb_wk), 0, sizeof(struct rte_crypto_op) +
 	    sizeof(struct rte_crypto_sym_op) + R2DP_GCM_IV_LEN, SOCKET_ID_ANY);
 	if (!d->sess_mp || !d->cop_mp) {
@@ -885,6 +885,12 @@ ports_find(struct dpdk_priv *d)
 	}
 }
 
+static void
+dpd_idle(struct fwd_dp *dp)
+{
+	spd_idle(dp->priv);
+}
+
 int
 fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
     const char *sockpath, int verbose, int nb_workers, unsigned nh_size)
@@ -899,7 +905,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		    DP_MAX_WK);
 		return -EINVAL;
 	}
-	/* sa_tab[] holds struct rte_ipsec_session (64-byte aligned); calloc only
+	/* dpdk_priv is cache-line aligned (dp_wk is); calloc only
 	 * guarantees natural (8-byte) alignment.  rte_zmalloc can't be used: the
 	 * EAL heap does not exist yet.  aligned_alloc + memset (M3). */
 	d = aligned_alloc(RTE_CACHE_LINE_SIZE, sizeof(*d));
@@ -946,9 +952,10 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		/* Only the SPI_DIP key flavor is used (inbound ESP lookup).  Leave
 		 * the other table types unsized (0) so the SAD doesn't preallocate
 		 * SPI_ONLY / SPI_DIP_SIP tables we never query. */
-		conf.max_sa[RTE_IPSEC_SAD_SPI_DIP] = MAX_SA;
+		conf.max_sa[RTE_IPSEC_SAD_SPI_DIP] = DP_SAD_INIT; /* grows */
 		conf.flags = RTE_IPSEC_SAD_FLAG_RW_CONCURRENCY;
 		d->sad = rte_ipsec_sad_create("r2dp_sad", &conf);
+		d->sad_cap = DP_SAD_INIT;
 		if (!d->sad) {
 			fprintf(stderr, "r2dp-fwd: sad create failed: %s\n",
 			    rte_strerror(rte_errno));
@@ -981,6 +988,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	dpdk_ops.sp_del = dpd_sp_del;
 	dpdk_ops.start  = dpd_start;
 	dpdk_ops.stop   = dpd_stop;
+	dpdk_ops.idle   = dpd_idle;
 	dp->ops = &dpdk_ops;
 	if (dp->ops->caps)
 		dp->ops->caps(dp);

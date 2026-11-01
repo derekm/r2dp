@@ -68,14 +68,15 @@ mk_priv(const char *tag)
 static void
 free_priv(struct dpdk_priv *d)
 {
-	for (int i = 0; i < MAX_SA; i++) {
-		if (d->sa_tab[i].used)
-			sa_slot_free(d, &d->sa_tab[i]);
+	for (int i = 0; i < (int)sa_cap(d); i++) {
+		if ((*sa_at(d, (uint32_t)(i))).used)
+			sa_slot_free(d, &(*sa_at(d, (uint32_t)(i))));
 	}
 	spd_teardown(d);
 	rte_ipsec_sad_destroy(d->sad);
 	rte_mempool_free(d->sess_mp);
 	rte_mempool_free(d->cop_mp);
+	dp_tables_free(d);
 	free(d);
 }
 

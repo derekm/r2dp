@@ -144,13 +144,14 @@ mk_inner(struct rte_mbuf *m, int k, uint16_t id)
 static void
 free_priv(struct dpdk_priv *d)
 {
-	for (int i = 0; i < MAX_SA; i++)
-		if (d->sa_tab[i].used)
-			sa_slot_free(d, &d->sa_tab[i]);
+	for (int i = 0; i < (int)sa_cap(d); i++)
+		if ((*sa_at(d, (uint32_t)(i))).used)
+			sa_slot_free(d, &(*sa_at(d, (uint32_t)(i))));
 	spd_teardown(d);
 	rte_ipsec_sad_destroy(d->sad);
 	rte_mempool_free(d->sess_mp);
 	rte_mempool_free(d->cop_mp);
+	dp_tables_free(d);
 	free(d);
 }
 
@@ -276,9 +277,9 @@ main(void)
 	if (!mp || !A || !B) { puts("setup FAILED"); return 1; }
 	for (int k = 0; k < NT; k++)
 		if (add_tunnel(k)) { puts("tunnel setup FAILED"); return 1; }
-	for (int i = 0; i < MAX_SA; i++)
-		if (A->sa_tab[i].used)
-			owners_used |= 1u << A->sa_tab[i].owner;
+	for (int i = 0; i < (int)sa_cap(A); i++)
+		if ((*sa_at(A, (uint32_t)(i))).used)
+			owners_used |= 1u << (*sa_at(A, (uint32_t)(i))).owner;
 	CHECK(owners_used == (1u << NW) - 1, "tunnels spread over every worker");
 
 	/* 1. concurrent encrypt: every worker offered every tunnel */

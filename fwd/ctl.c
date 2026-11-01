@@ -46,21 +46,58 @@ static void on_sig(int s) { (void)s; g_stop = 1; }
 #define LOG(...) do { if (C && C->verbose) \
 	{ fprintf(stderr, "r2dp: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
-/* first free SAD slot, or -1 */
+/* Double an entry array (new half zeroed).  0, or -1 with *arr intact. */
+static int
+grow_arr(void **arr, uint32_t *n, size_t esz)
+{
+	uint32_t nn = *n ? *n * 2 : FWD_SA_INIT;
+	void *p;
+
+	if (nn > FWD_SA_LIMIT || nn <= *n)
+		return -1;
+	p = realloc(*arr, (size_t)nn * esz);
+	if (!p)
+		return -1;
+	memset((char *)p + (size_t)*n * esz, 0, (size_t)(nn - *n) * esz);
+	*arr = p;
+	*n = nn;
+	return 0;
+}
+
+/* first free SAD slot, growing the table when full; -1 only when memory
+ * (or FWD_SA_LIMIT) runs out -- existing entries are never touched.
+ * Growth moves the array: callers take entry pointers after this. */
 static int
 sa_alloc_idx(struct fwd_ctl *c)
 {
-	for (int i = 0; i < FWD_MAXSA; i++)
+	uint32_t n0 = c->nsa;
+
+	for (uint32_t i = 0; i < c->nsa; i++)
 		if (!c->sad[i].used)
-			return i;
-	return -1;
+			return (int)i;
+	if (grow_arr((void **)&c->sad, &c->nsa, sizeof(*c->sad)) < 0)
+		return -1;
+	return (int)n0;
+}
+
+static int
+sp_alloc_idx(struct fwd_ctl *c)
+{
+	uint32_t n0 = c->nsp;
+
+	for (uint32_t i = 0; i < c->nsp; i++)
+		if (!c->spd[i].used)
+			return (int)i;
+	if (grow_arr((void **)&c->spd, &c->nsp, sizeof(*c->spd)) < 0)
+		return -1;
+	return (int)n0;
 }
 
 /* ------------------------------------------------------------ SAD */
 static struct fwd_sa_ent *
 sa_find(struct fwd_ctl *c, const struct r2dp_sa *k)
 {
-	for (int i = 0; i < FWD_MAXSA; i++)
+	for (int i = 0; i < (int)c->nsa; i++)
 		if (c->sad[i].used && c->sad[i].sa.spi == k->spi &&
 		    c->sad[i].sa.proto == k->proto &&
 		    r2dp_addr_eq(&c->sad[i].sa.dst, &k->dst))
@@ -100,7 +137,7 @@ sel_eq_d(const struct r2dp_sp *a, const struct r2dp_sp *b)
 static struct fwd_sp_ent *
 sp_find(struct fwd_ctl *c, const struct r2dp_sp *k, int by_selector)
 {
-	for (int i = 0; i < FWD_MAXSP; i++) {
+	for (int i = 0; i < (int)c->nsp; i++) {
 		if (!c->spd[i].used)
 			continue;
 		if (by_selector ? sel_eq_d(&c->spd[i].sp, k) :
@@ -283,7 +320,7 @@ static void
 check_lifetimes(const int *cli, int ncli)
 {
 	time_t now = time(NULL);
-	for (int i = 0; i < FWD_MAXSA; i++) {
+	for (int i = 0; i < (int)C->nsa; i++) {
 		struct fwd_sa_ent *e = &C->sad[i];
 		uint64_t el, soft_t, hard_t, soft_b, hard_b;
 		int64_t nbytes = -1;
@@ -351,7 +388,7 @@ reap_larv(void)
 {
 	time_t now = time(NULL);
 
-	for (int i = 0; i < FWD_MAXSA; i++)
+	for (int i = 0; i < (int)C->nsa; i++)
 		if (C->sad[i].used && C->sad[i].larval &&
 		    now - C->sad[i].larva_at > R2DP_LARVAL_TTL_S)
 			C->sad[i].used = 0;
@@ -492,7 +529,7 @@ do_sa(int fd, const struct r2dp_msg *m)
 		 * the SAD and verify the dataplane matches.  Completing-reply type
 		 * is the request type (R2DP_SA_DUMP); each carries its own seq. */
 		int last = -1;
-		for (int i = 0; i < FWD_MAXSA; i++)
+		for (int i = 0; i < (int)C->nsa; i++)
 			if (C->sad[i].used && !C->sad[i].larval) last = i;
 		if (last < 0) { rc = ENOENT; goto out; }
 		for (int i = 0; i <= last; i++) {
@@ -542,7 +579,7 @@ sp_valid(const struct r2dp_sp *sp)
 static uint32_t
 slid_alloc(struct fwd_ctl *c)
 {
-	for (uint32_t tries = 0; tries < FWD_MAXSP + 1; tries++) {
+	for (uint32_t tries = 0; tries < c->nsp + 1; tries++) {
 		uint32_t s = c->next_slid++;
 		struct r2dp_sp k;
 		if (s == 0)
@@ -579,10 +616,8 @@ do_sp(int fd, const struct r2dp_msg *m)
 			if (o && o != e) { reply_sp(fd, m, EEXIST, rq, 0); return; }
 		}
 		if (!e) {
-			int i;
-			for (i = 0; i < FWD_MAXSP; i++)
-				if (!C->spd[i].used) break;
-			if (i == FWD_MAXSP) { reply_sp(fd, m, ENOBUFS, rq, 0); return; }
+			int i = sp_alloc_idx(C);
+			if (i < 0) { reply_sp(fd, m, ENOBUFS, rq, 0); return; }
 			e = &C->spd[i];
 			out = *rq; out.slid = rq->slid ? rq->slid : slid_alloc(C);
 			if (!out.slid) { reply_sp(fd, m, ENOBUFS, rq, 0); return; }
@@ -627,7 +662,7 @@ do_sp(int fd, const struct r2dp_msg *m)
 		return;
 	case R2DP_SP_DUMP: {
 		int last = -1;
-		for (int i = 0; i < FWD_MAXSP; i++)
+		for (int i = 0; i < (int)C->nsp; i++)
 			if (C->spd[i].used) last = i;
 		if (last < 0) { reply_sp(fd, m, ENOENT, rq, 0); return; }
 		for (int i = 0; i <= last; i++)
@@ -713,6 +748,8 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 			break;
 		reap_larv();          /* expire stale GETSPI reservations */
 		check_lifetimes(cli, ncli);  /* soft/hard TIME expiry -> EXPIRE */
+		if (C->dp.ops && C->dp.ops->idle)
+			C->dp.ops->idle(&C->dp);
 		npoll = ncli;
 		pf[n].fd = lfd; pf[n++].events = POLLIN;
 		for (int i = 0; i < ncli; i++) { pf[n].fd = cli[i]; pf[n++].events = POLLIN; }

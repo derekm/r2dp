@@ -91,6 +91,23 @@ if dpdk.found()
       c_args: ['-DR2DP_HAVE_DPDK=1']),
     is_parallel: false, timeout: 60)
 
+  # dp_grow: SA/SP/SAD/session-pool growth from empty to 10000 tunnels
+  # with traffic running; allocation failure during growth.
+  test('dp_grow',
+    executable('dp_grow', 'dp_grow.c', '../fwd/dpdk_sad.c', '../fwd/dpdk_spd.c',
+      '../fwd/dpdk_esp.c', '../fwd/dpdk_stats.c', '../fwd/dp_gcm.c',
+      '../fwd/dp_nh.c', '../fwd/dpdk_nh.c', '../fwd/dp_sel.c',
+      include_directories: [include_directories('../include'),
+                            include_directories('../fwd')],
+      dependencies: dpdk,
+      link_with: libr2dp,
+      c_args: ['-DR2DP_HAVE_DPDK=1']),
+    # 10000 tunnels in a plain build; sanitizer builds (several times
+    # slower) take 3000 -- still three SA/SP chunk growths and two SAD
+    # rebuilds.  DP_GROW_NT=10000 runs the full size under ASan.
+    env: ['DP_GROW_NT=' + (get_option('b_sanitize') == 'none' ? '10000' : '3000')],
+    is_parallel: false, timeout: 900)
+
   # nh_tab: the next-hop table (fwd/dpdk_nh.c): >64 peers, growth from 8
   # to 10000 under concurrent lookups, allocation failure during growth.
   test('nh_tab',

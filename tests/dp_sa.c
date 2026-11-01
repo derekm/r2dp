@@ -96,8 +96,8 @@ reader(void *arg)
 	rte_rcu_qsbr_thread_register(d->rcu, d->wk[0].lcore);
 	rte_rcu_qsbr_thread_online(d->rcu, d->wk[0].lcore);
 	while (!rd_stop) {
-		for (int i = 0; i < 8; i++) {
-			const struct r2dp_sp *sp = sp_load(&d->sp_tab[i]);
+		for (int i = 0; i < 8 && i < (int)sp_cap(d); i++) {
+			const struct r2dp_sp *sp = sp_load(sp_at(d, (uint32_t)i));
 			uint8_t k;
 			if (!sp)
 				continue;
@@ -278,9 +278,9 @@ t_replay_window(void)
 static struct dp_sa *
 sa_by_spi(struct dpdk_priv *d, uint32_t spi)
 {
-	for (int i = 0; i < MAX_SA; i++)
-		if (d->sa_tab[i].used && d->sa_tab[i].spi == spi)
-			return &d->sa_tab[i];
+	for (int i = 0; i < (int)sa_cap(d); i++)
+		if ((*sa_at(d, (uint32_t)(i))).used && (*sa_at(d, (uint32_t)(i))).spi == spi)
+			return &(*sa_at(d, (uint32_t)(i)));
 	return NULL;
 }
 
@@ -328,14 +328,14 @@ t_inbound_indexed(struct dpdk_priv *d)
 	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0, "idx: inbound SA A");
 	mk_sa(&r, 0x4002, "192.0.2.3", "192.0.2.1");
 	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0, "idx: inbound SA B");
-	for (int i = 0; i < MAX_SA; i++) {
-		if (!d->sa_tab[i].used) continue;
-		if (d->sa_tab[i].spi == 0x4001) a = &d->sa_tab[i];
-		if (d->sa_tab[i].spi == 0x4002) b = &d->sa_tab[i];
+	for (int i = 0; i < (int)sa_cap(d); i++) {
+		if (!(*sa_at(d, (uint32_t)(i))).used) continue;
+		if ((*sa_at(d, (uint32_t)(i))).spi == 0x4001) a = &(*sa_at(d, (uint32_t)(i)));
+		if ((*sa_at(d, (uint32_t)(i))).spi == 0x4002) b = &(*sa_at(d, (uint32_t)(i)));
 	}
 	s = d->spd;
-	CHECK(a && b && s && s->in_gen[a - d->sa_tab] == a->gen &&
-	    s->in_off[a - d->sa_tab + 1] - s->in_off[a - d->sa_tab] == 1,
+	CHECK(a && b && s && s->in_gen[a->idx] == a->gen &&
+	    s->in_off[a->idx + 1] - s->in_off[a->idx] == 1,
 	    "idx: snapshot holds exactly A's IN policy for SA A");
 	ipkt(p, "10.0.2.5", "10.0.1.5");
 	CHECK(inbound_policy_ok(d, a, p, 40) && !inbound_policy_ok(d, b, p, 40),
@@ -412,9 +412,9 @@ t_binding(struct dpdk_priv *d)
 	ds->gen += 1000;                         /* slot reused behind our back */
 	m = sp_match_out(d, (const struct rte_ipv4_hdr *)pkt, sizeof(pkt), &ds);
 	CHECK(m && !ds, "bind: stale binding (generation mismatch) fails closed");
-	for (int i = 0; i < MAX_SA; i++)
-		if (d->sa_tab[i].used && d->sa_tab[i].spi == 0x3001)
-			d->sa_tab[i].gen -= 1000;
+	for (int i = 0; i < (int)sa_cap(d); i++)
+		if ((*sa_at(d, (uint32_t)(i))).used && (*sa_at(d, (uint32_t)(i))).spi == 0x3001)
+			(*sa_at(d, (uint32_t)(i))).gen -= 1000;
 
 	/* a more specific DISCARD installed later still wins */
 	sp.slid = 78; sp.action = R2DP_ACT_DISCARD;
@@ -445,8 +445,8 @@ ref_match(struct dpdk_priv *d, const uint8_t *ip, size_t avail)
 	const struct r2dp_sp *best = NULL;
 	int bs = -1;
 
-	for (int i = 0; i < MAX_SA; i++) {
-		const struct r2dp_sp *sp = d->sp_tab[i].sp;
+	for (int i = 0; i < (int)sp_cap(d); i++) {
+		const struct r2dp_sp *sp = (*sp_at(d, (uint32_t)(i))).sp;
 		int sc;
 		if (!sp || sp->dir != R2DP_DIR_OUT || !r2dp_sel_match(sp, ip, avail))
 			continue;
@@ -464,83 +464,93 @@ t_acl_diff(struct dpdk_priv *d)
 	static const uint16_t ports[] = { 0, 53, 80, 443 };
 	unsigned mism = 0, matched = 0, nomatch = 0, npk = 30000;
 
-	for (int i = 0; i < 300; i++) {
-		struct r2dp_sp sp;
-		memset(&sp, 0, sizeof(sp));
-		sp.slid = 5000 + (rnd() % 260);           /* some upserts */
-		sp.dir = (rnd() % 5) ? R2DP_DIR_OUT : R2DP_DIR_IN;
-		sp.action = 1 + rnd() % 3;
-		sp.ul_proto = protos[rnd() % 5];
-		sp.sel_src.family = (rnd() % 40) ? R2DP_AF_INET4 : R2DP_AF_INET6;
-		sp.sel_dst.family = R2DP_AF_INET4;
-		sp.sel_src.addr[0] = sp.sel_dst.addr[0] = 10;
-		sp.sel_src.addr[1] = rnd() % 4; sp.sel_src.addr[2] = rnd() % 4; sp.sel_src.addr[3] = rnd() % 4;
-		sp.sel_dst.addr[1] = rnd() % 4; sp.sel_dst.addr[2] = rnd() % 4; sp.sel_dst.addr[3] = rnd() % 4;
-		sp.pref_src = (uint8_t)(8 + rnd() % 26);   /* 33: unmatchable; >= 8 so */
-		sp.pref_dst = (uint8_t)(8 + rnd() % 25);   /* 11/8 packets miss */
-		sp.sel_src.port = htons(ports[rnd() % 4] * (rnd() % 3 == 0));
-		sp.sel_dst.port = htons(ports[rnd() % 4] * (rnd() % 2));
-		sp.tun_src.family = sp.tun_dst.family = R2DP_AF_INET4;
-		if (dpd_sp_add(&dp, &sp) != 0) { CHECK(0, "acl-diff: sp_add"); return; }
-		if (rnd() % 10 == 0) { sp.slid = 5000 + (rnd() % 260); dpd_sp_del(&dp, &sp); }
-	}
 	static uint8_t bip[BURST_SZ][64];
 	static const struct r2dp_sp *bwant[BURST_SZ];
 	unsigned bn = 0, bmism = 0;
 	size_t bav[BURST_SZ];
 
-	for (unsigned n = 0; n < npk; n++) {
-		uint8_t ip[64];
-		size_t ihl = (rnd() % 8) ? 20 : 24, avail;
-		const struct r2dp_sp *want, *got;
-		struct dp_sa *ds;
-		uint16_t sp_, dp_;
+	/* Check after every 10 policy changes, so the classifier is seen
+	 * fresh, reused with a delta list, with dead rules (deleted/replaced
+	 * policies), and right after a compaction. */
+	for (int round = 0; round < 30; round++) {
+		for (int i = 0; i < 10; i++) {
+			struct r2dp_sp sp;
+			memset(&sp, 0, sizeof(sp));
+			sp.slid = 5000 + (rnd() % 260);           /* some upserts */
+			sp.dir = (rnd() % 5) ? R2DP_DIR_OUT : R2DP_DIR_IN;
+			sp.action = 1 + rnd() % 3;
+			sp.ul_proto = protos[rnd() % 5];
+			sp.sel_src.family = (rnd() % 40) ? R2DP_AF_INET4 : R2DP_AF_INET6;
+			sp.sel_dst.family = R2DP_AF_INET4;
+			sp.sel_src.addr[0] = sp.sel_dst.addr[0] = 10;
+			sp.sel_src.addr[1] = rnd() % 4; sp.sel_src.addr[2] = rnd() % 4; sp.sel_src.addr[3] = rnd() % 4;
+			sp.sel_dst.addr[1] = rnd() % 4; sp.sel_dst.addr[2] = rnd() % 4; sp.sel_dst.addr[3] = rnd() % 4;
+			sp.pref_src = (uint8_t)(8 + rnd() % 26);   /* 33: unmatchable; >= 8 so */
+			sp.pref_dst = (uint8_t)(8 + rnd() % 25);   /* 11/8 packets miss */
+			sp.sel_src.port = htons(ports[rnd() % 4] * (rnd() % 3 == 0));
+			sp.sel_dst.port = htons(ports[rnd() % 4] * (rnd() % 2));
+			sp.tun_src.family = sp.tun_dst.family = R2DP_AF_INET4;
+			if (dpd_sp_add(&dp, &sp) != 0) { CHECK(0, "acl-diff: sp_add"); return; }
+			if (rnd() % 4 == 0) { sp.slid = 5000 + (rnd() % 260); dpd_sp_del(&dp, &sp); }
+		}
+		if (round % 7 == 6)
+			spd_rebuild_ex(d, 2);             /* idle compaction */
+		for (unsigned n = 0; n < npk / 30; n++) {
+			uint8_t ip[64];
+			size_t ihl = (rnd() % 8) ? 20 : 24, avail;
+			const struct r2dp_sp *want, *got;
+			struct dp_sa *ds;
+			uint16_t sp_, dp_;
 
-		memset(ip, 0, sizeof(ip));
-		ip[0] = 0x40 | (uint8_t)(ihl / 4);
-		ip[9] = protos[1 + rnd() % 4];
-		if (rnd() % 6 == 0) { ip[6] = 0x00; ip[7] = (uint8_t)(1 + rnd() % 8); }  /* non-first frag */
-		if (rnd() % 9 == 0) ip[6] = 0x20;                                      /* MF, first frag */
-		ip[12] = ip[16] = 10;
-		if (rnd() % 6 == 0) ip[12 + 4 * (rnd() % 2)] = 11;  /* no-match share */
-		for (int k = 1; k < 4; k++) { ip[12 + k] = rnd() % 4; ip[16 + k] = rnd() % 4; }
-		sp_ = htons(ports[rnd() % 4] ? ports[rnd() % 4] : 1234);
-		dp_ = htons(ports[rnd() % 4] ? ports[rnd() % 4] : 4321);
-		memcpy(ip + ihl, &sp_, 2); memcpy(ip + ihl + 2, &dp_, 2);
-		avail = (rnd() % 10) ? ihl + 8 : ihl + 2;                    /* truncated L4 */
-		want = ref_match(d, ip, avail);
-		got = sp_match_out(d, (const struct rte_ipv4_hdr *)ip, avail, &ds);
-		if (want) matched++; else nomatch++;
-		/* the burst classifier must agree packet for packet */
-		memcpy(bip[bn], ip, sizeof(ip));
-		bav[bn] = avail;
-		bwant[bn++] = got;
-		if (n % 3 == 0) {        /* same key twice in a row: shared result */
+			memset(ip, 0, sizeof(ip));
+			ip[0] = 0x40 | (uint8_t)(ihl / 4);
+			ip[9] = protos[1 + rnd() % 4];
+			if (rnd() % 6 == 0) { ip[6] = 0x00; ip[7] = (uint8_t)(1 + rnd() % 8); }  /* non-first frag */
+			if (rnd() % 9 == 0) ip[6] = 0x20;                                      /* MF, first frag */
+			ip[12] = ip[16] = 10;
+			if (rnd() % 6 == 0) ip[12 + 4 * (rnd() % 2)] = 11;  /* no-match share */
+			for (int k = 1; k < 4; k++) { ip[12 + k] = rnd() % 4; ip[16 + k] = rnd() % 4; }
+			sp_ = htons(ports[rnd() % 4] ? ports[rnd() % 4] : 1234);
+			dp_ = htons(ports[rnd() % 4] ? ports[rnd() % 4] : 4321);
+			memcpy(ip + ihl, &sp_, 2); memcpy(ip + ihl + 2, &dp_, 2);
+			avail = (rnd() % 10) ? ihl + 8 : ihl + 2;                    /* truncated L4 */
+			want = ref_match(d, ip, avail);
+			got = sp_match_out(d, (const struct rte_ipv4_hdr *)ip, avail, &ds);
+			if (want) matched++; else nomatch++;
+			/* the burst classifier must agree packet for packet */
 			memcpy(bip[bn], ip, sizeof(ip));
 			bav[bn] = avail;
 			bwant[bn++] = got;
-		}
-		if (bn >= BURST_SZ - 1 || n + 1 == npk) {
-			const struct rte_ipv4_hdr *bp[BURST_SZ];
-			const struct r2dp_sp *bgot[BURST_SZ];
-			struct dp_sa *bds[BURST_SZ];
-			for (unsigned b = 0; b < bn; b++)
-				bp[b] = (b % 7 == 3) ? NULL : (const struct rte_ipv4_hdr *)bip[b];
-			sp_match_out_burst(d, bp, bav, (uint16_t)bn, bgot, bds);
-			for (unsigned b = 0; b < bn; b++)
-				if (bgot[b] != (bp[b] ? bwant[b] : NULL))
-					bmism++;
-			bn = 0;
-		}
-		if (want != got) {
-			if (mism++ < 5)
-				printf("     mismatch pkt %u: want slid %u got slid %u\n", n,
-				    want ? want->slid : 0, got ? got->slid : 0);
+			if (n % 3 == 0) {        /* same key twice in a row: shared result */
+				memcpy(bip[bn], ip, sizeof(ip));
+				bav[bn] = avail;
+				bwant[bn++] = got;
+			}
+			if (bn >= BURST_SZ - 1 || n + 1 == npk / 30) {
+				const struct rte_ipv4_hdr *bp[BURST_SZ];
+				const struct r2dp_sp *bgot[BURST_SZ];
+				struct dp_sa *bds[BURST_SZ];
+				for (unsigned b = 0; b < bn; b++)
+					bp[b] = (b % 7 == 3) ? NULL : (const struct rte_ipv4_hdr *)bip[b];
+				sp_match_out_burst(d, bp, bav, (uint16_t)bn, bgot, bds);
+				for (unsigned b = 0; b < bn; b++)
+					if (bgot[b] != (bp[b] ? bwant[b] : NULL))
+						bmism++;
+				bn = 0;
+			}
+			if (want != got) {
+				if (mism++ < 5)
+					printf("     mismatch pkt %u: want slid %u got slid %u\n", n,
+					    want ? want->slid : 0, got ? got->slid : 0);
+			}
 		}
 	}
 	printf("     acl-diff: %u packets, %u matched, %u matched none\n", npk, matched, nomatch);
 	CHECK(bmism == 0, "acl-diff: sp_match_out_burst == sp_match_out");
 	CHECK(mism == 0 && matched > npk / 4 && nomatch > npk / 20, "acl-diff: rte_acl SPD == full scan on random policies/packets");
+	printf("     acl-diff: %llu classifier builds, %llu reuses\n",
+	    (unsigned long long)d->n_acl_build, (unsigned long long)d->n_acl_reuse);
+	CHECK(d->n_acl_reuse > d->n_acl_build, "acl-diff: classifier reused across policy changes");
 	spd_teardown(d);
 }
 
@@ -607,17 +617,19 @@ main(void)
 		CHECK(sa_install(d, &r, key, 20, 0, 0) == 0, "outbound SA #1");
 		mk_sa(&r, 0x2002, "192.0.2.1", "192.0.2.2");      /* rekeyed SA */
 		CHECK(sa_install(d, &r, key, 20, 0, 0) == 0, "outbound SA #2");
-		for (int i = 0; i < MAX_SA; i++) {
-			if (!d->sa_tab[i].used) continue;
-			if (d->sa_tab[i].spi == 0x2001) old_slot = i;
-			if (d->sa_tab[i].spi == 0x2002) new_slot = i;
+		for (int i = 0; i < (int)sa_cap(d); i++) {
+			if (!(*sa_at(d, (uint32_t)(i))).used) continue;
+			if ((*sa_at(d, (uint32_t)(i))).spi == 0x2001) old_slot = i;
+			if ((*sa_at(d, (uint32_t)(i))).spi == 0x2002) new_slot = i;
 		}
 		/* force the OLD SA into a later slot than the new one, so a
 		 * "last matching slot" policy would pick the wrong SA */
 		if (old_slot >= 0 && new_slot >= 0 && old_slot < new_slot) {
-			struct dp_sa t = d->sa_tab[old_slot];
-			d->sa_tab[old_slot] = d->sa_tab[new_slot];
-			d->sa_tab[new_slot] = t;
+			struct dp_sa t = *sa_at(d, (uint32_t)old_slot);
+			*sa_at(d, (uint32_t)old_slot) = *sa_at(d, (uint32_t)new_slot);
+			*sa_at(d, (uint32_t)new_slot) = t;
+			sa_at(d, (uint32_t)old_slot)->idx = (uint32_t)old_slot;
+			sa_at(d, (uint32_t)new_slot)->idx = (uint32_t)new_slot;
 		}
 		memset(&sp, 0, sizeof(sp));
 		sp.dir = R2DP_DIR_OUT; sp.action = R2DP_ACT_PROTECT;
@@ -641,13 +653,15 @@ main(void)
 	t_acl_diff(d);
 
 	/* teardown: free every session (no leaks under LSan) */
-	for (int i = 0; i < MAX_SA; i++)
-		if (d->sa_tab[i].used)
-			sa_slot_free(d, &d->sa_tab[i]);
+	for (int i = 0; i < (int)sa_cap(d); i++)
+		if ((*sa_at(d, (uint32_t)(i))).used)
+			sa_slot_free(d, &(*sa_at(d, (uint32_t)(i))));
 	rte_ipsec_sad_destroy(d->sad);
 	rte_mempool_free(d->sess_mp);
 	rte_cryptodev_stop(d->cdev_id);
 	rte_cryptodev_close(d->cdev_id);
+	spd_teardown(d);
+	dp_tables_free(d);
 	free(d);
 	rte_eal_cleanup();
 

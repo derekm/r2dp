@@ -36,6 +36,187 @@ addr4_to_u32(const struct r2dp_addr *a, uint32_t *out)
 	return 0;
 }
 
+/* ---- growth (ctl thread, d->lock held) --------------------------- */
+
+static uint32_t pool_gen;     /* process-wide: DPDK object names are global */
+
+static int
+grow_fail_injected(struct dpdk_priv *d)
+{
+	if (!d->inject_grow_fail)
+		return 0;
+	d->inject_grow_fail--;
+	return 1;
+}
+
+static void *
+chunk_alloc(struct dpdk_priv *d, size_t esz)
+{
+	size_t sz = (size_t)DP_CHUNK * esz;
+	void *p;
+
+	if (grow_fail_injected(d))
+		return NULL;
+	p = aligned_alloc(RTE_CACHE_LINE_SIZE,
+	    RTE_ALIGN_CEIL(sz, RTE_CACHE_LINE_SIZE));
+	if (p)
+		memset(p, 0, sz);
+	return p;
+}
+
+/* Add one chunk of SA slots and publish it: the chunk pointer first, then
+ * the new cap with a release store.  Existing slots never move. */
+int
+dp_sa_grow(struct dpdk_priv *d)
+{
+	uint32_t c = d->sa_cap / DP_CHUNK;
+	struct dp_sa *ch;
+
+	if (c >= DP_MAX_CHUNKS || !(ch = chunk_alloc(d, sizeof(*ch)))) {
+		d->n_grow_fail++;
+		return -ENOMEM;
+	}
+	for (uint32_t i = 0; i < DP_CHUNK; i++)
+		ch[i].idx = c * DP_CHUNK + i;
+	__atomic_store_n(&d->sa_chunk[c], ch, __ATOMIC_RELEASE);
+	__atomic_store_n(&d->sa_cap, (c + 1) * DP_CHUNK, __ATOMIC_RELEASE);
+	d->n_grow++;
+	return 0;
+}
+
+int
+dp_sp_grow(struct dpdk_priv *d)
+{
+	uint32_t c = d->sp_cap / DP_CHUNK;
+	struct dp_sp_ent *ch;
+
+	if (c >= DP_MAX_CHUNKS || !(ch = chunk_alloc(d, sizeof(*ch)))) {
+		d->n_grow_fail++;
+		return -ENOMEM;
+	}
+	__atomic_store_n(&d->sp_chunk[c], ch, __ATOMIC_RELEASE);
+	__atomic_store_n(&d->sp_cap, (c + 1) * DP_CHUNK, __ATOMIC_RELEASE);
+	d->n_grow++;
+	return 0;
+}
+
+/* Grow ahead of need (at 75% use) so that a failed allocation costs
+ * nothing while free slots remain; grow on demand when none are left.
+ * Returns a free SA slot, or -ENOMEM only when the table is full and
+ * cannot grow (existing SAs are untouched either way). */
+static int
+sa_free_slot(struct dpdk_priv *d)
+{
+	if ((uint64_t)(d->sa_n + 1) * 4 > (uint64_t)d->sa_cap * 3)
+		(void)dp_sa_grow(d);
+	for (uint32_t i = 0; i < d->sa_cap; i++)
+		if (!sa_at(d, i)->used)
+			return (int)i;
+	if (dp_sa_grow(d) < 0)
+		return -ENOMEM;
+	return (int)(d->sa_cap - DP_CHUNK);
+}
+
+/* Free all chunks (teardown; no worker running). */
+void
+dp_tables_free(struct dpdk_priv *d)
+{
+	for (uint32_t c = 0; c < DP_MAX_CHUNKS; c++) {
+		free(d->sa_chunk[c]);
+		free(d->sp_chunk[c]);
+		d->sa_chunk[c] = NULL;
+		d->sp_chunk[c] = NULL;
+	}
+	d->sa_cap = d->sp_cap = d->sa_n = d->sp_n = 0;
+	/* overflow session pools (every session must be freed by now) */
+	for (uint32_t i = 0; i < d->n_sess_more; i++)
+		rte_mempool_free(d->sess_more[i]);
+	d->n_sess_more = 0;
+}
+
+static struct rte_cryptodev_sym_session *
+sess_create(struct dpdk_priv *d, struct rte_crypto_sym_xform *x)
+{
+	struct rte_cryptodev_sym_session *s;
+	struct rte_mempool *mp;
+	char name[RTE_MEMPOOL_NAMESIZE];
+
+	s = rte_cryptodev_sym_session_create(d->cdev_id, x, d->sess_mp);
+	for (uint32_t i = 0; !s && i < d->n_sess_more; i++)
+		s = rte_cryptodev_sym_session_create(d->cdev_id, x,
+		    d->sess_more[i]);
+	if (s || !d->sess_mp)
+		return s;
+	if (d->n_sess_more >= DP_MAX_SESS_POOLS || grow_fail_injected(d)) {
+		d->n_grow_fail++;
+		return NULL;
+	}
+	snprintf(name, sizeof(name), "r2dp_sess%u",
+	    __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELAXED));
+	mp = rte_cryptodev_sym_session_pool_create(name, DP_SESS_POOL,
+	    rte_cryptodev_sym_get_private_session_size(d->cdev_id), 0, 0,
+	    SOCKET_ID_ANY);
+	if (!mp) {
+		d->n_grow_fail++;
+		return NULL;
+	}
+	d->sess_more[d->n_sess_more++] = mp;
+	d->n_grow++;
+	return rte_cryptodev_sym_session_create(d->cdev_id, x, mp);
+}
+
+/* Inbound SAD growth: build a SAD of twice the capacity holding every
+ * live inbound SA, publish it, and destroy the old one after a grace
+ * period (workers keep looking up in the old one until then).  On failure
+ * the old SAD keeps serving.  d->sad_cap == 0: fixed-size SAD (tests). */
+static int
+sad_grow(struct dpdk_priv *d)
+{
+	struct rte_ipsec_sad_conf conf;
+	struct rte_ipsec_sad *ns, *old = d->sad;
+	char name[RTE_IPSEC_SAD_NAMESIZE];
+	uint32_t ncap = d->sad_cap * 2;
+
+	if (grow_fail_injected(d)) {
+		d->n_grow_fail++;
+		return -ENOMEM;
+	}
+	memset(&conf, 0, sizeof(conf));
+	conf.socket_id = SOCKET_ID_ANY;
+	conf.max_sa[RTE_IPSEC_SAD_SPI_DIP] = ncap;
+	conf.flags = RTE_IPSEC_SAD_FLAG_RW_CONCURRENCY;
+	snprintf(name, sizeof(name), "r2dp_sad%u",
+	    __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELAXED));
+	ns = rte_ipsec_sad_create(name, &conf);
+	if (!ns) {
+		d->n_grow_fail++;
+		return -ENOMEM;
+	}
+	for (uint32_t i = 0; i < d->sa_cap; i++) {
+		struct dp_sa *ds = sa_at(d, i);
+		union rte_ipsec_sad_key k;
+
+		if (!ds->used || !ds->inbound)
+			continue;
+		memset(&k, 0, sizeof(k));
+		k.v4.spi = ds->spi;
+		k.v4.dip = ds->dip;
+		if (rte_ipsec_sad_add(ns, &k, RTE_IPSEC_SAD_SPI_DIP,
+		    &ds->sess) < 0) {
+			rte_ipsec_sad_destroy(ns);
+			d->n_grow_fail++;
+			return -ENOMEM;
+		}
+	}
+	__atomic_store_n(&d->sad, ns, __ATOMIC_RELEASE);
+	d->sad_cap = ncap;
+	d->n_grow++;
+	if (d->rcu)
+		rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+	rte_ipsec_sad_destroy(old);
+	return 0;
+}
+
 /* r2dp SA -> rte_ipsec_sa + crypto session + ipsec session.  M1: AES-GCM-16
  * tunnel.  AEAD key blob = cipher key (16) || salt (4) = 20 bytes (M0 f3).
  * `inbound` distinguishes an SA protecting traffic TO us (our GETSPI: install
@@ -88,8 +269,9 @@ dp_sa_init(struct dpdk_priv *d, struct dp_sa *ds, const struct r2dp_sa *rsa,
 		return -EINVAL;
 	}
 
-	/* crypto session on the openssl device */
-	ds->cses = rte_cryptodev_sym_session_create(d->cdev_id, &aead, d->sess_mp);
+	/* crypto session: from the first pool with room, adding a pool when
+	 * they are all full (sessions go back to their own pool on free) */
+	ds->cses = sess_create(d, &aead);
 	if (!ds->cses) {
 		rte_ipsec_sa_fini(ds->sa);
 		rte_free(ds->sa);
@@ -140,7 +322,11 @@ sa_slot_free(struct dpdk_priv *d, struct dp_sa *ds)
 	if (ds->sa)
 		rte_ipsec_sa_fini(ds->sa);
 	rte_free(ds->sa);
-	memset(ds, 0, sizeof(*ds));
+	{
+		uint32_t idx = ds->idx;
+		memset(ds, 0, sizeof(*ds));
+		ds->idx = idx;
+	}
 }
 
 /* H5: retire a slot the worker may currently be using.  Step 1 (unlink):
@@ -151,17 +337,19 @@ sa_slot_free(struct dpdk_priv *d, struct dp_sa *ds)
  * then free the session memory -- this is what prevents the ctl<->worker
  * use-after-free on SA_DEL / rekey under traffic.  Caller holds d->lock. */
 static void
-sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds)
+sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds, int sad_del)
 {
 	union rte_ipsec_sad_key keyv;
-	int inbound = ds->inbound;
+	int inbound = ds->inbound && sad_del;
 
 	__atomic_store_n(&ds->used, 0, __ATOMIC_RELEASE); /* unlink from worker */
 	if (inbound) {
 		memset(&keyv, 0, sizeof(keyv));
 		keyv.v4.spi = ds->spi;
 		keyv.v4.dip = ds->dip;
-		rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP);
+		if (rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP) == 0 &&
+		    d->sad_n)
+			d->sad_n--;
 	}
 	if (d->rcu)
 		rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
@@ -184,12 +372,12 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	rte_spinlock_lock(&d->lock);
 
 	if (remove) {
-		for (int i = 0; i < MAX_SA; i++) {
-			if (d->sa_tab[i].used &&
-			    d->sa_tab[i].spi == ntohl(rsa->spi) &&
-			    d->sa_tab[i].proto == rsa->proto &&
-			    d->sa_tab[i].dip == dip) {
-				sa_slot_retire(d, &d->sa_tab[i]);
+		for (uint32_t i = 0; i < d->sa_cap; i++) {
+			struct dp_sa *x = sa_at(d, i);
+			if (x->used && x->spi == ntohl(rsa->spi) &&
+			    x->proto == rsa->proto && x->dip == dip) {
+				sa_slot_retire(d, x, 1);
+				d->sa_n--;
 				(void)spd_rebuild(d);  /* rebind to a remaining SA */
 				break;
 			}
@@ -205,11 +393,11 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	 * unique per destination, so matching on SPI+proto alone could tear down
 	 * another peer's SA. */
 	idx = -1;
-	for (int i = 0; i < MAX_SA; i++) {
-		if (d->sa_tab[i].used && d->sa_tab[i].proto == rsa->proto &&
-		    d->sa_tab[i].spi == ntohl(rsa->spi) &&
-		    d->sa_tab[i].dip == dip) {
-			idx = i;
+	for (uint32_t i = 0; i < d->sa_cap; i++) {
+		struct dp_sa *x = sa_at(d, i);
+		if (x->used && x->proto == rsa->proto &&
+		    x->spi == ntohl(rsa->spi) && x->dip == dip) {
+			idx = (int)i;
 			break;
 		}
 	}
@@ -218,12 +406,20 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	 * the old SA untouched (ctl still holds the old one as last-known-good).
 	 * Only after the new session exists do we tear the old one down and
 	 * publish the new one -- no window where the dataplane has nothing. */
-	int newidx = -1;
-	for (int i = 0; i < MAX_SA; i++)
-		if (!d->sa_tab[i].used) { newidx = i; break; }
+	int newidx = sa_free_slot(d);
+	struct dp_sa *nd;
 	if (newidx < 0) {
 		rte_spinlock_unlock(&d->lock);
-		return -ENOSPC;
+		return newidx;
+	}
+	nd = sa_at(d, (uint32_t)newidx);
+	/* inbound: make room in the SAD before anything is published, so a
+	 * failure leaves every existing SA as it was */
+	if (inbound && d->sad_cap &&
+	    (uint64_t)(d->sad_n + 1) * 4 > (uint64_t)d->sad_cap * 3 &&
+	    sad_grow(d) < 0 && d->sad_n + 1 > d->sad_cap) {
+		rte_spinlock_unlock(&d->lock);
+		return -ENOMEM;
 	}
 	{
 		struct dp_sa scratch;
@@ -236,23 +432,25 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		/* dp_sa_init marks scratch used; publish only after every
 		 * field below is written (release store), never via this copy */
 		scratch.used = 0;
-		d->sa_tab[newidx] = scratch;
+		scratch.idx = (uint32_t)newidx;
+		*nd = scratch;
 	}
-	d->sa_tab[newidx].spi = ntohl(rsa->spi);
-	d->sa_tab[newidx].proto = rsa->proto;
-	d->sa_tab[newidx].reqid = rsa->reqid;
-	d->sa_tab[newidx].dip = dip;
-	d->sa_tab[newidx].inbound = inbound;
-	d->sa_tab[newidx].natt = rsa->natt_type;
-	d->sa_tab[newidx].owner = dp_owner(d->nb_wk, sip, dip);
+	nd->spi = ntohl(rsa->spi);
+	nd->proto = rsa->proto;
+	nd->reqid = rsa->reqid;
+	nd->dip = dip;
+	nd->inbound = inbound;
+	nd->natt = rsa->natt_type;
+	nd->owner = dp_owner(d->nb_wk, sip, dip);
 	/* iked's NAT-T ports (the peer's may be NAT-mapped); 0 -> 4500 */
-	d->sa_tab[newidx].natt_sport = rsa->natt_sport ? rsa->natt_sport :
+	nd->natt_sport = rsa->natt_sport ? rsa->natt_sport :
 	    rte_cpu_to_be_16(NATT_PORT);
-	d->sa_tab[newidx].natt_dport = rsa->natt_dport ? rsa->natt_dport :
+	nd->natt_dport = rsa->natt_dport ? rsa->natt_dport :
 	    rte_cpu_to_be_16(NATT_PORT);
-	d->sa_tab[newidx].gen = ++d->sa_gen;
+	nd->gen = ++d->sa_gen;
 	/* publish last: the worker only proceeds past `used` == 1 */
-	__atomic_store_n(&d->sa_tab[newidx].used, 1, __ATOMIC_RELEASE);
+	__atomic_store_n(&nd->used, 1, __ATOMIC_RELEASE);
+	d->sa_n++;
 
 	/* Rebind policies before retiring the old session: a rekey switches
 	 * egress to the newest SA with no window where the policy has none.
@@ -260,42 +458,38 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	 * worker re-validates by generation (stale => drop, never misuse). */
 	(void)spd_rebuild(d);
 
-	/* tear down the old same-SPI session (now that a replacement exists) */
-	if (idx >= 0)
-		sa_slot_retire(d, &d->sa_tab[idx]);
-
-	/* Only inbound SAs (protecting traffic TO us) belong in the (SPI,DIP)
-	 * inbound SAD; outbound SAs stay in sa_tab for the SPD-driven egress
-	 * leg.  The SAD is consulted only by the inbound worker. */
-	if (!inbound) {
-		rte_spinlock_unlock(&d->lock);
-		return 0;
+	/* Inbound: point the (SPI, DIP) SAD key at the new session before the
+	 * old one goes.  rte_ipsec_sad_add on an existing key replaces its
+	 * value, so during a same-SPI update every lookup returns the old or
+	 * the new session, never a miss.  On failure the new SA is retired
+	 * and the old one keeps serving. */
+	if (inbound) {
+		memset(&keyv, 0, sizeof(keyv));
+		keyv.v4.spi = ntohl(rsa->spi);
+		keyv.v4.dip = dip;
+		if (d->verbose)
+			fprintf(stderr, "r2dp-fwd: SA_ADD key spi=%08x dip=%08x "
+			    "(rsa.spi=%08x raw dip=%08x)\n", ntohl(rsa->spi),
+			    dip, rsa->spi, dip);
+		ret = rte_ipsec_sad_add(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP,
+		    &nd->sess);   /* SAD value = the ipsec session ptr */
+		if (ret < 0) {
+			/* published already: unlink, wait out readers, free */
+			sa_slot_retire(d, nd, 0);
+			d->sa_n--;
+			(void)spd_rebuild(d);
+			rte_spinlock_unlock(&d->lock);
+			return ret;
+		}
+		if (idx < 0)
+			d->sad_n++;
 	}
-
-	memset(&keyv, 0, sizeof(keyv));
-	keyv.v4.spi = ntohl(rsa->spi);
-	keyv.v4.dip = dip;
-	if (d->verbose) {
-		fprintf(stderr,
-		    "r2dp-fwd: SA_ADD key spi=%08x dip=%08x (rsa.spi=%08x raw dip=%08x)\n",
-		    ntohl(rsa->spi), dip, rsa->spi, dip);
+	/* tear down the old same-SPI session (now that a replacement exists);
+	 * its SAD key already maps to the new session */
+	if (idx >= 0) {
+		sa_slot_retire(d, sa_at(d, (uint32_t)idx), 0);
+		d->sa_n--;
 	}
-	ret = rte_ipsec_sad_add(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP,
-	    &d->sa_tab[newidx].sess);   /* SAD value = the ipsec session ptr */
-	if (ret < 0) {
-		if (d->sa_tab[newidx].cses)
-			rte_cryptodev_sym_session_free(d->cdev_id, d->sa_tab[newidx].cses);
-		if (d->sa_tab[newidx].sa)
-			rte_ipsec_sa_fini(d->sa_tab[newidx].sa);
-		rte_free(d->sa_tab[newidx].sa);
-		memset(&d->sa_tab[newidx], 0, sizeof(d->sa_tab[newidx]));
-		rte_spinlock_unlock(&d->lock);
-		return ret;
-	}
-	/* .inbound/.dip were already set on sa_tab[newidx] at publish (above);
-	 * never touch sa_tab[idx] here -- idx is -1 for a fresh install, so
-	 * indexing it would write before the array (OOB).  The worker reads
-	 * these fields off newidx via the SAD-returned session. */
 	rte_spinlock_unlock(&d->lock);
 	return 0;
 }
@@ -319,13 +513,14 @@ dpd_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 	struct dpdk_priv *d = dp->priv;
 	int64_t v = -1;
 	rte_spinlock_lock(&d->lock);
-	for (int i = 0; i < MAX_SA; i++)
-		if (d->sa_tab[i].used && d->sa_tab[i].spi == spi &&
-		    d->sa_tab[i].dip == dip) {
-			v = (int64_t)__atomic_load_n(&d->sa_tab[i].bytes,
+	for (uint32_t i = 0; i < d->sa_cap; i++) {
+		struct dp_sa *x = sa_at(d, i);
+		if (x->used && x->spi == spi && x->dip == dip) {
+			v = (int64_t)__atomic_load_n(&x->bytes,
 			    __ATOMIC_RELAXED);
 			break;
 		}
+	}
 	rte_spinlock_unlock(&d->lock);
 	return v;
 }
@@ -336,9 +531,8 @@ sa_of_sess(struct dpdk_priv *d, struct rte_ipsec_session *ss)
 {
 	struct dp_sa *ds = (struct dp_sa *)((uint8_t *)ss -
 	    offsetof(struct dp_sa, sess));
-	uintptr_t base = (uintptr_t)d->sa_tab, end = base + sizeof(d->sa_tab);
 
-	return ((uintptr_t)ds >= base && (uintptr_t)ds < end) ? ds : NULL;
+	return ds->idx < sa_cap(d) && sa_at(d, ds->idx) == ds ? ds : NULL;
 }
 
 

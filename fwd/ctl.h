@@ -10,8 +10,10 @@
 #include "r2dp/proto.h"
 #include "dp.h"
 
-#define FWD_MAXSA 1024
-#define FWD_MAXSP 1024
+/* The control-plane SAD/SPD grow on demand (doubling, from FWD_SA_INIT
+ * entries); FWD_SA_LIMIT only bounds memory against a runaway client. */
+#define FWD_SA_INIT  256
+#define FWD_SA_LIMIT (1u << 22)
 
 /* Larval (GETSPI-reserved) SAs are held this long before reaping; the kernel
  * treats a reserved-but-never-confirmed SPI as garbage after ~30 s. */
@@ -29,8 +31,9 @@ struct fwd_sp_ent { int used; struct r2dp_sp sp; };
 
 struct fwd_ctl {
 	struct fwd_dp dp;                 /* dataplane backend vtable */
-	struct fwd_sa_ent sad[FWD_MAXSA]; /* in-process SAD (M1 scale) */
-	struct fwd_sp_ent spd[FWD_MAXSP];
+	struct fwd_sa_ent *sad;           /* in-process SAD, nsa slots */
+	struct fwd_sp_ent *spd;           /* in-process SPD, nsp slots */
+	uint32_t nsa, nsp;
 	uint32_t next_slid;
 	uint64_t epoch;
 	int verbose;

@@ -49,7 +49,14 @@
 
 #define MEMPOOL_CACHE 256
 #define MEMPOOL_SIZE  16384
-#define MAX_SA        FWD_MAXSA
+/* SA and SP tables are chunked and grow on demand (dpdk_sad.c): a chunk,
+ * once published, never moves or goes away while the data plane runs, so
+ * a worker's pointer into it stays valid across growth. */
+#define DP_CHUNK      1024u          /* entries per chunk */
+#define DP_MAX_CHUNKS 4096u          /* 4M SAs / 4M SPs */
+#define DP_SAD_INIT   1024u          /* initial inbound SAD capacity */
+#define DP_SESS_POOL  2048u          /* crypto sessions per session pool */
+#define DP_MAX_SESS_POOLS 2048u
 #define DP_RING_SZ    1024  /* dispatcher -> worker ring, per direction */
 #define BURST_SZ      128
 #define TAP_IF_DEFAULT "r2dp-tap"
@@ -95,6 +102,7 @@ struct dp_sa {
 	uint64_t           rp_map[RP_WORDS]; /* bit (seq % RP_BITS) seen */
 	uint32_t           rp_w;     /* window (packets), 0 = off, <= RP_BITS */
 	uint8_t            rp_esn;   /* SA uses extended sequence numbers */
+	uint32_t           idx;      /* own slot number (sa_at(d, idx) == this) */
 };
 
 /* SPD entry mirror for the egress (outbound) worker: populated by dpd_sp_add/
@@ -106,7 +114,9 @@ struct dp_sp_ent {
 	 * swapping the pointer, waiting a QSBR grace period, then freeing the
 	 * old copy, so the worker never sees a torn or freed policy (M4). */
 	struct r2dp_sp *sp;
+	uint64_t ver;            /* unique per stored copy (ctl, d->lock) */
 };
+
 
 /* Policy snapshot (SPD view of the worker).  Built by the control thread
  * under d->lock whenever an SA or SP changes, published with a release
@@ -172,7 +182,7 @@ struct dp_wk {
 	uint64_t            n_natt_keepalive; /* RFC 3948 keepalives consumed */
 } __rte_cache_aligned;
 
-#define PEER_HSZ 4096     /* power of two, > 2 * (2 * MAX_SA) */
+#define PEER_HSZ_MIN 4096 /* peer hash slots: power of two, >= 4x peers */
 
 struct dp_pol {
 	const struct r2dp_sp *sp;
@@ -180,22 +190,55 @@ struct dp_pol {
 	uint64_t sa_gen;          /* that slot's gen at bind time */
 	int      score;           /* r2dp_sel_score(sp) */
 	int      slot;            /* sp_tab slot (tie-break) */
+	uint64_t ver;             /* dp_sp_ent.ver: identity for dp_acl */
+	/* the selector compiled against struct acl_key (wire order), for the
+	 * delta list / dead-rule scan; v4 = 0: matches nothing (as in rte_acl) */
+	uint32_t src, smask, dst, dmask;
+	uint16_t sport, dport;    /* 0 = any */
+	uint8_t  proto;           /* 0 = any */
+	uint8_t  v4;
 };
+
+/* An rte_acl OUT classifier, shared by successive snapshots while the
+ * policy set changes by little (refs: snapshots holding it, ctl-only).
+ * Rule r (userdata r+1) was built for a policy copy identified by its
+ * dp_sp_ent.ver (never reused, unlike a freed pointer); a snapshot maps it to
+ * its own out[] index through acl_map (-1: policy gone = dead rule). */
+struct dp_acl {
+	struct rte_acl_ctx *ctx;
+	uint32_t n;
+	uint64_t *sorted;         /* (policy ver, rule) pairs by ver */
+	uint32_t refs;
+};
+
+/* Policies added since the classifier was built are matched by a short
+ * linear scan (delta); rules of deleted/replaced policies are dead and a
+ * hit on one falls back to a scan of out[].  Above DP_ACL_DELTA
+ * delta+dead the classifier is rebuilt; it is also compacted when the
+ * policy set has been idle for DP_ACL_IDLE_MS. */
+#define DP_ACL_DELTA    32
+#define DP_ACL_IDLE_MS  200
 
 struct dp_spd {
 	uint32_t       nout;
 	struct dp_pol *out;       /* OUT policies, most specific first */
-	struct rte_acl_ctx *acl;  /* OUT classifier over out[] (NULL: none) */
+	struct dp_acl *acl;       /* OUT classifier (NULL: none) */
+	int32_t       *acl_map;   /* acl rule -> out[] index, -1 = dead */
+	uint32_t       ndead;     /* dead acl rules */
+	uint32_t       ndelta;
+	uint32_t      *delta;     /* out[] indices not in the classifier */
 	/* Inbound (RFC 4301 s5.2) check, indexed by SA slot: the IN/FWD PROTECT
 	 * policies whose tunnel endpoints/reqid fit that SA are
 	 * in_pol[in_off[slot] .. in_off[slot+1]), valid while the slot's gen
 	 * still equals in_gen[slot] (else the worker falls back to a scan). */
-	uint32_t      *in_off;              /* MAX_SA + 1 */
-	uint64_t      *in_gen;              /* MAX_SA */
+	uint32_t       in_cap;              /* SA slots indexed below */
+	uint32_t      *in_off;              /* in_cap + 1 */
+	uint64_t      *in_gen;              /* in_cap */
 	const struct r2dp_sp **in_pol;
 	/* Tunnel peers (far ends of SAs and PROTECT policies), open addressing,
 	 * 0 = empty; peer_zero records 0.0.0.0 itself. */
-	uint32_t       peer[PEER_HSZ];
+	uint32_t      *peer;
+	uint32_t       peer_mask;           /* slots - 1 (power of two) */
 	int            peer_zero;
 };
 
@@ -232,19 +275,33 @@ struct dpdk_priv {
 	int                 port_id;      /* outer tap (ESP side) */
 	int                 inner_port;   /* inner tap (plaintext side) */
 	struct rte_mempool *pool;
-	struct rte_mempool *sess_mp;   /* crypto session mempool */
+	struct rte_mempool *sess_mp;   /* crypto session mempool (first) */
+	struct rte_mempool *sess_more[DP_MAX_SESS_POOLS]; /* added on demand */
+	uint32_t            n_sess_more;
 	struct rte_mempool *cop_mp;    /* crypto operation mempool */
-	struct rte_ipsec_sad *sad;
+	struct rte_ipsec_sad *sad;     /* published: workers acquire-load it */
+	uint32_t            sad_cap;  /* SAs it was sized for; 0 = fixed */
+	uint32_t            sad_n;    /* inbound SAs in it */
 	struct rte_cryptodev_info cdev_info;
 	uint8_t             cdev_id;
 	int                 have_cdev;
 	rte_spinlock_t      lock;
 	struct rte_rcu_qsbr *rcu;   /* H5: QSBR for the ctl<->worker SA/SP handoff */
 	unsigned            rcu_tid; /* worker thread id registered with the QSBR */
-	struct dp_sa        sa_tab[MAX_SA];
-	struct dp_sp_ent    sp_tab[MAX_SA];
+	struct dp_sa       *sa_chunk[DP_MAX_CHUNKS];
+	struct dp_sp_ent   *sp_chunk[DP_MAX_CHUNKS];
+	uint32_t            sa_cap, sp_cap; /* published (release) slot counts */
+	uint32_t            sa_n, sp_n;     /* live entries (ctl, d->lock) */
+	/* growth stats; inject_grow_fail is a test hook (fail that many
+	 * allocations as if out of memory) */
+	uint64_t            n_grow, n_grow_fail;
+	uint32_t            inject_grow_fail;
 	struct dp_spd      *spd;      /* published policy snapshot (see above) */
 	uint64_t            n_spd_fail; /* snapshot rebuilds that failed (ENOMEM) */
+	uint64_t            n_acl_build;  /* OUT classifier (re)builds */
+	uint64_t            n_acl_reuse;  /* snapshots that kept the classifier */
+	uint64_t            sp_ver;       /* dp_sp_ent.ver source */
+	uint64_t            spd_dirty_tsc; /* last policy change (0: compacted) */
 	int                 verbose;
 	uint64_t            sa_gen;       /* last dp_sa.gen handed out */
 	/* Egress ESP L2: per-peer next hop learned from IKE/ESP sent by a
@@ -265,6 +322,40 @@ struct dpdk_priv {
 	    uint16_t n);
 	uint32_t            spin_max;
 };
+
+/* Slot i (< sa_cap / sp_cap).  Chunk pointers are written once, before
+ * the release store of the cap (or of a snapshot built after it). */
+static inline struct dp_sa *
+sa_at(const struct dpdk_priv *d, uint32_t i)
+{
+	return &__atomic_load_n(&d->sa_chunk[i / DP_CHUNK], __ATOMIC_RELAXED)
+	    [i % DP_CHUNK];
+}
+
+static inline struct dp_sp_ent *
+sp_at(const struct dpdk_priv *d, uint32_t i)
+{
+	return &__atomic_load_n(&d->sp_chunk[i / DP_CHUNK], __ATOMIC_RELAXED)
+	    [i % DP_CHUNK];
+}
+
+static inline uint32_t
+sa_cap(const struct dpdk_priv *d)
+{
+	return __atomic_load_n(&d->sa_cap, __ATOMIC_ACQUIRE);
+}
+
+static inline uint32_t
+sp_cap(const struct dpdk_priv *d)
+{
+	return __atomic_load_n(&d->sp_cap, __ATOMIC_ACQUIRE);
+}
+
+static inline struct rte_ipsec_sad *
+sad_load(const struct dpdk_priv *d)
+{
+	return __atomic_load_n(&d->sad, __ATOMIC_ACQUIRE);
+}
 
 /* Worker owning a tunnel's SAs: a hash of its two endpoints (raw wire
  * order), order-independent so both directions and every rekey of the
@@ -302,9 +393,8 @@ sa_bytes_add(struct dpdk_priv *d, struct rte_ipsec_session *ss, uint64_t n)
 {
 	uintptr_t off = offsetof(struct dp_sa, sess);
 	struct dp_sa *ds = (struct dp_sa *)((uint8_t *)ss - off);
-	/* sanity: the recovered pointer must land inside sa_tab */
-	uintptr_t base = (uintptr_t)d->sa_tab, end = base + sizeof(d->sa_tab);
-	if ((uintptr_t)ds >= base && (uintptr_t)ds < end && sa_live(ds))
+	/* sanity: the recovered pointer must be a live table slot */
+	if (ds->idx < sa_cap(d) && sa_at(d, ds->idx) == ds && sa_live(ds))
 		__atomic_fetch_add(&ds->bytes, n, __ATOMIC_RELAXED);
 }
 
@@ -317,6 +407,9 @@ enum { NT_NONE, NT_ESP, NT_IKE, NT_KEEPALIVE };
 /* dpdk_sad.c */
 void
 sa_slot_free(struct dpdk_priv *d, struct dp_sa *ds);
+int dp_sa_grow(struct dpdk_priv *d);
+int dp_sp_grow(struct dpdk_priv *d);
+void dp_tables_free(struct dpdk_priv *d);
 void
 dpdk_caps(struct fwd_dp *dp);
 int
@@ -346,6 +439,9 @@ int
 spd_rebuild_ex(struct dpdk_priv *d, int policies_changed);
 void
 spd_teardown(struct dpdk_priv *d);
+/* ctl idle hook: compact the OUT classifier once the policy set is quiet */
+void
+spd_idle(struct dpdk_priv *d);
 const struct r2dp_sp *
 sp_match_out(struct dpdk_priv *d, const struct rte_ipv4_hdr *ip, size_t avail,
     struct dp_sa **sa);

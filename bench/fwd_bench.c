@@ -71,7 +71,7 @@ mk_priv(const char *tag)
 	d->cdev_id = (uint8_t)cdev;
 	d->have_cdev = 1;
 	snprintf(n, sizeof(n), "%s_sess", tag);
-	d->sess_mp = rte_cryptodev_sym_session_pool_create(n, 2 * MAX_SA,
+	d->sess_mp = rte_cryptodev_sym_session_pool_create(n, 4096,
 	    rte_cryptodev_sym_get_private_session_size(d->cdev_id), 0, 0,
 	    SOCKET_ID_ANY);
 	snprintf(n, sizeof(n), "%s_cop", tag);
@@ -80,10 +80,11 @@ mk_priv(const char *tag)
 	    sizeof(struct rte_crypto_sym_op) + R2DP_GCM_IV_LEN, SOCKET_ID_ANY);
 	memset(&sc, 0, sizeof(sc));
 	sc.socket_id = SOCKET_ID_ANY;
-	sc.max_sa[RTE_IPSEC_SAD_SPI_DIP] = 2 * MAX_SA;
+	sc.max_sa[RTE_IPSEC_SAD_SPI_DIP] = 4096;
 	sc.flags = RTE_IPSEC_SAD_FLAG_RW_CONCURRENCY;
 	snprintf(n, sizeof(n), "%s_sad", tag);
 	d->sad = rte_ipsec_sad_create(n, &sc);
+	d->sad_cap = 4096;              /* grows past it */
 	if (!d->sess_mp || !d->cop_mp || !d->sad)
 		return NULL;
 	rte_spinlock_init(&d->lock);
@@ -93,13 +94,14 @@ mk_priv(const char *tag)
 static void
 free_priv(struct dpdk_priv *d)
 {
-	for (int i = 0; i < MAX_SA; i++)
-		if (d->sa_tab[i].used)
-			sa_slot_free(d, &d->sa_tab[i]);
+	for (int i = 0; i < (int)sa_cap(d); i++)
+		if ((*sa_at(d, (uint32_t)(i))).used)
+			sa_slot_free(d, &(*sa_at(d, (uint32_t)(i))));
 	spd_teardown(d);
 	rte_ipsec_sad_destroy(d->sad);
 	rte_mempool_free(d->sess_mp);
 	rte_mempool_free(d->cop_mp);
+	dp_tables_free(d);
 	free(d);
 }
 
@@ -478,7 +480,7 @@ main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--sizes") && v)
 			nsz = parse_list(argv[++i], sizes, 28, 1400);
 		else if (!strcmp(argv[i], "--tunnels") && v)
-			ntun = parse_list(argv[++i], tunnels, 1, MAX_SA / 2 - 1);
+			ntun = parse_list(argv[++i], tunnels, 1, 100000);
 		else if (!strcmp(argv[i], "--steer"))
 			steer = 1;
 		else if (!strcmp(argv[i], "--natt"))

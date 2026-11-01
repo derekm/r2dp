@@ -22,6 +22,8 @@ same commit as the behaviour it describes.
 | Data path encrypt→decrypt, forged ICV/ciphertext, 8-bit length regression, batching | `dp_path` | `fwd/dpdk_esp.c` | CI |
 | Stuck cryptodev: drop + count, quarantine, no enqueue behind it, recovery, no op/mbuf leak | `dp_path` (dequeue hook) | `fwd/dpdk_esp.c` crypto_run | CI |
 | NAT-T demux (keepalive / IKE marker / ESP-in-UDP) | `dp_path` natt_class cases | `fwd/dpdk_esp.c` | CI |
+| SA/SP/SAD/session-pool growth from empty to 10000 tunnels under traffic (0 lost); allocation failure refuses installs, live tunnels unaffected | `dp_grow` | `fwd/dpdk_sad.c`, `fwd/dpdk_spd.c`, `fwd/ctl.c` | CI |
+| OUT classifier reuse (delta list, dead rules, compaction) == full scan | `dp_sa` t_acl_diff | `fwd/dpdk_spd.c` | CI |
 | Interop with an independent ESP (scapy): round trips, pad lengths, TTL, window, replay, tamper, unknown SPI, selector, cleartext, truncation; **exact** drop counters | `tests/e2e/fwd_e2e.sh` phases positive/window/negative | DPDK and kernel backends | CI (unshare -Urnm) |
 | NAT-T interop (RFC 3948): ESP-in-UDP round trips, egress framing, plain ESP to a NAT-T SA refused, keepalive consumed, IKE marker not ESP | `fwd_e2e.sh` phase natt | both backends | CI |
 | Kernel XFRM backend via the r2dp socket | `kfwd_test`, `fwd_e2e.sh BACKEND=kernel` | `fwd/dp_xfrm.c` | CI |

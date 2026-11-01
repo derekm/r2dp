@@ -385,6 +385,36 @@ t_sp_upsert(void)
 	    "wrapped slid skips 0 and in-use ids (got %u)", r2dp_msg_sp(&r)->slid);
 }
 
+/* No SA/SP count cap (was 1024 each): the control tables grow past it and
+ * every entry stays findable. */
+static void
+t_scale(void)
+{
+	struct r2dp_sa sa;
+	struct r2dp_sp sp;
+	uint8_t key[20] = { 0 };
+	int ok_sa = 1, ok_sp = 1, found = 1;
+	char a[32], b[32];
+
+	for (uint32_t i = 0; i < 5000 && ok_sa; i++) {
+		mk_sa(&sa, 0x200000 + i); sa.enckeylen = 20; sa.dir = R2DP_DIR_IN;
+		ok_sa = req(R2DP_SA_ADD, 0, &sa, sizeof(sa), key, 20, NULL) == 0;
+	}
+	for (uint32_t i = 0; i < 5000 && ok_sp; i++) {
+		snprintf(a, sizeof(a), "172.%u.%u.0", 16 + i / 256, i % 256);
+		snprintf(b, sizeof(b), "172.%u.%u.0", 32 + i / 256, i % 256);
+		mk_sp(&sp, a, 24, b, 24);
+		ok_sp = req(R2DP_SP_ADD, 0, &sp, sizeof(sp), NULL, 0, NULL) == 0;
+	}
+	for (uint32_t i = 0; i < 5000 && found; i++) {
+		mk_sa(&sa, 0x200000 + i);
+		found = sa_find(C, &sa) != NULL;
+	}
+	CHECK(ok_sa && ok_sp, "5000 SAs and 5000 policies accepted (tables %u/%u)",
+	    C->nsa, C->nsp);
+	CHECK(found, "every SA still found after the table grew");
+}
+
 /* A client that never reads is marked slow instead of blocking dispatch. */
 static void
 t_slow_client(void)
@@ -430,6 +460,7 @@ main(void)
 	t_replay_win();
 	t_expiry();
 	t_sp_upsert();
+	t_scale();
 	t_slow_client();
 
 	if (fails) { printf("ctl_unit: %d failures\n", fails); return 1; }

@@ -360,7 +360,7 @@ bad:
 			keys[nu++] = &kkey[i];
 		ux[i] = (uint8_t)(nu - 1);
 	}
-	uint32_t nlook = rte_ipsec_sad_lookup(d->sad, keys, usa, nu);
+	uint32_t nlook = rte_ipsec_sad_lookup(sad_load(d), keys, usa, nu);
 	for (uint32_t i = 0; i < nk; i++)
 		sas[i] = usa[ux[i]];
 
@@ -719,7 +719,7 @@ dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
 		}
 		ux[i] = (int16_t)(nu - 1);
 	}
-	if (!nu || rte_ipsec_sad_lookup(d->sad, kp, sa, nu) <= 0)
+	if (!nu || rte_ipsec_sad_lookup(sad_load(d), kp, sa, nu) <= 0)
 		return;
 	for (uint16_t i = 0; i < n; i++) {
 		const struct dp_sa *ds;
