@@ -218,6 +218,27 @@ t_lifetime_clock(void)
 		CHECK(fk_sa_calls == calls,
 		    "lifetime-only UPDATE does not rebuild the dataplane SA");
 	}
+	/* a keyless UPDATE that would change what the dataplane holds is
+	 * refused, and the stored SA keeps the values packets use */
+	{
+		int calls = fk_sa_calls;
+		mk_sa(&sa, 0x9001); sa.lft_hard_time = 200;
+		sa.natt_type = R2DP_NATT_ESPINUDP;
+		sa.natt_sport = sa.natt_dport = htons(4500);
+		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == EOPNOTSUPP &&
+		    e->sa.natt_type == R2DP_NATT_NONE && fk_sa_calls == calls,
+		    "keyless UPDATE switching on NAT-T refused (EOPNOTSUPP), SA unchanged");
+		mk_sa(&sa, 0x9001); sa.lft_hard_time = 200;
+		inet_pton(AF_INET, "192.0.2.9", sa.src.addr);
+		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == EOPNOTSUPP,
+		    "keyless UPDATE moving the tunnel endpoint refused");
+		mk_sa(&sa, 0x9001); sa.lft_hard_time = 200; sa.saflags = R2DP_SAF_ESN;
+		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == EOPNOTSUPP,
+		    "keyless UPDATE toggling ESN refused");
+		mk_sa(&sa, 0x9001); sa.lft_hard_time = 300; sa.natt_sport = htons(500);
+		CHECK(req(R2DP_SA_UPDATE, R2DP_HF_NOKEYS, &sa, sizeof(sa), NULL, 0, NULL) == 0,
+		    "NAT-T ports ignored on a non-NAT-T SA (iked sends 500)");
+	}
 }
 
 /* Replay windows wider than the u8 wsize ride in replay_win; anything over

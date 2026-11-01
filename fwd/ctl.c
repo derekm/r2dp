@@ -407,6 +407,27 @@ sa_is_inbound(const struct fwd_sa_ent *e, const struct r2dp_sa *rq)
 	return e && (e->larval || e->inbound);
 }
 
+static int
+addr_same(const struct r2dp_addr *x, const struct r2dp_addr *y)
+{
+	size_t n = x->family == R2DP_AF_INET4 ? 4 : 16;
+	return x->family == y->family && !memcmp(x->addr, y->addr, n);
+}
+
+/* Do two SAs agree on everything the dataplane was given? */
+static int
+sa_dp_same(const struct r2dp_sa *x, const struct r2dp_sa *y)
+{
+	return x->proto == y->proto && x->mode == y->mode &&
+	    x->enc == y->enc && x->integ == y->integ &&
+	    x->natt_type == y->natt_type &&
+	    (x->natt_type == R2DP_NATT_NONE ||
+	    (x->natt_sport == y->natt_sport && x->natt_dport == y->natt_dport)) &&
+	    (x->saflags & R2DP_SAF_ESN) == (y->saflags & R2DP_SAF_ESN) &&
+	    r2dp_sa_window(x) == r2dp_sa_window(y) && x->reqid == y->reqid &&
+	    addr_same(&x->src, &y->src) && addr_same(&x->dst, &y->dst);
+}
+
 static void
 do_sa(int fd, const struct r2dp_msg *m)
 {
@@ -472,6 +493,15 @@ do_sa(int fd, const struct r2dp_msg *m)
 		 * A larval UPDATE (the GETSPI completion path) is fine: it installs
 		 * the key for the first time.  Lifetime-only updates carry no blob. */
 		if (!e->larval && blen) { rc = EINVAL; goto out; }
+		/* ...and a keyless UPDATE of a live SA is not sent to the
+		 * dataplane, so it may change lifetimes only.  Anything the
+		 * dataplane holds (endpoints, transform, NAT-T encapsulation
+		 * and ports, ESN, window, reqid) would otherwise change in our
+		 * table and GET/DUMP while packets keep using the old values. */
+		if (!e->larval && !blen && !sa_dp_same(&e->sa, rq)) {
+			rc = EOPNOTSUPP;
+			goto out;
+		}
 		{
 			/* Apply to the dataplane FIRST.  The dataplane's update is
 			 * del-then-add, so on failure the SAD holds nothing while the
