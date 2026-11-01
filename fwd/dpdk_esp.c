@@ -16,9 +16,11 @@ dp_expire_kick(struct dpdk_priv *d)
 {
 	uint64_t one = 1;
 	int fd = d->expire_fd;
-	/* fd 0 is "unset" (zeroed test priv). Never write stdin. */
-	if (fd > 0)
-		(void)write(fd, &one, sizeof one);
+	/* fd 0 is "unset" (zeroed test priv). Never write stdin.
+	 * write() is warn_unused_result under -Werror; a short write only
+	 * means the kick was coalesced or the fd is gone. */
+	if (fd > 0 && write(fd, &one, sizeof one) < 0)
+		return;
 }
 
 
