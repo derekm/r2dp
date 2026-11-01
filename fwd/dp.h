@@ -54,6 +54,11 @@ struct fwd_dp_ops {
 	int (*sa_set_hard_bytes)(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
 	    uint64_t hard);
 
+	/* Optional: absolute unix-second deadline for the hard time
+	 * lifetime (0 = none).  Same keying as sa_set_hard_bytes. */
+	int (*sa_set_hard_time)(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
+	    uint64_t deadline);
+
 	/* Optional: start/stop the datapath packet threads. */
 	int (*start)(struct fwd_dp *dp);
 	void (*stop)(struct fwd_dp *dp);
@@ -67,6 +72,7 @@ struct fwd_dp_ops {
 struct fwd_dp {
 	const struct fwd_dp_ops *ops;
 	void *priv;             /* backend private state */
+	int wake_fd;            /* optional eventfd ctl polls; -1 = none */
 	uint32_t flags;
 
 	/* Capability bitmaps the dataplane actually supports. */

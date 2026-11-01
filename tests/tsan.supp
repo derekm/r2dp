@@ -1,5 +1,8 @@
 # ThreadSanitizer suppressions for the DPDK libraries (not instrumented).
-# Build: meson setup btsan -Db_sanitize=thread -Db_lundef=false -Dc_args=-DRTE_FORCE_INTRINSICS
+# A race in r2dp code whose stack passes through one of these libraries is
+# also suppressed.  A clean run under this file is not proof the data path
+# is race-free.  CI job `tsan` runs dp_mt/dp_sa/dp_grow/nh_tab with it.
+# Build: meson setup btsan -Denable_dpdk=enabled -Db_sanitize=thread -Db_lundef=false -Dc_args=-DRTE_FORCE_INTRINSICS
 # Run:   TSAN_OPTIONS=suppressions=$PWD/tests/tsan.supp meson test -C btsan
 # librte_eal is left out on purpose: its frames sit at the bottom of every lcore stack.
 called_from_lib:librte_acl.so

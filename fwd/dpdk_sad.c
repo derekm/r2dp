@@ -8,6 +8,7 @@
 #ifdef R2DP_HAVE_DPDK
 
 #include "dpdk_int.h"
+#include <time.h>
 
 /* ------------------------------------------------------------------ */
 void
@@ -453,6 +454,9 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	nd->natt_dport = rsa->natt_dport ? rsa->natt_dport :
 	    rte_cpu_to_be_16(NATT_PORT);
 	nd->hard_bytes = rsa->lft_hard_bytes;
+	nd->hard_deadline = rsa->lft_hard_time ?
+	    (uint64_t)time(NULL) + rsa->lft_hard_time : 0;
+	nd->expire_kicked = 0;
 	nd->gen = ++d->sa_gen;
 	/* publish last: the worker only proceeds past `used` == 1 */
 	__atomic_store_n(&nd->used, 1, __ATOMIC_RELEASE);
@@ -542,6 +546,31 @@ dpd_sa_set_hard_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
 		struct dp_sa *x = sa_at(d, i);
 		if (x->used && x->spi == spi && x->dip == dip) {
 			__atomic_store_n(&x->hard_bytes, hard, __ATOMIC_RELAXED);
+			__atomic_store_n(&x->expire_kicked, 0, __ATOMIC_RELAXED);
+			if (hard && __atomic_load_n(&x->bytes, __ATOMIC_RELAXED) >= hard)
+				sa_mark_expired(d, x);
+			rc = 0;
+		}
+	}
+	rte_spinlock_unlock(&d->lock);
+	return rc;
+}
+
+int
+dpd_sa_set_hard_time(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
+    uint64_t deadline)
+{
+	struct dpdk_priv *d = dp->priv;
+	int rc = -ENOENT;
+	uint64_t now = (uint64_t)time(NULL);
+	rte_spinlock_lock(&d->lock);
+	for (uint32_t i = 0; i < d->sa_cap; i++) {
+		struct dp_sa *x = sa_at(d, i);
+		if (x->used && x->spi == spi && x->dip == dip) {
+			__atomic_store_n(&x->hard_deadline, deadline, __ATOMIC_RELAXED);
+			__atomic_store_n(&x->expire_kicked, 0, __ATOMIC_RELAXED);
+			if (deadline && now >= deadline)
+				sa_mark_expired(d, x);
 			rc = 0;
 		}
 	}

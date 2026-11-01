@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* EFD_CLOEXEC */
 /*
  * fwd/dp_dpdk.c -- DPDK data plane for the r2dp forwarder: ports, workers,
  * probe/start/stop and the fwd_dp vtable (dp.h).
@@ -17,6 +18,8 @@
 #ifdef R2DP_HAVE_DPDK
 
 #include "dpdk_int.h"
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 static struct fwd_dp_ops dpdk_ops;
 
@@ -815,6 +818,11 @@ dpd_stop(struct fwd_dp *dp)
 		rte_free(d->rcu);
 		d->rcu = NULL;
 	}
+	if (d->expire_fd > 0) {
+		close(d->expire_fd);
+		d->expire_fd = -1;
+		dp->wake_fd = -1;
+	}
 	spd_teardown(d);
 }
 
@@ -940,6 +948,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	if (!d)
 		return -ENOMEM;
 	memset(d, 0, sizeof(*d));
+	d->expire_fd = -1;
 	d->verbose = verbose;
 	d->nb_wk = (unsigned)nb_workers;
 	if (nh_size > R2DP_NH_MAX_CAP) {
@@ -1009,10 +1018,18 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	}
 
 	dp->priv = d;
+	{
+		int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+		if (efd > 0) {
+			d->expire_fd = efd;
+			dp->wake_fd = efd;
+		}
+	}
 	dpdk_ops.caps   = dpdk_caps;
 	dpdk_ops.sa_add = dpd_sa_add;
 	dpdk_ops.sa_bytes = dpd_sa_bytes;
 	dpdk_ops.sa_set_hard_bytes = dpd_sa_set_hard_bytes;
+	dpdk_ops.sa_set_hard_time = dpd_sa_set_hard_time;
 	dpdk_ops.sp_add = dpd_sp_add;
 	dpdk_ops.sp_del = dpd_sp_del;
 	dpdk_ops.start  = dpd_start;

@@ -525,16 +525,37 @@ do_sa(int fd, const struct r2dp_msg *m)
 				goto out;
 			}
 		}
-		/* the dataplane drops on an SA past its hard byte limit by
-		 * itself, so a new limit must reach it (or a raised one would
-		 * lose packets the SA may still carry) */
-		if (!e->larval && !blen &&
-		    rq->lft_hard_bytes != e->sa.lft_hard_bytes &&
-		    C->dp.ops && C->dp.ops->sa_set_hard_bytes) {
+		/* the dataplane drops on an SA past its hard byte or time
+		 * limit by itself, so a new limit must reach it (or a raised
+		 * one would lose packets the SA may still carry).  A failed
+		 * push is not committed: ctl and the dataplane stay on the
+		 * last limit that was actually installed. */
+		if (!e->larval && !blen) {
 			uint32_t ndip;
+			int pushed_b = 0;
 			memcpy(&ndip, &e->sa.dst.addr, 4);
-			(void)C->dp.ops->sa_set_hard_bytes(&C->dp,
-			    ntohl(e->sa.spi), ndip, rq->lft_hard_bytes);
+			if (rq->lft_hard_bytes != e->sa.lft_hard_bytes &&
+			    C->dp.ops && C->dp.ops->sa_set_hard_bytes) {
+				int hb = C->dp.ops->sa_set_hard_bytes(&C->dp,
+				    ntohl(e->sa.spi), ndip, rq->lft_hard_bytes);
+				if (hb) { rc = dp_errno(hb); goto out; }
+				pushed_b = 1;
+			}
+			if (rq->lft_hard_time != e->sa.lft_hard_time &&
+			    C->dp.ops && C->dp.ops->sa_set_hard_time) {
+				uint64_t dl = rq->lft_hard_time ?
+				    (uint64_t)e->installed_at + rq->lft_hard_time : 0;
+				int ht = C->dp.ops->sa_set_hard_time(&C->dp,
+				    ntohl(e->sa.spi), ndip, dl);
+				if (ht) {
+					if (pushed_b)
+						(void)C->dp.ops->sa_set_hard_bytes(
+						    &C->dp, ntohl(e->sa.spi), ndip,
+						    e->sa.lft_hard_bytes);
+					rc = dp_errno(ht);
+					goto out;
+				}
+			}
 		}
 		e->inbound = sa_is_inbound(e, rq);
 		/* The lifetime clock starts when key material is installed (the
@@ -774,7 +795,7 @@ int
 fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 {
 	int lfd = r2dp_listen(sockpath, 8);
-	struct pollfd pf[MAXCLI + 1];
+	struct pollfd pf[MAXCLI + 2];
 	int ncli = 0, cli[MAXCLI];
 
 	if (lfd < 0) {
@@ -784,7 +805,7 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 	fprintf(stderr, "r2dp: serving %s (epoch=%llu)\n", sockpath,
 	    (unsigned long long)c->epoch);
 	for (;;) {
-		int n = 0, r, npoll;   /* npoll = clients we polled this pass */
+		int n = 0, r, npoll, wake_i = -1;
 		if (g_stop)
 			break;
 		reap_larv();          /* expire stale GETSPI reservations */
@@ -794,7 +815,20 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 		npoll = ncli;
 		pf[n].fd = lfd; pf[n++].events = POLLIN;
 		for (int i = 0; i < ncli; i++) { pf[n].fd = cli[i]; pf[n++].events = POLLIN; }
+		if (C->dp.wake_fd >= 0) {
+			wake_i = n;
+			pf[n].fd = C->dp.wake_fd;
+			pf[n++].events = POLLIN;
+		}
 		if (poll(pf, n, 500) < 0) { if (errno == EINTR) continue; break; }
+		/* Data path hit a hard lifetime: withdraw and EXPIRE now,
+		 * not after another idle poll. */
+		if (wake_i >= 0 && (pf[wake_i].revents & POLLIN)) {
+			uint64_t v;
+			while (read(C->dp.wake_fd, &v, sizeof v) > 0)
+				;
+			check_lifetimes(cli, ncli);
+		}
 		if (pf[0].revents & POLLIN) {
 			int fd = r2dp_accept(lfd);
 			if (fd >= 0 && ncli < MAXCLI && peer_allowed(fd) &&

@@ -27,4 +27,5 @@ fwd_dp_init(struct fwd_dp *dp)
 {
 	memset(dp, 0, sizeof(*dp));
 	dp->ops = NULL;
+	dp->wake_fd = -1;
 }

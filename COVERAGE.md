@@ -40,12 +40,19 @@ same commit as the behaviour it describes.
   on `main` (the upstream prototype reported it for its own forwarder).
 - **DPDK backend algorithms**: AES-GCM-16 only.  AES-CBC + HMAC, other
   GCM ICV lengths, CCM and ChaCha20 are kernel-backend only.
-- **IPv6** (outer or inner) in the DPDK backend: not implemented.
+- **IPv6** (outer or inner) in the DPDK backend: not implemented.  Inner
+  IPv6 on the plaintext port is discarded, not bypassed in the clear.
 - **Transport mode** in the DPDK backend: not implemented (tunnel only).
 - **Multicore**: SA ownership, sequence uniqueness and replay under
-  concurrent workers are tested (`dp_mt`, e2e with 2 and 3 workers), but
-  there is no table-churn-under-load test and no TSan build; the
-  dispatcher is software steering (no NIC RSS).  See MILESTONES M3.
+  concurrent workers are tested (`dp_mt`, e2e with 2 and 3 workers).
+  There is still no table-churn-under-load test.  A ThreadSanitizer
+  job runs `dp_mt`, `dp_sa`, `dp_grow` and `nh_tab` under
+  `tests/tsan.supp`.  That suppression file hides races whose stack
+  includes an uninstrumented `librte_*` (and any symbol matching
+  `^rte_`), so a clean TSan run is not proof the data path is
+  race-free.  The dispatcher is still software steering.  RSS is
+  enabled when the NIC advertises it (not on net_tap); it balances
+  RX across tunnels and does not spread one tunnel.  See MILESTONES M3.
 - **Performance** numbers are cycles/pkt and Mpps of the ESP path on a
   `--no-huge` vdev (crypto_aesni_mb or crypto_openssl); no NIC, no
   line-rate or latency measurement, no dispatcher cost.

@@ -140,3 +140,25 @@ jobs:
       - name: Forwarder log on failure
         if: failure()
         run: cat "$RUNNER_TEMP/e2e/fwd.out" || true
+
+  # Multi-thread data-plane tests under ThreadSanitizer.  DPDK itself is
+  # not instrumented; tests/tsan.supp hides races whose stack includes
+  # librte_*.  A green job is not proof the data path is race-free.
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install DPDK deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build meson pkg-config libdpdk-dev libssl-dev clang
+      - name: TSan build
+        run: |
+          CC=clang meson setup build-tsan --buildtype=debug -Denable_dpdk=enabled \
+            -Db_sanitize=thread -Db_lundef=false -Dc_args=-DRTE_FORCE_INTRINSICS
+          meson compile -C build-tsan
+      - name: Multi-thread tests under TSan
+        run: |
+          TSAN_OPTIONS="suppressions=$PWD/tests/tsan.supp halt_on_error=1" \
+            meson test -C build-tsan --print-errorlogs \
+            dp_mt dp_sa dp_grow nh_tab

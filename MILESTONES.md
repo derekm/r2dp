@@ -86,7 +86,10 @@ fixed and verified.
   sequence numbers, exactly-once inbound, replay refused) and `fwd_e2e.sh`
   with `FWD_WORKERS=2/3` in CI.  `fwd_bench --workers N` measures the
   multi-worker ESP path.
-- **Still open**: NIC RSS steering instead of the dispatcher, NUMA/hugepage
+- **Still open**: replacing the dispatcher with NIC RSS (RSS is configured
+  when the NIC advertises it, and is not used on net_tap; one tunnel is
+  one outer flow, so RSS does not spread a single tunnel and the
+  dispatcher still steers every packet to its owner), NUMA/hugepage
   docs, the scale and churn exit gate below.
 - **Exit gate**: N-tunnel scale test linear to core count; table churn (SA/SP add/del at 1k/s) under traffic with zero drops/crashes (ASan/TSan builds clean).
 
@@ -152,7 +155,9 @@ into per-backend protocol forks.
 - **Protocol v2** (`R2DP_VERSION 2`): `r2dp_sa.pad0` becomes `dir`
   (`R2DP_DIR_IN`/`OUT`, 0 = infer for compatibility in the forwarder); the
   racoon2 shim sets it explicitly (GETSPI/UPDATE = IN, ADD = OUT).
-  `wsize = 0` means "forwarder default (64)", never "anti-replay off".
+  `wsize = 0` means anti-replay off (PF_KEY `sadb_sa_replay`), not a
+  default window of 64.  A non-zero `replay_win` overrides `wsize`.
+  librte_ipsec still keeps a 64-packet window on an ESN SA.
 - **Concurrency (M4)**: policies are published as pointers (release) and
   retired through QSBR before free; SA slots are published with a
   release-store of `used`; the control thread waits with
@@ -166,8 +171,10 @@ into per-backend protocol forks.
 - **Control server (M8 + minors)**: clients are non-blocking and a client
   that cannot take a reply is dropped instead of stalling the loop; reserved
   SPIs (< 256) and prefixes > 32/128 refused; lifetime clock starts at larval
-  promotion; failed SP upsert restores the old policy; lifetime-only UPDATE
-  does not touch the data plane; request buffers are scrubbed.
+  promotion; failed SP upsert restores the old policy; a lifetime-only
+  UPDATE does not rebuild the dataplane SA (sequence and replay stay),
+  but a changed hard byte limit or hard-time deadline is pushed and a
+  failed push is not committed; request buffers are scrubbed.
 - **libr2dp**: tail-length checks for every message type, `MSG_NOSIGNAL`,
   send buffers scrubbed, HELLO validates seq/status and skips async messages.
 - **Next hops**: one shared `rte_hash` (`fwd/dpdk_nh.c`) keyed by the

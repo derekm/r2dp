@@ -8,6 +8,18 @@
 #ifdef R2DP_HAVE_DPDK
 
 #include "dpdk_int.h"
+#include <time.h>
+#include <unistd.h>
+
+void
+dp_expire_kick(struct dpdk_priv *d)
+{
+	uint64_t one = 1;
+	int fd = d->expire_fd;
+	/* fd 0 is "unset" (zeroed test priv). Never write stdin. */
+	if (fd > 0)
+		(void)write(fd, &one, sizeof one);
+}
 
 
 /* RFC 3948 s2.2 demux of what arrives on UDP/4500, for an Ethernet frame:
@@ -434,22 +446,38 @@ bad:
 		while (j < nk && sas[j] == ss)
 			j++;
 		uint64_t rb = 0;        /* this run's bytes, one counter update */
-		{
-			const struct dp_sa *xs = sa_of_sess(d, ss);
-			if (xs && sa_dead(xs)) {
-				DROP(w, DR_EXPIRED, j - i);
-				for (uint32_t k = i; k < j; k++)
-					rte_pktmbuf_free(pm[k]);
-				i = j;
-				continue;
-			}
+		uint64_t now = (uint64_t)time(NULL);
+		struct dp_sa *xs = sa_of_sess(d, ss);
+		if (xs && sa_dead(xs, now)) {
+			DROP(w, DR_EXPIRED, j - i);
+			for (uint32_t k = i; k < j; k++)
+				rte_pktmbuf_free(pm[k]);
+			i = j;
+			continue;
 		}
 
 		ng = crypto_run(w, ss, &pm[i], (uint16_t)(j - i), ok);
 		for (uint16_t k = 0; k < ng; k++) {
+			uint32_t plen = rte_pktmbuf_pkt_len(ok[k]);
+			/* Crossing packet is not forwarded. Commit what already
+			 * fit, snap the counter to the limit, wake ctl. */
+			if (xs && (sa_time_dead(xs, now) ||
+			    !sa_byte_room(xs, rb, plen))) {
+				if (rb)
+					sa_bytes_add(d, ss, rb);
+				rb = 0;
+				sa_mark_expired(d, xs);
+				DROP(w, DR_EXPIRED, 1);
+				rte_pktmbuf_free(ok[k]);
+				for (uint16_t k2 = k + 1; k2 < ng; k2++) {
+					DROP(w, DR_EXPIRED, 1);
+					rte_pktmbuf_free(ok[k2]);
+				}
+				break;
+			}
 			/* D8: RFC 4301 s5.2 IN selector check + trim to inner IP */
 			if (out && no < BURST_SZ && in_inner_ok(d, ss, ok[k])) {
-				rb += rte_pktmbuf_pkt_len(ok[k]);
+				rb += plen;
 				out[no++] = ok[k];
 			} else {
 				if (d->verbose)
@@ -519,22 +547,19 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 	size_t cav[BURST_SZ] = { 0 };
 
 	if (nr > BURST_SZ) nr = BURST_SZ;
-	/* This data path carries IPv4 only.  Inner IPv6 used to fall through
-	 * to bypass -- cleartext even when an IPv6 PROTECT/DISCARD policy
-	 * asked otherwise.  Fail closed: with such a policy present, inner
-	 * IPv6 is dropped (no policy at all: forwarded, as the kernel does). */
-	{
-		const struct dp_spd *s = __atomic_load_n(&d->spd, __ATOMIC_ACQUIRE);
-		if (s && s->v6_out)
-			for (uint16_t i = 0; i < nr; i++) {
-				const uint8_t *f = rte_pktmbuf_mtod(bufs[i], const uint8_t *);
-				if (rte_pktmbuf_data_len(bufs[i]) >= RTE_ETHER_HDR_LEN &&
-				    f[12] == 0x86 && f[13] == 0xdd) {
-					DROP(w, DR_V6_POLICY, 1);
-					rte_pktmbuf_free(bufs[i]);
-					bufs[i] = NULL;
-				}
-			}
+	/* Inner IPv6 has no ESP path.  Default is discard (RFC 4301), not
+	 * bypass: a config with only IPv4 policies must not leak v6 clear. */
+	for (uint16_t i = 0; i < nr; i++) {
+		const uint8_t *f;
+		if (!bufs[i])
+			continue;
+		f = rte_pktmbuf_mtod(bufs[i], const uint8_t *);
+		if (rte_pktmbuf_data_len(bufs[i]) >= RTE_ETHER_HDR_LEN &&
+		    f[12] == 0x86 && f[13] == 0xdd) {
+			DROP(w, DR_V6_POLICY, 1);
+			rte_pktmbuf_free(bufs[i]);
+			bufs[i] = NULL;
+		}
 	}
 	/* inner tap delivers Ethernet: parse the inner IP at the L2 offset for
 	 * policy matching (one ACL classify for the whole burst); only STRIP
@@ -641,7 +666,8 @@ drop:
 		while (j < nm && pds[j] == ds)
 			j++;
 		uint64_t rb = 0;        /* this run's bytes, one counter update */
-		if (sa_dead(ds)) {
+		uint64_t now = (uint64_t)time(NULL);
+		if (sa_dead(ds, now)) {
 			DROP(w, DR_EXPIRED, j - i);
 			for (uint16_t k = i; k < j; k++)
 				rte_pktmbuf_free(pm[k]);
@@ -653,13 +679,28 @@ drop:
 		for (uint16_t k = 0; k < ng; k++) {
 			struct rte_mbuf *m = ok[k];
 			uint16_t proc = 1;
+			uint32_t plen;
 
 			if (!out || no >= BURST_SZ) {
 				DROP(w, DR_NOMEM, 1);
 				rte_pktmbuf_free(m);
 				continue;
 			}
-			rb += rte_pktmbuf_pkt_len(m);
+			plen = rte_pktmbuf_pkt_len(m);
+			if (sa_time_dead(ds, now) || !sa_byte_room(ds, rb, plen)) {
+				if (rb)
+					__atomic_fetch_add(&ds->bytes, rb, __ATOMIC_RELAXED);
+				rb = 0;
+				sa_mark_expired(d, ds);
+				DROP(w, DR_EXPIRED, 1);
+				rte_pktmbuf_free(m);
+				for (uint16_t k2 = k + 1; k2 < ng; k2++) {
+					DROP(w, DR_EXPIRED, 1);
+					rte_pktmbuf_free(ok[k2]);
+				}
+				break;
+			}
+			rb += plen;
 			{
 				struct rte_ipv4_hdr *oip =
 				    rte_pktmbuf_mtod(m, struct rte_ipv4_hdr *);

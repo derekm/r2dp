@@ -58,6 +58,8 @@ fk_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 
 static int fk_hard_calls;
 static uint64_t fk_hard;
+static int fk_time_calls;
+static uint64_t fk_deadline;
 static int
 fk_sa_set_hard_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
     uint64_t hard)
@@ -66,10 +68,19 @@ fk_sa_set_hard_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
 	fk_hard_calls++; fk_hard = hard;
 	return 0;
 }
+static int
+fk_sa_set_hard_time(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
+    uint64_t deadline)
+{
+	(void)dp; (void)spi; (void)dip;
+	fk_time_calls++; fk_deadline = deadline;
+	return 0;
+}
 
 static const struct fwd_dp_ops fk_ops = {
 	.sa_add = fk_sa_add, .sp_add = fk_sp_add, .sp_del = fk_sp_del,
 	.sa_bytes = fk_sa_bytes, .sa_set_hard_bytes = fk_sa_set_hard_bytes,
+	.sa_set_hard_time = fk_sa_set_hard_time,
 };
 
 static struct fwd_ctl ctl;
@@ -228,6 +239,8 @@ t_lifetime_clock(void)
 		CHECK(e->sa.lft_hard_time == 200, "new hard lifetime applied");
 		CHECK(fk_sa_calls == calls,
 		    "lifetime-only UPDATE does not rebuild the dataplane SA");
+		CHECK(fk_time_calls == 1 && fk_deadline == (uint64_t)t0 + 200,
+		    "lifetime-only UPDATE pushes the hard-time deadline");
 	}
 	/* a keyless UPDATE that would change what the dataplane holds is
 	 * refused, and the stored SA keeps the values packets use */

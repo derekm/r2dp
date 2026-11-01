@@ -90,10 +90,13 @@ struct dp_sa {
 	uint64_t           gen;      /* install generation (monotonic): the
 	                              * newest of several SAs for one tunnel is
 	                              * the post-rekey SA egress must use */
-	uint64_t           hard_bytes; /* hard byte lifetime, 0 = none: past it
-	                              * the worker drops (SA dead), as the
-	                              * upstream prototype does, not only ctl */
-	uint64_t           bytes;    /* total bytes crypted on this SA (soft/hard
+	uint64_t           hard_bytes; /* hard byte lifetime, 0 = none: a packet
+	                              * that would reach it is not forwarded */
+	uint64_t           hard_deadline; /* unix seconds, 0 = no hard time.
+	                              * Worker drops at or past it; ctl still
+	                              * sends EXPIRE. */
+	uint8_t            expire_kicked; /* 1 after the first data-path kick */
+	uint64_t           bytes;    /* total bytes forwarded on this SA (soft/hard
 	                              * byte lifetime accounting, young seq) */
 	/* Our own anti-replay window (inbound SAs, worker-only state), checked
 	 * after the ICV verified and before rte_ipsec_pkt_process.  librte_ipsec
@@ -311,6 +314,8 @@ struct dpdk_priv {
 	uint64_t            n_nh_unref;   /* next hops removed with their last SA/SP */
 	uint64_t            sp_ver;       /* dp_sp_ent.ver source */
 	uint16_t            out_mtu;      /* outer port MTU (0: unchecked) */
+	int                 expire_fd;    /* eventfd (>0). 0 = unset: a zeroed
+	                                   * test priv must not be written. */
 	uint64_t            spd_dirty_tsc; /* last policy change (0: compacted) */
 	int                 verbose;
 	uint64_t            sa_gen;       /* last dp_sa.gen handed out */
@@ -410,13 +415,47 @@ sa_bytes_add(struct dpdk_priv *d, struct rte_ipsec_session *ss, uint64_t n)
 
 extern const char *const dp_drop_name[DR_NUM];
 
-/* Hard byte lifetime reached: the SA is dead in the data path at once,
- * whatever the ctl poll interval (other SAs are unaffected). */
+/* Hard lifetime reached: byte counter at the limit, or hard time passed.
+ * `now` is unix seconds (0 skips the time check). */
 static inline int
-sa_dead(const struct dp_sa *ds)
+sa_time_dead(const struct dp_sa *ds, uint64_t now)
+{
+	uint64_t dl = __atomic_load_n(&ds->hard_deadline, __ATOMIC_RELAXED);
+	return now && dl && now >= dl;
+}
+static inline int
+sa_dead(const struct dp_sa *ds, uint64_t now)
 {
 	uint64_t h = __atomic_load_n(&ds->hard_bytes, __ATOMIC_RELAXED);
+	if (sa_time_dead(ds, now))
+		return 1;
 	return h && __atomic_load_n(&ds->bytes, __ATOMIC_RELAXED) >= h;
+}
+/* 1 if `n` more forwarded bytes still sit strictly under the hard limit.
+ * Reaching the limit is dead (sa_dead uses >=), so the crossing packet
+ * is not forwarded. pending = bytes of this run not yet added. */
+static inline int
+sa_byte_room(const struct dp_sa *ds, uint64_t pending, uint64_t n)
+{
+	uint64_t h = __atomic_load_n(&ds->hard_bytes, __ATOMIC_RELAXED);
+	uint64_t b = __atomic_load_n(&ds->bytes, __ATOMIC_RELAXED);
+	if (!h)
+		return 1;
+	return b + pending + n < h;
+}
+void dp_expire_kick(struct dpdk_priv *d);
+/* Snap the byte counter to the hard limit (so ctl's sa_bytes sees it)
+ * and wake ctl once. Does not add `pending`; the caller commits that
+ * first. */
+static inline void
+sa_mark_expired(struct dpdk_priv *d, struct dp_sa *ds)
+{
+	uint64_t h = __atomic_load_n(&ds->hard_bytes, __ATOMIC_RELAXED);
+	uint64_t b = __atomic_load_n(&ds->bytes, __ATOMIC_RELAXED);
+	if (h && b < h)
+		__atomic_store_n(&ds->bytes, h, __ATOMIC_RELAXED);
+	if (!__atomic_exchange_n(&ds->expire_kicked, 1, __ATOMIC_RELAXED))
+		dp_expire_kick(d);
 }
 /* natt_class() results (dpdk_esp.c). */
 enum { NT_NONE, NT_ESP, NT_IKE, NT_KEEPALIVE };
@@ -442,6 +481,9 @@ dpd_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip);
 int
 dpd_sa_set_hard_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
     uint64_t hard);
+int
+dpd_sa_set_hard_time(struct fwd_dp *dp, uint32_t spi, uint32_t dip,
+    uint64_t deadline);
 struct dp_sa *
 sa_of_sess(struct dpdk_priv *d, struct rte_ipsec_session *ss);
 

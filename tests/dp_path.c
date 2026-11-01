@@ -337,43 +337,27 @@ main(void)
 		tamper_at = -1;
 	}
 
-	/* Inner IPv6: this data path has no IPv6 ESP, so with an IPv6
-	 * PROTECT policy present inner IPv6 must be dropped, not bypassed in
-	 * the clear; with no IPv6 policy it still bypasses. */
+	/* Inner IPv6 has no ESP path and must never leave in the clear,
+	 * whether or not an IPv6 policy is installed (RFC 4301 default
+	 * discard). */
 	{
-		struct fwd_dp dp = { .priv = a };
-		struct r2dp_sp sp;
 		struct rte_mbuf *in[1], *esp[1] = { NULL };
 		uint16_t nout, nb;
 		uint64_t v6 = a->wk[0].n_dropr[DR_V6_POLICY];
-		int bypass_before, dropped;
+		uint8_t *f;
 
-		for (int pass = 0; pass < 2; pass++) {
-			uint8_t *f;
-			in[0] = rte_pktmbuf_alloc(mp);
-			f = in[0] ? (uint8_t *)rte_pktmbuf_append(in[0], 14 + 60) : NULL;
-			if (!f) { CHECK(0, "v6 frame alloc"); break; }
+		in[0] = rte_pktmbuf_alloc(mp);
+		f = in[0] ? (uint8_t *)rte_pktmbuf_append(in[0], 14 + 60) : NULL;
+		if (!f) {
+			CHECK(0, "v6 frame alloc");
+		} else {
 			memset(f, 0, 74);
 			f[12] = 0x86; f[13] = 0xdd; f[14] = 0x60; f[20] = 59; f[21] = 64;
 			nout = nb = 0;
 			esp_outbound(&a->wk[0], in, 1, esp, &nout, &nb);
-			if (pass == 0) {
-				bypass_before = nb == 1 && in[0] != NULL;
-				if (in[0]) rte_pktmbuf_free(in[0]);
-				memset(&sp, 0, sizeof(sp));
-				sp.slid = 66; sp.dir = R2DP_DIR_OUT; sp.action = R2DP_ACT_PROTECT;
-				sp.ul_proto = R2DP_PROTO_ANY;
-				sp.sel_src.family = sp.sel_dst.family = R2DP_AF_INET6;
-				sp.tun_src.family = sp.tun_dst.family = R2DP_AF_INET4;
-				dpd_sp_add(&dp, &sp);
-			} else {
-				dropped = in[0] == NULL && nout == 0 &&
-				    a->wk[0].n_dropr[DR_V6_POLICY] == v6 + 1;
-				if (in[0]) rte_pktmbuf_free(in[0]);
-				CHECK(bypass_before, "inner IPv6 with no IPv6 policy -> bypass");
-				CHECK(dropped, "inner IPv6 with an IPv6 PROTECT policy -> dropped, never clear");
-				dpd_sp_del(&dp, &sp);
-			}
+			CHECK(in[0] == NULL && nout == 0 && nb == 0 &&
+			    a->wk[0].n_dropr[DR_V6_POLICY] == v6 + 1,
+			    "inner IPv6 with no IPv6 policy -> discarded, never clear");
 		}
 	}
 
@@ -396,9 +380,9 @@ main(void)
 		grow_outer_len = 0;
 	}
 
-	/* Hard byte lifetime in the data path (ported from the upstream
-	 * prototype): once an SA's crypted bytes reach lft_hard_bytes the
-	 * worker drops on it as expired, without waiting for the ctl poll. */
+	/* Hard byte lifetime: a packet that would reach the limit is not
+	 * forwarded (no one-burst overshoot).  The counter snaps to the
+	 * limit so the next packet is dead without waiting for ctl. */
 	{
 		static uint8_t w[64], g[64];
 		struct rte_mbuf *m;
@@ -407,20 +391,27 @@ main(void)
 			uint64_t ex = p->wk[0].n_dropr[DR_EXPIRED];
 			for (uint32_t k = 0; k < sa_cap(p); k++) {
 				struct dp_sa *x = sa_at(p, k);
-				if (x && sa_live(x)) x->hard_bytes = x->bytes + 1;
+				if (x && sa_live(x))
+					x->hard_bytes = x->bytes + 100000;
 			}
 			m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
 			CHECK(run(a, b, m, &enc, g) && !memcmp(g, w, 64),
-			    side ? "inbound SA below its hard byte limit passes"
-			         : "egress SA below its hard byte limit passes");
-			m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
-			CHECK(!run(a, b, m, &enc, g) &&
-			    p->wk[0].n_dropr[DR_EXPIRED] == ex + 1,
-			    side ? "inbound SA past its hard byte limit -> expired drop"
-			         : "egress SA past its hard byte limit -> expired drop");
+			    side ? "inbound SA with byte room passes"
+			         : "egress SA with byte room passes");
 			for (uint32_t k = 0; k < sa_cap(p); k++) {
 				struct dp_sa *x = sa_at(p, k);
-				if (x && sa_live(x)) x->hard_bytes = 0;
+				if (x && sa_live(x))
+					x->hard_bytes = x->bytes + 1;
+			}
+			m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+			CHECK(!run(a, b, m, &enc, g) &&
+			    p->wk[0].n_dropr[DR_EXPIRED] >= ex + 1,
+			    side ? "inbound packet that would cross the hard byte limit is not forwarded"
+			         : "egress packet that would cross the hard byte limit is not forwarded");
+			for (uint32_t k = 0; k < sa_cap(p); k++) {
+				struct dp_sa *x = sa_at(p, k);
+				if (x && sa_live(x))
+					x->hard_bytes = 0;
 			}
 		}
 	}
