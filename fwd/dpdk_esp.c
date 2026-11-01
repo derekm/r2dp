@@ -37,6 +37,13 @@ natt_class(const uint8_t *p, uint32_t len)
 	ulen = ((uint16_t)u[4] << 8) | u[5];
 	pl = u + 8;
 	len -= ihl + 8;
+	/* The UDP length bounds the payload (as in the upstream prototype):
+	 * a datagram too short for the marker / ESP header is not IKE or
+	 * ESP-in-UDP, whatever bytes follow it in the frame. */
+	if (ulen < 8)
+		return NT_NONE;
+	if (len > ulen - 8u)
+		len = ulen - 8u;
 	if (ulen == 9 && len >= 1 && pl[0] == 0xff)
 		return NT_KEEPALIVE;
 	if (len < 4)

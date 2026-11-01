@@ -279,6 +279,12 @@ main(void)
 		f[u + 8 + 3] = 0x01;
 		CHECK(natt_class(f, (uint32_t)n) == NT_ESP, "natt: non-zero SPI is ESP-in-UDP");
 		CHECK(natt_class(f, (uint32_t)(u + 8 + 6)) == NT_NONE, "natt: runt ESP is not ESP");
+		f[u + 4] = 0; f[u + 5] = 8 + 6;
+		CHECK(natt_class(f, (uint32_t)n) == NT_NONE,
+		    "natt: UDP length too short for an ESP header is not ESP");
+		f[u + 5] = 4;
+		CHECK(natt_class(f, (uint32_t)n) == NT_NONE, "natt: UDP length below 8 is not ESP");
+		f[u + 5] = 8 + 32;
 		NT_FRAME(500, 8 + 32); f[u + 8 + 3] = 0x01;
 		CHECK(natt_class(f, (uint32_t)n) == NT_NONE, "natt: port 500 is never ESP");
 		NT_FRAME(4500, 8 + 32); f[u + 8 + 3] = 0x01; f[14 + 9] = 6;
