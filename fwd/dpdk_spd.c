@@ -441,10 +441,14 @@ spd_rebuild_ex(struct dpdk_priv *d, int policies_changed)
 		goto fail;
 	__atomic_store_n(&d->spd, ns, __ATOMIC_RELEASE);
 	if (old) {
-		if (old->acl == ns->acl)
-			old->acl = NULL;     /* ownership moved to ns */
 		if (d->rcu)
 			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
+		/* ownership of a reused classifier moved to ns.  Only now: until
+		 * the grace period ended a worker could still be reading
+		 * old->acl, and clearing it under its feet handed
+		 * rte_acl_classify a NULL context. */
+		if (old->acl == ns->acl)
+			old->acl = NULL;
 		spd_free(old);
 	}
 	return 0;
