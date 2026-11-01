@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R2DP — external dataplane control protocol for racoon2</title>
+<style>
+ body{font-family:system-ui,Segoe UI,Roboto,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;line-height:1.5;color:#1a1a1a;background:#fdfdfd}
+ nav a{margin-right:.75rem;color:#0366d6;text-decoration:none}
+ section{margin:2rem 0;padding:1rem 0;border-top:1px solid #e1e4e8}
+ h1,h2,h3{line-height:1.2}
+ h2{border-bottom:2px solid #0366d6;padding-bottom:.25rem}
+ .dag li{margin:.35rem 0}
+ .date{color:#888;font-size:.9em}
+ pre.doc{background:#f6f8fa;padding:1rem;border-radius:6px;overflow:auto;font-size:.85em}
+ table{border-collapse:collapse;width:100%;font-size:.9em}
+ th,td{border:1px solid #e1e4e8;padding:.35rem .5rem;text-align:left}
+ th{background:#f6f8fa}
+ footer{margin-top:3rem;color:#888;font-size:.85em;border-top:1px solid #e1e4e8;padding-top:1rem}
+</style></head>
+<body>
+<h1>R2DP — external dataplane control protocol for racoon2</h1>
+<nav><a href='#overview'>Overview</a> · <a href='#lineage'>Lineage DAG</a> · <a href='#agent'>Agent memory</a> · <a href='#usage'>Usage</a> · <a href='#milestones'>Milestones</a></nav>
+<section id="overview"><h2>Overview</h2><p>R2DP: racoon2 external dataplane control protocol.</p><p>External dataplane control protocol for racoon2: drives a DPDK forwarder instead of the kernel via a PF_KEY-shaped protocol on a unix socket. Contributors own their work; contributions license its use to generate derivative output.</p></section>
+<section id="lineage"><h2>Lineage DAG</h2><h3>Zip lineage (M0 → M0+M1)</h3><ul class='dag'><li><code>b8e89e6</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — docs: link lineage commits/branches to agent memory context (docs/memory-links.md)</li>
+<li><code>d9f3de7</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-26)</span> — ci: baseline lineage-DAG test suite (walk all DAG commits)</li>
+<li><code>b57d97f</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-25)</span> — zip2: r2dp M0+M1 package (direct upstream lineage child)</li>
+<li><code>5361910</code> <b>Terre d&#x27;Hermès</b> <span class='date'>(2026-10-24)</span> — zip1: r2dp M0 base (upstream lineage root)</li></ul><h3>Project DAG (source development, via main)</h3><ul class='dag'><li><code>4b3ba7b</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — tests: clean ThreadSanitizer run over the multi-threaded tests</li>
+<li><code>0ddac49</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: wait out QSBR grace periods in instrumentable code</li>
+<li><code>fd542f1</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: bound NAT-T classification by the UDP length</li>
+<li><code>7dea328</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: enforce the hard byte lifetime in the data path</li>
+<li><code>0a80374</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — ctl: refuse a keyless SA UPDATE that changes data-path parameters</li>
+<li><code>018b35f</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: refuse non-ESP SAs at install instead of treating them as ESP</li>
+<li><code>d1a6f49</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: a queued next-hop learn cannot re-add a peer that just lost its last reference</li>
+<li><code>c236690</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — bench: reproducible sweep entry point (bench/run.sh, meson `bench` target)</li>
+<li><code>344cae6</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: spread multi-queue RX by RSS on NICs that support it</li>
+<li><code>b7f4350</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: validate packet lengths on both paths, enforce outer MTU, fail closed on inner IPv6</li>
+<li><code>783fab1</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: delete a peer&#x27;s next hop with its last SA/policy reference</li>
+<li><code>ea25e46</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: no SA/SP cap -- grow every table off the data path, loss-free</li>
+<li><code>761d269</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: don&#x27;t clear a published SPD snapshot&#x27;s classifier before the grace period</li>
+<li><code>45e5ec5</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: growable lock-free next-hop table, no tunnel cap</li>
+<li><code>6026aa2</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — bench: e2e harness up to 1000 tunnels</li>
+<li><code>dc2b619</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — bench: end-to-end memif harness (generator/validating sink, two forwarders)</li>
+<li><code>168d283</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: never call rte_eth_tx_burst with zero packets</li>
+<li><code>557ee9d</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: drop crypto_run&#x27;s redundant session-attach pass</li>
+<li><code>9efd68e</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: dispatcher steers a whole burst with one SAD lookup and one ACL pass</li>
+<li><code>4253c65</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: next-hop learn/lookup off the per-packet path</li>
+<li><code>ee8a3ba</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — dp_sel: prefix match as one masked 32-bit compare</li>
+<li><code>201b824</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: outbound ACL classify only the distinct keys of a burst</li>
+<li><code>aec52e1</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: NAT-T moves the IP header, not the ESP payload</li>
+<li><code>087ac6b</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: one SA byte-counter update per crypto run, not per packet</li>
+<li><code>a3c44a0</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: inbound SAD lookup once per distinct (SPI, DIP) in a burst</li>
+<li><code>cb01ae6</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: classify a whole outbound burst with one rte_acl_classify</li>
+<li><code>dc9b96c</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — ci, docs: multi-worker e2e lanes and bench JSON; M3 status</li>
+<li><code>42c5a6e</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: -n workers, each tunnel pinned to one worker</li>
+<li><code>16e1b94</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: next-hop table safe for concurrent readers</li>
+<li><code>02262a0</code> <b>Derek Moore</b> <span class='date'>(2026-10-31)</span> — fwd: ESP SAs use atomic sequence numbers (SQN_ATOM)</li></ul><p class='note'>The `lineage` branch is a meta tracking context; the code DAG lives in the source history above.</p></section>
+<section id="agent"><h2>Agent memory milestones</h2><p>(agent ledger)</p></section>
+<section id="links"><h2>Lineage ↔ Agent memory links</h2><p>(memory links)</p></section>
+<section id="usage-token"><h2>Usage — token spend</h2><p>(no usage table)</p></section>
+<section id="usage-msg"><h2>Usage — user-message budget</h2><p>(no usage table)</p></section>
+<p>(no milestone map)</p>
+<footer>Generated passively by <code>site/gen_site.py</code> from the
+<code>lineage</code>, <code>agent</code>, and <code>usage</code> branches.
+Branches at build: lineage=?, agent=?,
+usage=?, contrib-doc=?.</footer>
+</body></html>
