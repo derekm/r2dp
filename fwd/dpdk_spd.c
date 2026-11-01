@@ -734,6 +734,13 @@ spd_rebuild_ex(struct dpdk_priv *d, int policies_changed)
 		if (d->rcu)
 			rte_rcu_qsbr_synchronize(d->rcu, RTE_QSBR_THRID_INVALID);
 		spd_peers_gone(d, old, ns);
+		/* the next-hop maintenance thread reads the published snapshot
+		 * (is_tunnel_peer via nh.wanted) under nh.lock and is no QSBR
+		 * reader: wait until it is out before freeing */
+		if (d->nh.wanted) {
+			rte_spinlock_lock(&d->nh.lock);
+			rte_spinlock_unlock(&d->nh.lock);
+		}
 		spd_free(old);       /* drops its classifier reference */
 	}
 	return 0;

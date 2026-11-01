@@ -20,6 +20,14 @@
 
 static struct fwd_dp_ops dpdk_ops;
 
+/* nh.wanted: a queued learn is applied only for a current tunnel peer */
+static int
+nh_wanted(void *arg, uint32_t ip)
+{
+	return is_tunnel_peer(arg, ip);
+}
+
+
 /* ------------------------------------------------------------------ */
 /* nq RX and nq TX queues (net_tap insists they match): one TX queue per
  * worker; with several workers the dispatcher polls every RX queue (a
@@ -729,8 +737,11 @@ dpd_start(struct fwd_dp *dp)
 	if (!d->nh.h) {
 		int r = r2dp_nh_init(&d->nh, "r2dp_nh", d->nh_size, d->rcu,
 		    SOCKET_ID_ANY);
-		if (r == 0)
+		if (r == 0) {
+			d->nh.wanted = nh_wanted;
+			d->nh.wanted_arg = d;
 			r = r2dp_nh_start(&d->nh);
+		}
 		if (r < 0) {
 			fprintf(stderr, "r2dp-fwd: next-hop table: %s\n",
 			    strerror(-r));

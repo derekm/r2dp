@@ -237,6 +237,10 @@ r2dp_nh_maint(struct r2dp_nh_tab *t)
 	    RTE_DIM(q), NULL)) != 0)
 		for (unsigned j = 0; j < nq; j++) {
 			uint32_t i;
+			if (t->wanted && !t->wanted(t->wanted_arg, q[j].ip)) {
+				t->n_unwanted++;
+				continue;
+			}
 			for (i = 0; i < t->npend && t->pend[i].ip != q[j].ip; i++)
 				;
 			if (i < t->npend)
@@ -261,7 +265,10 @@ r2dp_nh_maint(struct r2dp_nh_tab *t)
 				t->n_grow_fail++;
 		}
 		for (uint32_t i = 0; i < t->npend; )
-			if (nh_put(t, t->pend[i].ip, t->pend[i].mac) >= 0)
+			if (t->wanted && !t->wanted(t->wanted_arg, t->pend[i].ip)) {
+				t->n_unwanted++;
+				t->pend[i] = t->pend[--t->npend];
+			} else if (nh_put(t, t->pend[i].ip, t->pend[i].mac) >= 0)
 				t->pend[i] = t->pend[--t->npend];
 			else
 				i++;

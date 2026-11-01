@@ -68,7 +68,7 @@ dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 	    (unsigned long long)__atomic_load_n(&d->n_acl_build, __ATOMIC_RELAXED),
 	    (unsigned long long)__atomic_load_n(&d->n_acl_reuse, __ATOMIC_RELAXED));
 	fprintf(f, "r2dp-fwd: nexthop peers=%u cap=%u grows=%llu grow_fail=%llu "
-	    "pending=%u q_drop=%llu unref_del=%llu\n",
+	    "pending=%u q_drop=%llu unref_del=%llu unwanted=%llu\n",
 	    __atomic_load_n(&d->nh.n, __ATOMIC_RELAXED),
 	    __atomic_load_n(&d->nh.cap, __ATOMIC_RELAXED),
 	    (unsigned long long)__atomic_load_n(&d->nh.n_grow, __ATOMIC_RELAXED),
@@ -77,7 +77,8 @@ dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 	    __atomic_load_n(&d->nh.npend, __ATOMIC_RELAXED),
 	    (unsigned long long)__atomic_load_n(&d->nh.n_q_drop,
 	    __ATOMIC_RELAXED),
-	    (unsigned long long)__atomic_load_n(&d->n_nh_unref, __ATOMIC_RELAXED));
+	    (unsigned long long)__atomic_load_n(&d->n_nh_unref, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&d->nh.n_unwanted, __ATOMIC_RELAXED));
 	if (d->nb_wk > 1)
 		for (unsigned i = 0; i <= d->nb_wk; i++)
 			fprintf(f, "r2dp-fwd: %s %u: rx=%llu tx=%llu esp=%llu "

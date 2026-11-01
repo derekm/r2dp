@@ -73,6 +73,14 @@ struct r2dp_nh_tab {
 	int                 thr_run;
 	/* stats */
 	uint64_t            n_grow, n_grow_fail, n_q_drop;
+	/* Optional: is ip still a tunnel peer?  Asked under t->lock before a
+	 * queued/pending learn is applied, so a request queued just before
+	 * the peer's last SA/policy went cannot re-add it after r2dp_nh_del.
+	 * The callee must not free what it reads while t->lock is held by
+	 * the caller (dpdk_spd.c takes t->lock before freeing a snapshot). */
+	int               (*wanted)(void *arg, uint32_t ip);
+	void               *wanted_arg;
+	uint64_t            n_unwanted;   /* queued learns dropped by wanted() */
 	/* test hook: fail this many growth attempts as if out of memory */
 	uint32_t            inject_grow_fail;
 };

@@ -166,6 +166,12 @@ del_tunnel(uint32_t t, int sa_only)
 }
 
 static int
+wanted(void *arg, uint32_t ip)
+{
+	return is_tunnel_peer(arg, ip);
+}
+
+static int
 nh_known(uint32_t t)
 {
 	uint8_t mac[6];
@@ -335,7 +341,7 @@ main(void)
 	 * the rest: delete tunnels [0, 1000) entirely and only the SA of
 	 * tunnel 1000 (its OUT policy still names the peer). */
 	{
-		static const uint8_t mac[6] = { 2, 0, 0, 0, 0, 1 };
+		static const uint8_t mac[6] = { 2, 0, 0, 0, 0, 1 }, mac2[6] = { 2, 0, 0, 0, 0, 2 };
 		uint32_t n = ready, gone = 0, kept = 0, del = n > 2000 ? 1000 : n / 2;
 		uint64_t ok0, bad0, unref0 = A->n_nh_unref;
 
@@ -381,6 +387,28 @@ main(void)
 			dpd_sp_del(&da, &sp);
 		}
 		CHECK(!nh_known(del), "last reference (the policy) gone -> next hop gone");
+		/* A learn queued for the maintenance thread just before the
+		 * peer's last reference went must not re-add it (the lock is
+		 * held so the learner's trylock fails and it queues). */
+		{
+			uint64_t uw = A->nh.n_unwanted;
+			int q1, q2;
+			A->nh.wanted = wanted;
+			A->nh.wanted_arg = A;
+			rte_spinlock_lock(&A->nh.lock);
+			q1 = r2dp_nh_learn(&A->nh, peer_of(0), mac);       /* deleted */
+			q2 = r2dp_nh_learn(&A->nh, peer_of(n - 1), mac2);  /* live */
+			rte_spinlock_unlock(&A->nh.lock);
+			r2dp_nh_maint(&A->nh);
+			{
+				uint8_t got[6] = { 0 };
+				CHECK(q1 == 4 && q2 == 4 && !nh_known(0) &&
+				    A->nh.n_unwanted == uw + 1 &&
+				    r2dp_nh_lookup(&A->nh, peer_of(n - 1), got) &&
+				    !memcmp(got, mac2, 6),
+				    "queued learn for a removed peer dropped; for a live peer applied");
+			}
+		}
 	}
 	__atomic_store_n(&stop, 1, __ATOMIC_RELEASE);
 	rte_eal_mp_wait_lcore();
