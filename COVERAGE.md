@@ -27,8 +27,8 @@ same commit as the behaviour it describes.
 | Interop with an independent ESP (scapy): round trips, pad lengths, TTL, window, replay, tamper, unknown SPI, selector, cleartext, truncation; **exact** drop counters | `tests/e2e/fwd_e2e.sh` phases positive/window/negative | DPDK and kernel backends | CI (unshare -Urnm) |
 | NAT-T interop (RFC 3948): ESP-in-UDP round trips, egress framing, plain ESP to a NAT-T SA refused, keepalive consumed, IKE marker not ESP | `fwd_e2e.sh` phase natt | both backends | CI |
 | Kernel XFRM backend via the r2dp socket | `kfwd_test`, `fwd_e2e.sh BACKEND=kernel` | `fwd/dp_xfrm.c` | CI |
-| Multi-worker: each SA processed by its owner only; ESP sequence numbers unique and gapless per SPI under concurrency; inbound exactly-once; replay refused; non-owners count `steer` | `dp_mt` | `fwd/dpdk_esp.c`, `dp_owner` | CI |
-| Multi-worker forwarding (dispatcher + 2/3 workers) with the same exact counters | `fwd_e2e.sh FWD_WORKERS=2,3` | `fwd/dp_dpdk.c` | CI |
+| Multi-worker: each SA processed by its owner only; ESP sequence numbers unique and gapless per SPI under concurrency; inbound exactly-once; replay refused; non-owners count `steer`; tunnels spread over every worker (least-loaded, not a hash) | `dp_mt` | `fwd/dpdk_esp.c`, `tun_owner` | CI |
+| Multi-worker forwarding (2/3 workers, no dispatcher) with the same exact counters | `fwd_e2e.sh FWD_WORKERS=2,3` | `fwd/dp_dpdk.c` | CI |
 | Sanitizers | all of the above under ASan+UBSan | — | CI |
 | Data-path cost (cycles/pkt, Mpps; 64/512/1400B at 1/65/201 tunnels) | `bench/fwd_bench` regression gate | `bench/` | CI |
 
@@ -50,12 +50,14 @@ same commit as the behaviour it describes.
   `tests/tsan.supp`.  That suppression file hides races whose stack
   includes an uninstrumented `librte_*` (and any symbol matching
   `^rte_`), so a clean TSan run is not proof the data path is
-  race-free.  The dispatcher is still software steering.  RSS is
-  enabled when the NIC advertises it (not on net_tap); it balances
-  RX across tunnels and does not spread one tunnel.  See MILESTONES M3.
+  race-free.  There is no dispatcher lcore.  Each worker polls its own
+  RX queue and processes packets it owns in place; a mismatch is
+  cross-posted to the owner, not rehashed.  RSS is not enabled, because
+  a hash onto a queue is not the worker assigned at install.  See
+  MILESTONES M3.
 - **Performance** numbers are cycles/pkt and Mpps of the ESP path on a
   `--no-huge` vdev (crypto_aesni_mb or crypto_openssl); no NIC, no
-  line-rate or latency measurement, no dispatcher cost.
+  line-rate or latency measurement.
 - **ESN with anti-replay off**: librte_ipsec still keeps a 64-packet
   window under ESN (it needs one to infer the high bits); the DPDK backend
   therefore cannot fully disable replay checking on an ESN SA.

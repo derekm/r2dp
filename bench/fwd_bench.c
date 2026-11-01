@@ -24,7 +24,7 @@
  * encrypt, the UDP header removed again on decrypt).
  *
  * --workers N (N > 1): N lcores run the same enc/dec loop at once, each on
- * a tunnel it owns (dp_owner), sharing the cryptodev (one queue pair
+ * a tunnel it owns (tun_owner, install order), sharing the cryptodev (one queue pair
  * each), the SAD and the policy snapshot; reports mean cycles/pkt and the
  * summed Mpps.  No --check gate in this mode.
  *
@@ -365,33 +365,39 @@ mt_worker(void *arg)
 	return 0;
 }
 
-/* One tunnel per worker, chosen so that worker owns it (dp_owner), each
- * worker encrypting and then decrypting its own traffic at the same time
- * as the others.  Aggregate Mpps = sum of the per-worker rates. */
+/* One tunnel per worker.  Install order is the assignment: a fresh
+ * table gives the least-loaded worker, which is 0, then 1, then 2.
+ * Read the owner back.  Do not predict it with a hash. */
+static int
+owner_of(struct dpdk_priv *d, uint32_t spi)
+{
+	uint32_t cap = sa_cap(d);
+
+	for (uint32_t i = 0; i < cap; i++) {
+		struct dp_sa *x = sa_at(d, i);
+
+		if (x->used && x->spi == spi)
+			return x->owner;
+	}
+	return -1;
+}
+
 static int
 mt_tunnels(struct dpdk_priv *a, struct dpdk_priv *b, unsigned nw)
 {
-	uint32_t us, peer;
-	unsigned have = 0;
-
-	inet_pton(AF_INET, "192.0.2.1", &us);
-	for (unsigned p = 1; p < 250 && have != (1u << nw) - 1; p++) {
+	for (unsigned w = 0; w < nw; w++) {
 		char ps[32], s[32], t[32];
 		struct r2dp_sa r;
-		unsigned w;
 
-		snprintf(ps, sizeof(ps), "203.0.113.%u", p);
-		inet_pton(AF_INET, ps, &peer);
-		w = dp_owner(nw, us, peer);
-		if (have & (1u << w))
-			continue;
-		have |= 1u << w;
+		snprintf(ps, sizeof(ps), "203.0.113.%u", w + 1);
 		snprintf(s, sizeof(s), "172.20.%u.0", w);
 		snprintf(t, sizeof(t), "172.21.%u.0", w);
 		mk_sa(&r, 0x6000 + w, "192.0.2.1", ps); r.dir = R2DP_DIR_OUT;
 		if (sa_install(a, &r, key, 20, 0, 0)) return -1;
+		if (owner_of(a, 0x6000 + w) != (int)w) return -1;
 		r.dir = R2DP_DIR_IN;
 		if (sa_install(b, &r, key, 20, 0, 1) ||
+		    owner_of(b, 0x6000 + w) != (int)w ||
 		    add_sp(a, 100 + w, R2DP_DIR_OUT, s, t, "192.0.2.1", ps) ||
 		    add_sp(b, 100 + w, R2DP_DIR_IN, s, t, "192.0.2.1", ps))
 			return -1;
@@ -400,7 +406,7 @@ mt_tunnels(struct dpdk_priv *a, struct dpdk_priv *b, unsigned nw)
 		inet_pton(AF_INET, s, &flow_src[w]);
 		inet_pton(AF_INET, t, &flow_dst[w]);
 	}
-	return have == (1u << nw) - 1 ? 0 : -1;
+	return 0;
 }
 
 static int

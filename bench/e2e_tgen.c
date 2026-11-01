@@ -206,7 +206,7 @@ tx_run(void)
 			b[i] = tmpl[t];
 		}
 		rte_mbuf_refcnt_update(tmpl[t], BURST);
-		uint16_t s = rte_eth_tx_burst(0, 0, b, BURST);
+		uint16_t s = rte_eth_tx_burst(0, (uint16_t)(t % nrxq), b, BURST);
 		if (s < BURST)
 			rte_mbuf_refcnt_update(tmpl[t], (int16_t)-(BURST - s));
 		off += BURST;

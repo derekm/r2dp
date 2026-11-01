@@ -58,7 +58,7 @@
 #define DP_SAD_INIT   1024u          /* initial inbound SAD capacity */
 #define DP_SESS_POOL  2048u          /* crypto sessions per session pool */
 #define DP_MAX_SESS_POOLS 2048u
-#define DP_RING_SZ    1024  /* dispatcher -> worker ring, per direction */
+#define DP_RING_SZ    1024  /* cross-post ring, per direction, per worker */
 #define BURST_SZ      128
 #define TAP_IF_DEFAULT "r2dp-tap"
 
@@ -164,15 +164,14 @@ enum dp_drop {
 #define DROP(w, r, n) do { uint64_t n_ = (n); (w)->n_drop += n_; \
 	(w)->n_dropr[(r)] += n_; } while (0)
 
-#define DP_MAX_WK 8       /* packet workers (-n); + 1 dispatcher slot */
+#define DP_MAX_WK 8       /* packet workers (-n) */
 
 struct dpdk_priv;
 
-/* One packet worker (or, at index nb_wk, the dispatcher).  Everything here
- * is written by that lcore only; the stats dump sums the counters.  Each
- * worker has its own port TX queue and cryptodev queue pair, and in
- * multi-worker mode receives its packets on two SP/SC rings filled by the
- * dispatcher (see dp_dpdk.c). */
+/* One packet worker.  Everything here is written by that lcore only; the
+ * stats dump sums the counters.  Each worker has its own port TX queue
+ * and cryptodev queue pair, polls RX queue `id`, and in multi-worker mode
+ * also dequeues two MP/SC rings of packets cross-posted by other workers. */
 struct dp_wk {
 	struct dpdk_priv   *d;
 	unsigned            id;
@@ -330,7 +329,7 @@ struct dpdk_priv {
 	char                tap_if[IFNAMSIZ];
 	volatile int        running;
 	unsigned            nb_wk;        /* packet workers, 1..DP_MAX_WK */
-	struct dp_wk        wk[DP_MAX_WK + 1]; /* [nb_wk] = dispatcher */
+	struct dp_wk        wk[DP_MAX_WK + 1]; /* [nb_wk] unused */
 	/* Test hooks: cryptodev dequeue override and the drain spin bound
 	 * (NULL / 0 = rte_cryptodev_dequeue_burst / DP_CRYPTO_SPIN_DEFAULT). */
 	uint16_t (*cdeq)(uint8_t dev, uint16_t qp, struct rte_crypto_op **ops,
@@ -372,19 +371,11 @@ sad_load(const struct dpdk_priv *d)
 	return __atomic_load_n(&d->sad, __ATOMIC_ACQUIRE);
 }
 
-/* Worker owning a tunnel's SAs: a hash of its two endpoints (raw wire
- * order), order-independent so both directions and every rekey of the
- * tunnel stay on one worker -- no state hand-over, no reordering. */
-static inline uint8_t
-dp_owner(unsigned nb_wk, uint32_t a, uint32_t b)
-{
-	uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
-
-	if (nb_wk <= 1)
-		return 0;
-	return (uint8_t)(rte_hash_crc_4byte(hi, rte_hash_crc_4byte(lo, 0))
-	    % nb_wk);
-}
+/* Worker owning a tunnel is chosen at install, not by a hash.  A hash
+ * clumps (measured: flows collapsed onto a subset of workers) and it does
+ * not match the RX queue a packet arrives on, so every frame was steered.
+ * tun_owner() in dpdk_sad.c assigns a new tunnel to the least-loaded
+ * worker and keeps both directions and every rekey on that worker. */
 
 /* Reset worker slot `id` (counters, queues) for priv `d`. */
 static inline void

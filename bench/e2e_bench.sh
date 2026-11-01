@@ -6,14 +6,18 @@
 #         plaintext              encrypt          ESP             decrypt           plaintext, validated
 #
 # Usage: bench/e2e_bench.sh BUILD_DIR
-#   W=1|2|4 workers per forwarder (W > 1 adds a dispatcher lcore); both
-#   forwarders get W, since their memif link needs equal queue counts
+#   W=1|2|4 workers per forwarder (no dispatcher lcore).  Both forwarders
+#   get W.  Memif has no queues= argument; both sides configure W queue
+#   pairs.  Tunnel t is owned by worker t % W (least-loaded install
+#   order) and the generator transmits it on TX queue t % W, so the
+#   owner receives it in place.
 #   NTUN=1..16384 tunnels (each its own peer address 203.0.113.1 + t, so
 #   they spread over
 #   workers), NATT=1 ESP-in-UDP SAs, SIZES=64,512,1400 (Ethernet
 #   frame bytes), SECS=2 per trial, LOSS=0.001 (no-loss threshold)
-#   CPU placement: TG_CPUS="0,1" (tx,rx) A_CPUS="2" B_CPUS="3" (workers then
-#   dispatcher, one CPU each) MAIN_CPUS="6-7" (control threads, idle)
+#   CPU placement: TG_CPUS="0,1" (tx,rx) A_CPUS="2,3" B_CPUS="4,5"
+#   (one CPU per worker, no dispatcher) MAIN_CPUS="6" (control, not a
+#   data-path CPU)
 #   LOOP=1: no forwarders -- the generator's two ports wired to each other,
 #   the generator + memif ceiling.
 # Prints one JSON line per size (generator results, plus each forwarder's
@@ -26,19 +30,19 @@ W=${W:-1}; B_W=$W; NTUN=${NTUN:-1}; NATT=${NATT:-0}; SIZES=${SIZES:-64,512,1400}
 SECS=${SECS:-2}; LOSS=${LOSS:-0.001}
 TG_CPUS=${TG_CPUS:-0,1}; MAIN_CPUS=${MAIN_CPUS:-6-7}
 A_CPUS=${A_CPUS:-2}; B_CPUS=${B_CPUS:-3}
-D=$(mktemp -d /tmp/r2dp-e2eb.XXXXXX)
+D=$(mktemp -d "${TMPDIR:-/tmp}/r2dp-e2eb.XXXXXX")
 PIDS=
 cleanup() { for p in $PIDS; do kill -TERM $p 2>/dev/null; done; wait 2>/dev/null; rm -rf "$D"; }
 trap cleanup EXIT
 [ -n "${KEEP:-}" ] && trap "for p in \$PIDS; do kill -TERM \$p 2>/dev/null; done; wait; echo logs in \$D" EXIT
 
-lcores() {   # $1 = comma list of CPUs for workers (+ dispatcher)
+lcores() {   # $1 = comma list of CPUs, one per worker
 	local l="0@($MAIN_CPUS)" i=1
 	for c in ${1//,/ }; do l="$l,$i@$c"; i=$((i + 1)); done
 	echo "$l"
 }
 for x in "$W:$A_CPUS" "$B_W:$B_CPUS"; do
-	w=${x%%:*}; need=$(( w > 1 ? w + 1 : 1 ))
+	w=${x%%:*}; need=$w
 	[ "$(echo "${x#*:}" | tr ',' ' ' | wc -w)" -ge $need ] || { echo "need $need CPUs for $w workers (A_CPUS/B_CPUS)"; exit 2; }
 done
 # PMD=aesni_mb|openssl (crypto PMD), HUGE=1: use hugepages (default --no-huge)

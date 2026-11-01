@@ -57,18 +57,9 @@ port_init(struct dpdk_priv *d, uint16_t port, unsigned ntxq)
 		    port, dev_info.max_tx_queues, ntxq);
 		return -1;
 	}
-	/* Several RX queues: spread them by RSS on hardware that has it, so
-	 * the dispatcher's RX load (and the NIC's) is balanced; the
-	 * dispatcher steers every packet to its SA's owner either way.
-	 * net_tap's RSS needs eBPF and the kernel spreads its frames anyway. */
-	if (nrxq > 1 && dev_info.flow_type_rss_offloads &&
-	    strcmp(dev_info.driver_name, "net_tap") != 0) {
-		conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-		conf.rx_adv_conf.rss_conf.rss_hf = (RTE_ETH_RSS_IP |
-		    RTE_ETH_RSS_NONFRAG_IPV4_UDP) & dev_info.flow_type_rss_offloads;
-		if (!conf.rx_adv_conf.rss_conf.rss_hf)
-			conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
-	}
+	/* No RSS.  A hash onto a queue is not the worker tun_owner()
+	 * assigned, so it would cross-post every packet.  Queue q is
+	 * worker q.  The sender places a tunnel on that queue. */
 	if (rte_eth_dev_configure(port, nrxq, (uint16_t)ntxq, &conf) < 0)
 		return -rte_errno;
 	for (uint16_t q = 0; q < nrxq; q++)
@@ -530,12 +521,89 @@ qsbr_offline(struct dpdk_priv *d, unsigned tid)
 		rte_rcu_qsbr_thread_offline(d->rcu, tid);
 }
 
-/* Packet worker.  With one worker it polls queue 0 of both ports itself
- * (run to completion, as before multi-worker support).  With several, the
- * dispatcher (below) feeds it through two SP/SC rings and it only ever
- * handles packets for SAs it owns (dp_sa.owner), so every per-SA piece of
- * mutable state -- the replay window, the outbound sequence number -- has
- * exactly one writer. */
+/* Packet worker.  One worker polls queue 0 itself.  Several workers each
+ * poll their own RX queue and process a packet in place when they own its
+ * SA.  A packet for another worker is enqueued to that worker's ring
+ * (multi-producer: any worker may cross-post).  There is no dispatcher
+ * lcore.  The e2e memif sweep showed one: a dispatcher that touched every
+ * packet made -n 2 slower than -n 1 at 1400 B even with 1000 tunnels.
+ * Replay and the outbound sequence stay single-writer because only the
+ * owner calls esp_inbound/esp_outbound. */
+static void
+cross_post(struct dp_wk *w, struct rte_ring *r, struct rte_mbuf **m,
+    uint16_t n)
+{
+	unsigned sent;
+
+	if (!n)
+		return;
+	sent = rte_ring_mp_enqueue_burst(r, (void **)m, n, NULL);
+	if (sent < n) {
+		DROP(w, DR_STEER, n - sent);
+		rte_pktmbuf_free_bulk(&m[sent], n - sent);
+	}
+}
+
+/* RX one queue, learn next hops here (the receiver is the writer that
+ * saw the frame), drop NAT keepalives, process what this worker owns,
+ * cross-post the rest.  outer=1 is the ESP port. */
+static void
+rx_owned(struct dp_wk *w, uint16_t port, int outer)
+{
+	struct dpdk_priv *d = w->d;
+	struct rte_mbuf *bufs[BURST_SZ], *mine[BURST_SZ];
+	struct rte_mbuf *q[DP_MAX_WK][BURST_SZ];
+	uint16_t nq[DP_MAX_WK] = { 0 };
+	uint8_t tw[BURST_SZ];
+	uint16_t nr, nk = 0, nm = 0;
+	struct nh_memo mo = { .valid = 0 };
+
+	nr = rte_eth_rx_burst(port, w->id, bufs, BURST_SZ);
+	if (!nr)
+		return;
+	w->n_rx += nr;
+	for (uint16_t i = 0; i < nr; i++) {
+		if (outer) {
+			nh_learn_frame(d, bufs[i], &mo);
+			if (natt_class(rte_pktmbuf_mtod(bufs[i], const uint8_t *),
+			    rte_pktmbuf_data_len(bufs[i])) == NT_KEEPALIVE) {
+				w->n_natt_keepalive++;
+				rte_pktmbuf_free(bufs[i]);
+				continue;
+			}
+		}
+		bufs[nk++] = bufs[i];
+	}
+	if (!nk)
+		return;
+	if (outer)
+		dp_steer_outer(d, bufs, nk, tw);
+	else
+		dp_steer_inner(d, bufs, nk, tw);
+	for (uint16_t i = 0; i < nk; i++) {
+		uint8_t t = tw[i];
+
+		if (t >= d->nb_wk)
+			t = 0;
+		if (t == w->id)
+			mine[nm++] = bufs[i];
+		else
+			q[t][nq[t]++] = bufs[i];
+	}
+	if (nm) {
+		if (outer)
+			outer_burst(w, mine, nm, port, 0);
+		else
+			inner_burst(w, mine, nm, port);
+	}
+	for (unsigned t = 0; t < d->nb_wk; t++) {
+		if (!nq[t])
+			continue;
+		cross_post(w, outer ? d->wk[t].ring_o : d->wk[t].ring_i,
+		    q[t], nq[t]);
+	}
+}
+
 static int
 worker_main(void *arg)
 {
@@ -565,6 +633,9 @@ worker_main(void *arg)
 				inner_burst(w, bufs, nr, d->inner_port);
 			}
 		} else {
+			rx_owned(w, (uint16_t)port, 1);
+			if (d->inner_port >= 0)
+				rx_owned(w, (uint16_t)d->inner_port, 0);
 			nr = rte_ring_sc_dequeue_burst(w->ring_o, (void **)bufs,
 			    BURST_SZ, NULL);
 			if (nr)
@@ -575,94 +646,12 @@ worker_main(void *arg)
 				inner_burst(w, bufs, nr,
 				    d->inner_port >= 0 ? d->inner_port : port);
 		}
-		/* quiescent: ctl may now free anything read this iteration */
 		if (d->rcu)
 			rte_rcu_qsbr_quiescent(d->rcu, w->lcore);
-		if (single)
+		if (w->id == 0)
 			housekeeping(d, &last_t);
 	}
 	qsbr_offline(d, w->lcore);
-	return 0;
-}
-
-/* Hand per-worker batches to their rings; what does not fit is dropped
- * and counted on the dispatcher (DR_STEER). */
-static void
-dispatch_flush(struct dp_wk *dw, struct rte_mbuf *q[][BURST_SZ],
-    uint16_t *nq, int outer)
-{
-	struct dpdk_priv *d = dw->d;
-
-	for (unsigned i = 0; i < d->nb_wk; i++) {
-		struct rte_ring *r = outer ? d->wk[i].ring_o : d->wk[i].ring_i;
-		unsigned sent;
-
-		if (!nq[i])
-			continue;
-		sent = rte_ring_sp_enqueue_burst(r, (void **)q[i], nq[i], NULL);
-		if (sent < nq[i]) {
-			DROP(dw, DR_STEER, nq[i] - sent);
-			rte_pktmbuf_free_bulk(&q[i][sent], nq[i] - sent);
-		}
-		nq[i] = 0;
-	}
-}
-
-/* Multi-worker dispatcher: the only lcore that receives.  It learns next
- * hops and consumes NAT keepalives (so d->nh has one writer), then steers
- * each frame to the worker that owns its SA.  It reads the SAD and the
- * policy snapshot, so it is a QSBR reader like the workers. */
-static int
-dispatcher_main(void *arg)
-{
-	struct dp_wk *dw = arg;
-	struct dpdk_priv *d = dw->d;
-	struct rte_mbuf *bufs[BURST_SZ];
-	struct rte_mbuf *q[DP_MAX_WK][BURST_SZ];
-	uint16_t nq[DP_MAX_WK] = { 0 };
-	uint8_t tw[BURST_SZ];                 /* target worker per frame */
-	uint64_t last_t = 0;
-	unsigned qi = 0;
-
-	fprintf(stderr, "r2dp-fwd: dispatcher on lcore %u for %u workers\n",
-	    rte_lcore_id(), d->nb_wk);
-	qsbr_online(d, dw->lcore);
-	while (__atomic_load_n(&d->running, __ATOMIC_RELAXED)) {
-		uint16_t rq = qi++ % d->nb_wk;     /* round-robin the RX queues */
-		uint16_t nr = rte_eth_rx_burst(d->port_id, rq, bufs, BURST_SZ);
-
-		struct nh_memo mo = { .valid = 0 };
-
-		uint16_t nk = 0;
-
-		dw->n_rx += nr;
-		for (uint16_t i = 0; i < nr; i++) {
-			nh_learn_frame(d, bufs[i], &mo);
-			if (natt_class(rte_pktmbuf_mtod(bufs[i], const uint8_t *),
-			    rte_pktmbuf_data_len(bufs[i])) == NT_KEEPALIVE) {
-				dw->n_natt_keepalive++;   /* RFC 3948 s2.3 */
-				rte_pktmbuf_free(bufs[i]);
-				continue;
-			}
-			bufs[nk++] = bufs[i];
-		}
-		dp_steer_outer(d, bufs, nk, tw);
-		for (uint16_t i = 0; i < nk; i++)
-			q[tw[i]][nq[tw[i]]++] = bufs[i];
-		dispatch_flush(dw, q, nq, 1);
-		if (d->inner_port >= 0) {
-			nr = rte_eth_rx_burst(d->inner_port, rq, bufs, BURST_SZ);
-			dw->n_rx += nr;
-			dp_steer_inner(d, bufs, nr, tw);
-			for (uint16_t i = 0; i < nr; i++)
-				q[tw[i]][nq[tw[i]]++] = bufs[i];
-			dispatch_flush(dw, q, nq, 0);
-		}
-		if (d->rcu)
-			rte_rcu_qsbr_quiescent(d->rcu, dw->lcore);
-		housekeeping(d, &last_t);
-	}
-	qsbr_offline(d, dw->lcore);
 	return 0;
 }
 
@@ -683,9 +672,10 @@ max_workers(struct dpdk_priv *d)
 	return n ? n : 1;
 }
 
-/* Launch nb_wk workers (plus a dispatcher when nb_wk > 1) on the EAL
- * worker lcores.  nb_wk was fixed at probe time, before any SA could be
- * installed, because it decides dp_sa.owner. */
+/* Launch nb_wk workers on the EAL worker lcores.  Each polls RX queue
+ * `id` and processes packets it owns in place.  nb_wk was fixed at probe
+ * time, before any SA could be installed, because it decides the
+ * least-loaded assignment.  No dispatcher lcore. */
 static int
 dpd_start(struct fwd_dp *dp)
 {
@@ -696,7 +686,7 @@ dpd_start(struct fwd_dp *dp)
 		return -ENODEV;
 	if (d->running)
 		return -EBUSY;
-	need = d->nb_wk + (d->nb_wk > 1);
+	need = d->nb_wk;
 	RTE_LCORE_FOREACH_WORKER(lcore) {
 		if (nlc == need)
 			break;
@@ -751,20 +741,20 @@ dpd_start(struct fwd_dp *dp)
 			return r;
 		}
 	}
-	for (unsigned i = 0; i <= d->nb_wk; i++) {
+	for (unsigned i = 0; i < d->nb_wk; i++) {
 		dp_wk_init(d, i);
-		if (i < need)
-			d->wk[i].lcore = lc[i];
+		d->wk[i].lcore = lc[i];
 	}
 	if (d->nb_wk > 1)
 		for (unsigned i = 0; i < d->nb_wk; i++) {
 			char n[RTE_RING_NAMESIZE];
 			snprintf(n, sizeof(n), "r2dp_ro%u", i);
+			/* MP/SC: any worker may cross-post; only this worker dequeues. */
 			d->wk[i].ring_o = rte_ring_create(n, DP_RING_SZ,
-			    SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
+			    SOCKET_ID_ANY, RING_F_SC_DEQ);
 			snprintf(n, sizeof(n), "r2dp_ri%u", i);
 			d->wk[i].ring_i = rte_ring_create(n, DP_RING_SZ,
-			    SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
+			    SOCKET_ID_ANY, RING_F_SC_DEQ);
 			if (!d->wk[i].ring_o || !d->wk[i].ring_i) {
 				fprintf(stderr, "r2dp-fwd: worker ring: %s\n",
 				    rte_strerror(rte_errno));
@@ -785,9 +775,6 @@ dpd_start(struct fwd_dp *dp)
 	d->running = 1;
 	for (unsigned i = 0; i < d->nb_wk; i++)
 		rte_eal_remote_launch(worker_main, &d->wk[i], d->wk[i].lcore);
-	if (d->nb_wk > 1)
-		rte_eal_remote_launch(dispatcher_main, &d->wk[d->nb_wk],
-		    d->wk[d->nb_wk].lcore);
 	return 0;
 }
 
@@ -797,7 +784,7 @@ dpd_stop(struct fwd_dp *dp)
 	struct dpdk_priv *d = dp->priv;
 
 	__atomic_store_n(&d->running, 0, __ATOMIC_RELAXED);
-	for (unsigned i = 0; i <= d->nb_wk; i++) {
+	for (unsigned i = 0; i < d->nb_wk; i++) {
 		struct dp_wk *w = &d->wk[i];
 		struct rte_mbuf *m;
 

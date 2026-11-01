@@ -70,27 +70,29 @@ fixed and verified.
 - **Exit gate**: soft expiry triggers iked rekey with no packet loss in a ping flood; `samples/linux-matrix` rows (incl. NAT-T, ESN) pass against the forwarder; kernel-XFRM oracle matches on all algs.
 
 ## M3 — Multicore & update safety
-- **Builds**: RSS multi-queue workers, per-lcore counters, rte_rcu_qsbr table swaps, SA-pinned ordering notes (one SA = one core), hugepage/NUMA setup docs.
+- **Builds**: multi-queue workers (one RX queue per worker, no RSS hash), per-lcore counters, rte_rcu_qsbr table swaps, SA-pinned ordering notes (one SA = one core), hugepage/NUMA setup docs.
 - **Deps**: multi-queue-capable PMD (or net_tap multi-queue for CI), perf tools (optional).
 - **In (today's code)**: `r2dp-fwd -n N` runs N packet workers.  Each
-  tunnel is owned by one worker (`dp_owner`: a hash of its two endpoints,
-  so both directions and every rekey stay put) and every per-SA writer --
-  replay window, sequence number, byte counters -- is that worker; others
-  drop a stray packet as `steer`.  With N > 1 a dispatcher lcore receives
-  on every RX queue, learns next hops (serialized writer; readers
-  look up lock-free, see Next hops), consumes NAT-T keepalives and hands frames to the owner over
-  SP/SC rings.  Per-worker TX queues, cryptodev queue pairs, counters and
+  tunnel is owned by one worker, assigned at install to the least-loaded
+  worker (`tun_owner`).  Both directions and every rekey of that tunnel
+  stay on it.  A hash is not used: it clumps, and it does not match the
+  RX queue a packet arrives on.  Every per-SA writer -- replay window,
+  sequence number, byte counters -- is that worker.  Each worker polls
+  RX queue `id` (queue q is worker q) and processes a packet it owns in
+  place.  A packet that arrived on another queue is cross-posted to the
+  owner's ring (multi-producer, single-consumer).  There is no dispatcher
+  lcore.  RSS is not enabled: it would hash a flow onto a queue that is
+  not the assigned worker.  The sender places tunnel t on TX queue
+  t % N.  Per-worker TX queues, cryptodev queue pairs, counters and
   stuck-crypto quarantine; the stats dump sums them.  SAs also carry
   `RTE_IPSEC_SAFLAG_SQN_ATOM` as a backstop against GCM nonce reuse.
   Covered by `dp_mt` (concurrent workers on shared SAs: unique gapless
-  sequence numbers, exactly-once inbound, replay refused) and `fwd_e2e.sh`
-  with `FWD_WORKERS=2/3` in CI.  `fwd_bench --workers N` measures the
-  multi-worker ESP path.
-- **Still open**: replacing the dispatcher with NIC RSS (RSS is configured
-  when the NIC advertises it, and is not used on net_tap; one tunnel is
-  one outer flow, so RSS does not spread a single tunnel and the
-  dispatcher still steers every packet to its owner), NUMA/hugepage
-  docs, the scale and churn exit gate below.
+  sequence numbers, exactly-once inbound, replay refused, tunnels spread
+  over every worker) and `fwd_e2e.sh` with `FWD_WORKERS=2/3` in CI.
+  `fwd_bench --workers N` measures the multi-worker ESP path.
+- **Still open**: a flow rule that pins a tunnel to its owner's queue on
+  a NIC that does not preserve the sender's TX queue (memif does).
+  NUMA/hugepage docs, the scale and churn exit gate below.
 - **Exit gate**: N-tunnel scale test linear to core count; table churn (SA/SP add/del at 1k/s) under traffic with zero drops/crashes (ASan/TSan builds clean).
 
 ## M4 — Offload, on-demand, MTU

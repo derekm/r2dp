@@ -362,6 +362,40 @@ sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds, int sad_del)
 	sa_slot_free(d, ds);
 }
 
+/* Least-loaded worker for a new tunnel.  An existing tunnel (either
+ * direction, or a rekey of the same endpoints) keeps its worker, so
+ * replay and the outbound sequence never move.  Caller holds d->lock.
+ * Counts live SAs, not a hash: equal counts take the lowest id, which
+ * is round-robin on a fresh table and rebalances after deletes. */
+static uint8_t
+tun_owner(struct dpdk_priv *d, uint32_t sip, uint32_t dip)
+{
+	uint32_t lo = sip < dip ? sip : dip;
+	uint32_t hi = sip < dip ? dip : sip;
+	unsigned n[DP_MAX_WK] = { 0 };
+	unsigned best = 0;
+	uint32_t cap = sa_cap(d);
+
+	if (d->nb_wk <= 1)
+		return 0;
+	for (uint32_t i = 0; i < cap; i++) {
+		struct dp_sa *x = sa_at(d, i);
+		uint32_t a, b;
+
+		if (!x->used || x->owner >= d->nb_wk)
+			continue;
+		a = x->srca < x->dsta ? x->srca : x->dsta;
+		b = x->srca < x->dsta ? x->dsta : x->srca;
+		if (a == lo && b == hi)
+			return x->owner;
+		n[x->owner]++;
+	}
+	for (unsigned w = 1; w < d->nb_wk; w++)
+		if (n[w] < n[best])
+			best = w;
+	return (uint8_t)best;
+}
+
 /* ------------------------------------------------------------------ */
 int
 sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
@@ -447,7 +481,7 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	nd->dip = dip;
 	nd->inbound = inbound;
 	nd->natt = rsa->natt_type;
-	nd->owner = dp_owner(d->nb_wk, sip, dip);
+	nd->owner = tun_owner(d, sip, dip);
 	/* iked's NAT-T ports (the peer's may be NAT-mapped); 0 -> 4500 */
 	nd->natt_sport = rsa->natt_sport ? rsa->natt_sport :
 	    rte_cpu_to_be_16(NATT_PORT);

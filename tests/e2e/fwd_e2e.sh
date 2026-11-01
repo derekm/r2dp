@@ -56,11 +56,10 @@ if [ "$BACKEND" = kernel ]; then
 	ip addr add 192.0.2.1/24 dev r2ok
 	"$FWD" -s "$D/fwd.sock" --dp kernel --dp-cleanup -v >"$D/fwd.out" 2>&1 &
 else
-	# FWD_WORKERS=n: n packet workers (+ a dispatcher lcore when n > 1)
+	# FWD_WORKERS=n: n packet workers, each polling its own RX queue
 	W=${FWD_WORKERS:-1}
-	# main + workers (+ dispatcher), floating over every CPU so -n 3 also
-	# runs on a small CI runner
-	LC=$((W > 1 ? W + 1 : 1)); CPUS="0-$(($(nproc) - 1))"; LCORES=
+	# main + workers, floating over every CPU
+	LC=$W; CPUS="0-$(($(nproc) - 1))"; LCORES=
 	for l in $(seq 0 $LC); do LCORES="$LCORES${LCORES:+,}$l@($CPUS)"; done
 	"$FWD" -s "$D/fwd.sock" -n "$W" --lcores "$LCORES" --no-huge -m 512 --no-pci --no-telemetry \
 	    --file-prefix "r2e2e$$" --vdev=net_tap0,iface=r2o --vdev=net_tap1,iface=r2i \

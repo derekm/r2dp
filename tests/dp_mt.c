@@ -328,7 +328,7 @@ main(void)
 		uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(all[i], 14);
 		if (f) { memset(f, 0, 14); f[12] = 8; }
 	}
-	/* dispatcher steering (batched): every ESP frame to its SA's owner,
+	/* steer (batched): every ESP frame to its SA's owner,
 	 * every protected inner frame to its egress SA's owner, a non-ESP
 	 * outer frame to worker 0 */
 	{

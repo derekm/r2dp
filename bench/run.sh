@@ -87,13 +87,13 @@ fi
 if [ $E2E = 1 ]; then
 	: >"$OUT/e2e.jsonl"
 	for w in ${E2E_WORKERS//,/ }; do
-		per=$(( w > 1 ? w + 1 : 1 ))         # workers (+ dispatcher) per forwarder
-		need=$(( 2 + 2 * per ))              # tgen tx/rx, A, B (+ control, may share)
+		per=$w                               # one CPU per worker, no dispatcher
+		need=$(( 2 + 2 * per + 1 ))          # tgen tx/rx, A, B, dedicated control
 		[ "$need" -le "$NCPU" ] || { echo "skip e2e workers=$w (needs $need CPUs, have $NCPU)"; continue; }
-		# CPUs in order: tgen tx,rx | A workers(+dispatcher) | B ... | control
+		# CPUs in order: tgen tx,rx | A workers | B workers | control
 		sl() { local IFS=,; echo "${CL[*]:$1:$2}"; }
 		TGC=$(sl 0 2); AC=$(sl 2 $per); BC=$(sl $((2 + per)) $per); MC=${CL[$((2 + 2 * per))]:-}
-		[ -n "$MC" ] || { MC=${CL[$((NCPU - 1))]}; echo "  note: workers=$w: control threads share CPU $MC (zero-loss rates pessimistic)"; }
+		[ -n "$MC" ] || { echo "skip e2e workers=$w (no dedicated control CPU)"; continue; }
 		for t in ${E2E_TUNNELS//,/ }; do
 			echo "e2e: workers=$w tunnels=$t sizes=$E2E_SIZES"
 			W=$w NTUN=$t SIZES=$E2E_SIZES SECS=$SECS LOSS=$LOSS PMD=$PMD HUGE=$HUGE \
