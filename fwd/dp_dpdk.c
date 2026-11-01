@@ -46,6 +46,18 @@ port_init(struct dpdk_priv *d, uint16_t port, unsigned ntxq)
 		    port, dev_info.max_tx_queues, ntxq);
 		return -1;
 	}
+	/* Several RX queues: spread them by RSS on hardware that has it, so
+	 * the dispatcher's RX load (and the NIC's) is balanced; the
+	 * dispatcher steers every packet to its SA's owner either way.
+	 * net_tap's RSS needs eBPF and the kernel spreads its frames anyway. */
+	if (nrxq > 1 && dev_info.flow_type_rss_offloads &&
+	    strcmp(dev_info.driver_name, "net_tap") != 0) {
+		conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+		conf.rx_adv_conf.rss_conf.rss_hf = (RTE_ETH_RSS_IP |
+		    RTE_ETH_RSS_NONFRAG_IPV4_UDP) & dev_info.flow_type_rss_offloads;
+		if (!conf.rx_adv_conf.rss_conf.rss_hf)
+			conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
+	}
 	if (rte_eth_dev_configure(port, nrxq, (uint16_t)ntxq, &conf) < 0)
 		return -rte_errno;
 	for (uint16_t q = 0; q < nrxq; q++)
