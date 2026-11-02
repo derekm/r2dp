@@ -11,9 +11,9 @@
  *   r2dp-fwd [-s sockpath] [-v] [-n workers] [--nh-size peers]
  *            [--dp dpdk|kernel] [EAL args]
  *
- * -n: DPDK packet workers (default 1).  With more than one, an extra lcore
- * dispatches packets to the worker owning each tunnel, so give the EAL
- * -n + 2 lcores (main + dispatcher + workers), e.g. -n 2 -l 0-3.
+ * -n: DPDK packet workers (default 1).  Each worker polls its own RX queue
+ * (queue q is worker q) and the sender places a tunnel on its owner's
+ * queue, so give the EAL -n + 1 lcores (main + workers), e.g. -n 2 -l 0-2.
  *
  * --nh-size: initial size of the DPDK next-hop table, in tunnel peers
  * (default 1024).  It is not a limit: the table doubles as it fills.

@@ -33,7 +33,7 @@ int
 main(int argc, char **argv)
 {
 	const char *sock = argc > 1 ? argv[1]
-	    : (getenv("R2DP_SOCK") ? getenv("R2DP_SOCK") : "/var/run/r2dp.sock");
+    : (getenv("R2DP_SOCK") ? getenv("R2DP_SOCK") : R2DP_DEFAULT_SOCK);
 	struct r2dp_hello_ack ack;
 	struct r2dp_msg reply;
 	struct r2dp_sa sa;
@@ -50,6 +50,8 @@ main(int argc, char **argv)
 	sa.proto = R2DP_PROTO_ESP; sa.mode = R2DP_MODE_TUNNEL;
 	sa.enc = R2DP_ENCR_AES_GCM_16; sa.integ = R2DP_INTEG_NONE;
 	sa.spi_min = 0x4000; sa.spi_max = 0x4fff;
+	sa.src.family = R2DP_AF_INET4;
+	inet_pton(AF_INET, "192.0.2.1", sa.src.addr);    /* tunnel local end */
 	sa.dst.family = R2DP_AF_INET4;
 	inet_pton(AF_INET, "10.0.0.2", sa.dst.addr);
 
@@ -64,12 +66,18 @@ main(int argc, char **argv)
 
 	memset(&sp, 0, sizeof(sp));
 	sp.dir = R2DP_DIR_OUT; sp.action = R2DP_ACT_PROTECT; sp.mode = R2DP_MODE_TUNNEL;
-	sp.ul_proto = R2DP_PROTO_ESP; sp.slid = 0;
+	sp.ul_proto = R2DP_PROTO_ANY; sp.slid = 0;
 	sp.sel_src.family = R2DP_AF_INET4;
 	inet_pton(AF_INET, "192.0.2.0", sp.sel_src.addr);
 	sp.sel_dst.family = R2DP_AF_INET4;
 	inet_pton(AF_INET, "192.0.2.0", sp.sel_dst.addr);
 	sp.pref_src = 24; sp.pref_dst = 24;
+	sp.tun_src.family = R2DP_AF_INET4;
+	inet_pton(AF_INET, "192.0.2.1", sp.tun_src.addr);
+	sp.tun_dst.family = R2DP_AF_INET4;
+	inet_pton(AF_INET, "10.0.0.2", sp.tun_dst.addr);
+	/* The policy is the request body (as in the original working form);
+	 * a bare request with no policy is refused by sp_valid. */
 	if ((r = rt(fd, R2DP_SP_ADD, &sp, sizeof(sp), NULL, 0, &reply)) < 0) {
 		fprintf(stderr, "sp_add: %s\n", strerror(-r)); return 2; }
 	printf("installed SP slid=%u\n", r2dp_msg_sp(&reply)->slid);

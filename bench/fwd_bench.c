@@ -16,9 +16,9 @@
  *             [--tunnels a,b,..] [--pmd auto|openssl|aesni_mb] [--workers N]
  *             [--natt] [--steer]
  *
- * --steer: also time the multi-worker dispatcher's classification
- * (dp_steer_inner on the plaintext frames, dp_steer_outer on the ESP
- * frames), reported as cycles per packet; no crypto in it.
+ * --steer: also time the per-worker steering classification (dp_steer_inner
+ * on the plaintext frames, dp_steer_outer on the ESP frames), reported as
+ * cycles per packet; no crypto in it.
  *
  * --natt: every SA is RFC 3948 ESP-in-UDP (UDP/4500 encapsulation on
  * encrypt, the UDP header removed again on decrypt).

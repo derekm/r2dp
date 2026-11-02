@@ -21,7 +21,7 @@ verified and what is not, and `MILESTONES.md` for the plan.
 |---|---|
 | `include/r2dp/proto.h` | the wire contract (algorithms = IANA IKEv2 IDs, protocols = IP proto numbers) |
 | `include/r2dp/client.h`, `libr2dp/` | transport, validation, address helpers (client + server side) |
-| `fwd/` | `r2dp-fwd`: control server (`ctl.c`) and data planes: DPDK (`dp_dpdk.c` ports/workers/dispatcher, `dpdk_sad.c` SA table, `dpdk_spd.c` policy/ACL, `dpdk_esp.c` ESP path, `dpdk_stats.c`) or kernel XFRM (`dp_xfrm.c`) |
+| `fwd/` | `r2dp-fwd`: control server (`ctl.c`) and data planes: DPDK (`dp_dpdk.c` ports/workers, `dpdk_sad.c` SA table, `dpdk_spd.c` policy/ACL, `dpdk_esp.c` ESP path, `dpdk_stats.c`) or kernel XFRM (`dp_xfrm.c`) |
 | `bench/fwd_bench.c` | ESP path cycles/pkt and Mpps (sizes, tunnel counts, `--workers N`, `--json`) |
 | `bench/e2e_bench.sh` | end-to-end Gbps/Mpps through two `r2dp-fwd` over memif (`W`, `NTUN` up to 1000, `NATT`, `SIZES`) |
 | `tools/mockfwd.c` | `r2dp-mockfwd`: protocol-faithful forwarder with no dataplane |

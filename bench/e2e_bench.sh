@@ -28,6 +28,12 @@ B=${1:?build dir}
 FWD=$B/fwd/r2dp-fwd; CTL=$B/r2dpctl; TG=$B/bench/e2e_tgen
 W=${W:-1}; B_W=$W; NTUN=${NTUN:-1}; NATT=${NATT:-0}; SIZES=${SIZES:-64,512,1400}
 SECS=${SECS:-2}; LOSS=${LOSS:-0.001}
+
+# A silent success here is worse than a failure: run.sh (and CI) treats a
+# non-zero exit as "see the log".  Failure modes that used to print an
+# empty JSON line and exit 0: the generator dying, a forwarder dying, the
+# counter parse returning nothing, stderr diagnostics.
+err() { echo "e2e_bench: FAIL: $*" >&2; exit 1; }
 TG_CPUS=${TG_CPUS:-0,1}; MAIN_CPUS=${MAIN_CPUS:-6-7}
 A_CPUS=${A_CPUS:-2}; B_CPUS=${B_CPUS:-3}
 D=$(mktemp -d "${TMPDIR:-/tmp}/r2dp-e2eb.XXXXXX")
@@ -80,13 +86,15 @@ done
 fi
 # counters of forwarder $1 (a|b): rx tx drop tx_full
 ctr() {
-	local f=$D/$1.out p n
+	local f=$D/$1.out p n r
 	p=$([ $1 = a ] && echo $APID || echo $BPID)
 	n=$(grep -c "r2dp-fwd: drops" "$f")
-	kill -USR1 $p
+	kill -USR1 $p || err "signal forwarder $1 (pid $p) failed"
 	for _ in $(seq 30); do [ "$(grep -c "r2dp-fwd: drops" "$f")" -gt "$n" ] && break; sleep 0.1; done
-	grep -E "r2dp-fwd: (stats .*spd_fail|drops)" "$f" | tail -2 | tr '\n' ' ' |
-	    sed -E 's/.*stats rx=([0-9]+) tx=([0-9]+) .*drop=([0-9]+) spd_fail.*tx_full=([0-9]+).*/\1 \2 \3 \4/'
+	r=$(grep -E "r2dp-fwd: (stats .*spd_fail|drops)" "$f" | tail -2 | tr '\n' ' ' |
+	    sed -E 's/.*stats rx=([0-9]+) tx=([0-9]+) .*drop=([0-9]+) spd_fail.*tx_full=([0-9]+).*/\1 \2 \3 \4/')
+	[ "$(echo "$r" | wc -w)" = 4 ] || err "counter parse for $1 returned no stats"
+	echo "$r"
 }
 APID=$(echo $PIDS | cut -d' ' -f1); BPID=$(echo $PIDS | cut -d' ' -f2)
 if [ "${LOOP:-0}" = 1 ]; then
@@ -97,13 +105,19 @@ fi
 TC=${TG_CPUS%%,*}; RC=${TG_CPUS##*,}
 for SZ in ${SIZES//,/ }; do
 	[ "${LOOP:-0}" = 1 ] || { CA0=($(ctr a)); CB0=($(ctr b)); }
-	J=$("$TG" --lcores "0@$TC,1@$RC" $MEM --no-pci --no-telemetry --file-prefix r2t$$ \
+	TGE=$D/tg.err; : >"$TGE"
+	JT=$("$TG" --lcores "0@$TC,1@$RC" $MEM --no-pci --no-telemetry --file-prefix r2t$$ \
 		--log-level=lib.*:error $TGV -- \
-		--sizes "$SZ" --tunnels "$NTUN" --secs "$SECS" --loss "$LOSS" --rxq "$(( W > B_W ? W : B_W ))" ${TG_ARGS:-} 2>"$D/tg.err" | grep "^{")
+		--sizes "$SZ" --tunnels "$NTUN" --secs "$SECS" --loss "$LOSS" --rxq "$(( W > B_W ? W : B_W ))" ${TG_ARGS:-} 2>"$TGE"); TGRC=$?
+	[ "$TGRC" = 0 ] || { echo "--- tgen stderr (rc=$TGRC) ---"; cat "$TGE"; err "tgen failed"; }
+	[ -n "$JT" ] || { echo "--- tgen stderr ---"; cat "$TGE"; err "tgen produced no JSON (rc=0)"; }
+	J=$(printf '%s\n' "$JT" | grep "^{" | head -1)
+	[ -n "$J" ] || err "no {JSON} line in tgen output"
 	X=""
 	if [ "${LOOP:-0}" != 1 ]; then
+		for pp in $PIDS; do kill -0 "$pp" 2>/dev/null || err "forwarder pid $pp died"; done
 		CA1=($(ctr a)); CB1=($(ctr b))
 		X=",\"a_rx\":$((CA1[0]-CA0[0])),\"a_tx\":$((CA1[1]-CA0[1])),\"a_drop\":$((CA1[2]-CA0[2])),\"a_txfull\":$((CA1[3]-CA0[3])),\"b_rx\":$((CB1[0]-CB0[0])),\"b_tx\":$((CB1[1]-CB0[1])),\"b_drop\":$((CB1[2]-CB0[2])),\"b_txfull\":$((CB1[3]-CB0[3]))"
 	fi
-	echo "$J" | sed "s/^{/{\"workers\":$W,\"b_workers\":$B_W,\"natt\":$NATT,\"loop\":${LOOP:-0},/; s/}\$/$X}/"
+	printf '%s\n' "$J" | sed "s/^{/{\"workers\":$W,\"b_workers\":$B_W,\"natt\":$NATT,\"loop\":${LOOP:-0},/; s/}$/$X}/"
 done

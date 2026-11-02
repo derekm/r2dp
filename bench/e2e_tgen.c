@@ -131,6 +131,21 @@ valid(const struct rte_mbuf *m)
 	if (ntohl(mg) != MAGIC ||
 	    (unsigned)(f[PL_OFF + 4] | f[PL_OFF + 5] << 8) >= ntun)
 		return 0;
+	/* Cross-check the claimed tunnel index against the frame's own inner
+	 * addresses.  Without this, a dataplane that duplicates a frame onto
+	 * another tunnel (or rewrites the payload header) is blessed as
+	 * zero-loss at an inflated rate: the magic+index still match.
+	 * Tunnel t: src 10.(2+2h).l.5, dst 10.(1+2h).l.5 with h=t>>8, l=t&255. */
+	{
+		unsigned t = f[PL_OFF + 4] | f[PL_OFF + 5] << 8;
+		unsigned h = t >> 8, l = t & 255;
+		uint32_t sr = (10u << 24) | ((2 + 2 * h) << 16) | (l << 8) | 5;
+		uint32_t dr = (10u << 24) | ((1 + 2 * h) << 16) | (l << 8) | 5;
+
+		if (rte_be_to_cpu_32(ip->src_addr) != sr ||
+		    rte_be_to_cpu_32(ip->dst_addr) != dr)
+			return 0;
+	}
 	for (unsigned i = PL_OFF + 8; i < frame && i < PL_OFF + 24; i++)
 		if (f[i] != pat(i))
 			return 0;

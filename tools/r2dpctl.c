@@ -27,7 +27,7 @@
  *   r2dpctl [socket] sp-del dir=.. src=NET/LEN dst=NET/LEN [proto=..]
  * Exit status: 0 ok, 1 the forwarder refused (errno printed), 2 usage.
  *
- * socket defaults to $R2DP_SOCK else /var/run/r2dp.sock.
+ * socket defaults to $R2DP_SOCK else R2DP_DEFAULT_SOCK (proto.h).
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -399,7 +399,7 @@ main(int argc, char **argv)
 	if (!g_sock)
 		g_sock = getenv("R2DP_SOCK");
 	if (!g_sock)
-		g_sock = "/var/run/r2dp.sock";
+		g_sock = R2DP_DEFAULT_SOCK;
 
 	int fd = r2dp_connect(g_sock);
 	if (fd < 0) {

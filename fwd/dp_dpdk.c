@@ -681,6 +681,7 @@ dpd_start(struct fwd_dp *dp)
 {
 	struct dpdk_priv *d = dp->priv;
 	unsigned lc[DP_MAX_WK + 1], nlc = 0, need, lcore;
+	int ret = 0;
 
 	if (d->port_id < 0)
 		return -ENODEV;
@@ -695,10 +696,13 @@ dpd_start(struct fwd_dp *dp)
 	if (nlc < need) {
 		fprintf(stderr, "r2dp-fwd: %u worker(s) need %u spare lcores, "
 		    "have %u (e.g. -l 0-%u)\n", d->nb_wk, need, nlc, need);
-		return -EAGAIN;
+		ret = -EAGAIN;
+		goto rollback;
 	}
-	if (port_init(d, d->port_id, d->nb_wk) < 0)
-		return -rte_errno;
+	if (port_init(d, d->port_id, d->nb_wk) < 0) {
+		ret = -rte_errno;
+		goto rollback;
+	}
 	{
 		uint16_t mtu = 0;
 		if (rte_eth_dev_get_mtu(d->port_id, &mtu) == 0)
@@ -720,7 +724,8 @@ dpd_start(struct fwd_dp *dp)
 		d->rcu = rte_zmalloc("r2dp-rcu", rsz, RTE_CACHE_LINE_SIZE);
 		if (!d->rcu) {
 			fprintf(stderr, "r2dp-fwd: rte_rcu_qsbr alloc failed\n");
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto rollback;
 		}
 		rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
 	}
@@ -738,7 +743,19 @@ dpd_start(struct fwd_dp *dp)
 		if (r < 0) {
 			fprintf(stderr, "r2dp-fwd: next-hop table: %s\n",
 			    strerror(-r));
-			return r;
+			ret = r;
+			goto rollback;
+		}
+	} else {
+		/* stop/start cycle: the table and its hash survived dpd_stop,
+		 * but the maintenance thread was stopped with it.  Re-arm it. */
+		d->nh.wanted = nh_wanted;
+		d->nh.wanted_arg = d;
+		if (r2dp_nh_start(&d->nh) < 0) {
+			fprintf(stderr, "r2dp-fwd: next-hop table restart: %s\n",
+			    strerror(errno));
+			ret = -EAGAIN;
+			goto rollback;
 		}
 	}
 	for (unsigned i = 0; i < d->nb_wk; i++) {
@@ -758,7 +775,8 @@ dpd_start(struct fwd_dp *dp)
 			if (!d->wk[i].ring_o || !d->wk[i].ring_i) {
 				fprintf(stderr, "r2dp-fwd: worker ring: %s\n",
 				    rte_strerror(rte_errno));
-				return -ENOMEM;
+				ret = -ENOMEM;
+				goto rollback;
 			}
 		}
 	{	/* our MACs, for the L2 headers the workers write */
@@ -776,14 +794,16 @@ dpd_start(struct fwd_dp *dp)
 	for (unsigned i = 0; i < d->nb_wk; i++)
 		rte_eal_remote_launch(worker_main, &d->wk[i], d->wk[i].lcore);
 	return 0;
-}
 
-static void
-dpd_stop(struct fwd_dp *dp)
-{
-	struct dpdk_priv *d = dp->priv;
-
+rollback:
+	/* A start failure must not leave a half-started dataplane: ports live
+	 * with nobody polling them, an NH maintenance thread armed, rings
+	 * half-created.  Tear down exactly what this call set up, then return
+	 * the error so the caller (probe) reports "unavailable" instead of
+	 * serving SAs/SPs against a dead data plane. */
 	__atomic_store_n(&d->running, 0, __ATOMIC_RELAXED);
+	if (d->nh.h)
+		r2dp_nh_stop(&d->nh);
 	for (unsigned i = 0; i < d->nb_wk; i++) {
 		struct dp_wk *w = &d->wk[i];
 		struct rte_mbuf *m;
@@ -795,16 +815,69 @@ dpd_stop(struct fwd_dp *dp)
 		}
 		while (w->ring_o && rte_ring_dequeue(w->ring_o, (void **)&m) == 0)
 			rte_pktmbuf_free(m);
+		rte_ring_free(w->ring_o);
+		w->ring_o = NULL;
+		while (w->ring_i && rte_ring_dequeue(w->ring_i, (void **)&m) == 0)
+			rte_pktmbuf_free(m);
+		rte_ring_free(w->ring_i);
+		w->ring_i = NULL;
+		w->lcore = RTE_MAX_LCORE;
+	}
+	if (d->port_id >= 0) {
+		rte_eth_dev_stop(d->port_id);
+		d->port_id = -1;
+	}
+	if (d->inner_port >= 0) {
+		rte_eth_dev_stop(d->inner_port);
+		d->inner_port = -1;
+	}
+	return ret;
+}
+
+static void
+dpd_stop(struct fwd_dp *dp)
+{
+	struct dpdk_priv *d = dp->priv;
+
+	__atomic_store_n(&d->running, 0, __ATOMIC_RELAXED);
+	/* Phase 1: bring every worker to a stop FIRST.  A still-running worker
+	 * can cross-post into another worker's ring, so all workers must be
+	 * quiesced before any ring is freed -- freeing ring j while worker i
+	 * is enqueuing to it is a use-after-free.  Also unregister them from
+	 * the QSBR (the ctl thread below runs grace periods before freeing). */
+	for (unsigned i = 0; i < d->nb_wk; i++) {
+		struct dp_wk *w = &d->wk[i];
+
+		if (w->lcore < RTE_MAX_LCORE) {
+			rte_eal_wait_lcore(w->lcore);
+			if (d->rcu)
+				rte_rcu_qsbr_thread_unregister(d->rcu, w->lcore);
+		}
+	}
+	/* Stop the next-hop maintenance thread while the QSBR is still alive:
+	 * its per-iteration r2dp_qsbr_sync() runs on this same object, and its
+	 * wanted() callback reads the policy snapshot (is_tunnel_peer) which
+	 * spd_teardown() frees below. */
+	if (d->nh.h)
+		r2dp_nh_stop(&d->nh);
+	/* Phase 2: no producers remain; drain and free the rings. */
+	for (unsigned i = 0; i < d->nb_wk; i++) {
+		struct dp_wk *w = &d->wk[i];
+		struct rte_mbuf *m;
+
+		while (w->ring_o && rte_ring_dequeue(w->ring_o, (void **)&m) == 0)
+			rte_pktmbuf_free(m);
 		while (w->ring_i && rte_ring_dequeue(w->ring_i, (void **)&m) == 0)
 			rte_pktmbuf_free(m);
 		rte_ring_free(w->ring_o);
 		rte_ring_free(w->ring_i);
 		w->ring_o = w->ring_i = NULL;
 	}
-	if (d->rcu) {
-		rte_free(d->rcu);
-		d->rcu = NULL;
-	}
+	/* Keep the QSBR across a stop/start cycle: the next-hop table (d->nh)
+	 * is attached to it (its maintenance thread runs grace periods over
+	 * this object and its freed tables are returned through it), so
+	 * freeing it here would leave d->nh.rcu dangling on restart.  It is
+	 * released when the whole dpdk_priv is torn down (main exit). */
 	if (d->expire_fd > 0) {
 		close(d->expire_fd);
 		d->expire_fd = -1;
@@ -1026,12 +1099,19 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	if (dp->ops->caps)
 		dp->ops->caps(dp);
 	ret = dp->ops->start(dp);   /* bring up the ports and workers */
-	if (ret < 0)
+	if (ret < 0) {
 		fprintf(stderr, "r2dp-fwd: dataplane start failed: %s\n",
 		    strerror(-ret));
-	fprintf(stderr, "r2dp-fwd: DPDK dataplane %s (port=%d inner=%d cdev=%d "
-	    "workers=%u)\n", ret < 0 ? "NOT running" : "ready", d->port_id,
-	    d->inner_port, d->have_cdev ? d->cdev_id : -1, d->nb_wk);
+		/* A failed start is not a running dataplane.  Drop the op table so
+		 * ctl never applies SAs/SPs to a half-started/dead backend (and
+		 * never reports a dataplane that cannot forward).  main treats
+		 * this as DPDK-unavailable and serves control-only. */
+		dp->ops = NULL;
+		return ret;
+	}
+	fprintf(stderr, "r2dp-fwd: DPDK dataplane ready (port=%d inner=%d cdev=%d "
+	    "workers=%u)\n", d->port_id, d->inner_port,
+	    d->have_cdev ? d->cdev_id : -1, d->nb_wk);
 	return 0;
 }
 
