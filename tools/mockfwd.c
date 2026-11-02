@@ -182,6 +182,24 @@ static void do_sa(int fd, const struct r2dp_msg *m)
 		log_sa("SA_GET", rq);
 		if (!e || e->larval) { reply_sa(fd, m, ENOENT, NULL); return; }
 		reply_sa(fd, m, 0, e); return;
+	case R2DP_SA_DUMP: {
+		/* Stream every live SA, MORE on all but the last -- mirrors ctl.c
+		 * (fwd/ctl.c R2DP_SA_DUMP) and mockfwd's own SP_DUMP, so r2dpctl
+		 * dump/dump-sa enumerate the same way against either forwarder. */
+		int last = -1;
+		log_sa("SA_DUMP", rq);
+		for (int i = 0; i < MAXSA; i++) if (sad[i].used) last = i;
+		if (last < 0) { reply_sa(fd, m, ENOENT, NULL); return; }
+		for (int i = 0; i <= last; i++)
+			if (sad[i].used) {
+				int more = 0;
+				for (int j = i + 1; j <= last; j++)
+					if (sad[j].used) { more = 1; break; }
+				r2dp_send(fd, m->h.type, m->h.seq, 0,
+				    R2DP_HF_NOKEYS | (more ? R2DP_HF_MORE : 0),
+				    &sad[i].sa, sizeof(sad[i].sa), NULL, 0);
+			}
+		return; }
 	}
 }
 
@@ -240,7 +258,8 @@ static void dispatch(int fd, const struct r2dp_msg *m)
 	switch (m->h.type) {
 	case R2DP_HELLO:  do_hello(fd, m); break;
 	case R2DP_GETSPI: do_getspi(fd, m); break;
-	case R2DP_SA_ADD: case R2DP_SA_UPDATE: case R2DP_SA_DEL: case R2DP_SA_GET:
+	case R2DP_SA_ADD: case R2DP_SA_UPDATE: case R2DP_SA_DEL:
+	case R2DP_SA_GET: case R2DP_SA_DUMP:
 		do_sa(fd, m); break;
 	case R2DP_SP_ADD: case R2DP_SP_DEL: case R2DP_SP_GET: case R2DP_SP_DUMP:
 		do_sp(fd, m); break;

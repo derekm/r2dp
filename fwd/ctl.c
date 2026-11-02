@@ -602,7 +602,11 @@ do_sa(int fd, const struct r2dp_msg *m)
 			reply_sa_dump(fd, m, 0, &C->sad[i].sa,
 			    more ? R2DP_HF_MORE : 0);
 		}
-		goto out; }
+		/* Success already streamed every entry: do NOT fall through to the
+		 * shared `out:` which emits a trailing SA_DUMP completion with a
+		 * zeroed SA body.  SP_DUMP returns here; a full-stream consumer
+		 * would otherwise see a phantom zero-SA entry as the N+1-th. */
+		goto scrub; }
 	default:
 		rc = ENOSYS;
 		goto out;

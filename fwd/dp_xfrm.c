@@ -438,7 +438,12 @@ kx_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 
 	memset(&id, 0, sizeof(id));
 	memcpy(&id.daddr.a4, &dip, 4);
-	id.spi = spi;
+	/* ctl passes the host-order SPI (ntohl of the wire value, matching the
+	 * DPDK backend's in-process key), but the kernel keys XFRM states by the
+	 * raw network-order SPI (as we install them, x.id.spi = sa->spi below
+	 * in kx_sa_add).  Convert back, or GETSA always misses and byte
+	 * lifetimes never advance on --dp kernel. */
+	id.spi = htonl(spi);
 	id.family = AF_INET;
 	id.proto = IPPROTO_ESP;
 	nlb_init(&n, XFRM_MSG_GETSA, 0, &id, sizeof(id));

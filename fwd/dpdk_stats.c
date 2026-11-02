@@ -80,9 +80,9 @@ dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 	    (unsigned long long)__atomic_load_n(&d->n_nh_unref, __ATOMIC_RELAXED),
 	    (unsigned long long)__atomic_load_n(&d->nh.n_unwanted, __ATOMIC_RELAXED));
 	if (d->nb_wk > 1)
-		for (unsigned i = 0; i <= d->nb_wk; i++)
-			fprintf(f, "r2dp-fwd: %s %u: rx=%llu tx=%llu esp=%llu "
-			    "drop=%llu\n", i < d->nb_wk ? "worker" : "dispatcher", i,
+		for (unsigned i = 0; i < d->nb_wk; i++)
+			fprintf(f, "r2dp-fwd: worker %u: rx=%llu tx=%llu esp=%llu "
+			    "drop=%llu\n", i,
 			    (unsigned long long)d->wk[i].n_rx,
 			    (unsigned long long)d->wk[i].n_tx,
 			    (unsigned long long)d->wk[i].n_esp,

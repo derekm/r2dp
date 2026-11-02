@@ -248,6 +248,18 @@ trial(double rate)
 	tx_run();
 	rte_delay_ms(300);                 /* in-flight frames land */
 	rx1 = g_rx; v1 = g_valid; b1 = g_bad;
+	{
+		/* A dataplane cannot deliver more *valid* frames than were offered
+		 * unless it duplicated (or replayed) them.  Anything over the offer
+		 * is counted against us and capped, so loss cannot go negative and
+		 * a duplicating plane is not blessed as zero-loss at an inflated
+		 * rate. */
+		uint64_t offered = g_offered;
+		if (v1 - v0 > offered) {
+			r.bad += v1 - v0 - offered;
+			v1 = v0 + offered;
+		}
+	}
 	r.offered_pps = g_offered / secs;
 	r.tx_pps = g_tx / secs;
 	r.rx_pps = (rx1 - rx0) / secs;

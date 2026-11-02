@@ -342,8 +342,11 @@ outer_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port,
 				DROP(w, DR_CLEAR_OUTER, 1);
 		}
 		if (nf) {
-			if (is_udp(fwd[0]))
-				w->n_ike += nf;   /* IKE */
+			/* Count IKE per-frame: only a UDP-headed frame is IKE
+			 * (the burst may mix ARP; ARP is a clear_outer-free "ok"). */
+			for (uint16_t i = 0; i < nf; i++)
+				if (is_udp(fwd[i]))
+					w->n_ike++;
 			uint16_t sent = port_tx(to, w->txq, fwd, nf);
 			w->n_tx += sent;
 			DROP(w, DR_TX_FULL, nf - sent);
