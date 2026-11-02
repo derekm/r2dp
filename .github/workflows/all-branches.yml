@@ -32,3 +32,7 @@ jobs:
       - name: No-backup/scratch-cruft regression guard
         run: |
           bash ci/no-cruft-guard.sh
+
+      - name: POSIX-only regression guard (no Windows/MSVC in source)
+        run: |
+          bash ci/posix-only-guard.sh
