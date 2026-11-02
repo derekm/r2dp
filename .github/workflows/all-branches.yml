@@ -28,3 +28,7 @@ jobs:
       - name: Build + test every branch tip
         run: |
           bash ci/ci_all_branches.sh
+
+      - name: No-backup/scratch-cruft regression guard
+        run: |
+          bash ci/no-cruft-guard.sh
