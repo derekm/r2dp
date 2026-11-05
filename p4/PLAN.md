@@ -165,5 +165,12 @@ and the delegated `deleg_8f37ef0b` review):
   (b) ipsec_create needs a real cryptodev (else EINVAL); (c) r2dp's AEAD
   blob is key||salt (extern strips trailing 4); (d) table action_ids are
   global per-pipeline — resolve with rte_swx_ctl_table_action_info_get, never
-  hardcode.  Still open: real packet path (rx/tx rings aren't wired to NIC/VM
-  ports yet) and the §8 limits above (IKE/ARP/NAT-T/SPD expressiveness).
+  hardcode.  Still open: **packet I/O** — the SWX pipeline now runs (a `p4_worker`
+  thread loops `rte_swx_pipeline_run` + `rte_swx_ipsec_run`, `df3aa79`) and
+  the classification regarrays are initialized (`direction[0]=inbound`,
+  `direction[1]=outbound`, `ipsec_port_in_*` moved off the static legs), but
+  nothing yet feeds the ring ports the iospec declares (`R2DP_IN0/IN1`); the
+  spec's static ports are not wired to a NIC/VM.  So the data plane is a real
+  SWX pipeline running the PNA program, but no packets move until an I/O port
+  (net_tap/net_memif/net_vhost, like the DPDK backend's ports_find) feeds the
+  input rings.  Plus the §8 limits above (IKE/ARP/NAT-T/SPD expressiveness).
