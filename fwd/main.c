@@ -105,8 +105,17 @@ main(int argc, char **argv)
 			free(eal_base);
 			return 1;
 		}
+	} else if (strcmp(dpname, "p4") == 0) {
+		/* P4/SWX data plane (fwd/dp_p4.c): load p4/r2dp.out spec. */
+		int r = fwd_dp_p4_probe(&ctl.dp, &eal_argc, &eal_argv, NULL);
+		if (r < 0) {
+			fprintf(stderr, "r2dp-fwd: P4 dataplane: %s\n",
+			    strerror(-r));
+			free(eal_base);
+			return 1;
+		}
 	} else if (strcmp(dpname, "dpdk") != 0) {
-		fprintf(stderr, "r2dp-fwd: --dp dpdk|kernel (got '%s')\n", dpname);
+		fprintf(stderr, "r2dp-fwd: --dp dpdk|kernel|p4 (got '%s')\n", dpname);
 		free(eal_base);
 		return 2;
 	} else
