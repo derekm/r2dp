@@ -3,10 +3,8 @@
 //
 // r2dp P4 backend — first behavior (PNA arch, compiled by p4c-dpdk --arch pna).
 //
-// Modeled on p4c's backends/dpdk/examples/ipsec.p4 (Copyright 2023 Intel
-// Corporation, Apache-2.0): the parser/control/package structure and the
-// ipsec_accelerator extern usage follow that reference, adapted to r2dp's
-// inbound-SAD / outbound-SPD contract.
+// Structure modeled on p4c's backends/dpdk/examples/ipsec.p4 (Copyright 2023
+// Intel Corporation, Apache-2.0).
 //
 // It targets the same SPD/SAD contract as the r2dp DPDK backend
 // (fwd/dp_dpdk.c) behind the same r2dp socket.  NOTE this first version's

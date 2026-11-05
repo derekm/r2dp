@@ -1,10 +1,12 @@
 # P4 backend (r2dp) — design & first-behavior plan
 
-Status: **in progress.** The full `.p4`/PNA compile path now works (p4c-dpdk on
-`.165`, compiled `p4/r2dp.out`); the runtime `fwd/dp_p4.c` backend is built and
-links against DPDK 24.11 SWX.  Remaining: get `r2dp-fwd --dp p4` to actually
-load the pipeline and pass ctl/mockfwd.  This doc's §3/§5 were written before
-the toolchain existed and are superseded (see the "history" note below).
+Status: **in progress.** The full `.p4`/PNA compile path works (p4c-dpdk on
+`.165`, compiled `p4/r2dp.out`) and the `fwd/dp_p4.c` backend loads **and runs**
+the SWX pipeline: `--dp p4` brings up codegen->.so->build_from_lib, a cryptodev,
+the ipsec extern, a packet-path worker (`rte_swx_pipeline_run` + `rte_swx_ipsec_run`),
+and serves the r2dp control socket (SA/SP install + commit verified).  What is
+NOT done: real packet I/O (nothing feeds the ring ports yet) and the first-spec
+limits in §8.  Superseded pre-toolchain sections: §3/§5/§6/§7 (see §8).
 
 ## 1. Why this is buildable now
 
@@ -33,9 +35,8 @@ The P4-DPDK target compiles a P4 program (arch **PNA**) with the standalone
 a `rte_swx_pipeline` **text spec** (`.spec`), which a host program loads via
 `rte_swx_pipeline_*` / `rte_swx_ctl_*`.
 
-Confirmed present in the DPDK 25.11 build already installed on `.179`
-
-(`/home/yescorp/dpdk-mb-prefix`, `librte_pipeline.so`):
+Confirmed present in the DPDK 24.11 build used on `.165` (and 25.11 on `.179`;
+`/home/yescorp/dpdk-mb-prefix`, `librte_pipeline.so`):
 
 - `rte_swx_pipeline` — load/run the spec pipeline.
 - `rte_swx_ctl_*` — add/commit table entries (SAD, SPD), regarray, metarray,
@@ -71,9 +72,9 @@ NOTE (post-implementation): `p4c`/p4c-dpdk **is** now built and working (see the
 | `fwd_dp_ops` member | P4/SWX backing |
 |---|---|
 | `caps()` | Set `enc_caps`/`integ_caps` from the pipeline's advertised transforms (ipsec block caps; DPDK baseline ok initially). |
-| `sa_add(add, sa, blob, blen)` | Inbound: `rte_swx_ipsec_sa_add` (AEAD key+salt, encap from tunnel endpoints). Outbound/egress SA: SAD table entry keyed `(spi,dip)` → action `set_ipsec_in(sa_id,e)`. `add==0`: `rte_swx_ipsec_sa_delete` + SAD del. |
-| `sp_add(sp)` / `sp_del(sp)` | SPD table (`rte_swx_ctl_*` entry): match sel_src/sel_dst/pref/proto/ports → action `SPD_PROTECT(policy,e)` / `SPD_BYPASS` / `SPD_DISCARD`. Returns assigned `slid`. |
-| `sa_bytes(spi,dip)` | SWX per-SA byte counter (ipsec block / table action counter); `-1` if unknown. |
+| `sa_add(add, sa, blob, blen)` | Inbound (`FWD_DP_SA_INBOUND`): `rte_swx_ipsec_sa_add` (AEAD key‖salt) + `inbound_table_0` entry keyed `(dst,spi)` → `ipsec_enable(sa_id)`. Outbound/egress SA: `rte_swx_ipsec_sa_add` with encrypt, NO SAD entry (reached through the SPD's `ipsec_protect(sa_id)`). `add==0`: `rte_swx_ipsec_sa_delete` + (if inbound) `inbound_table_0` delete, direction from the stored `e->dir`. |
+| `sp_add(sp)` / `sp_del(sp)` | SPD table (`rte_swx_ctl_*` entry, exact `(src,dst,proto)`): action `ipsec_protect(crypto_sa_id)` / `spd_bypass` / `spd_discard`; `ipsec_protect` resolves the egress SA by tunnel endpoint (like `dpdk_spd.c` `sa_by_policy`), never the policy `slid`. |
+| `sa_bytes(spi,dip)` | **Not implemented**: returns `-1` (no SWX per-SA byte-counter surfaced yet). |
 | `sa_set_hard_bytes/hard_time` | Hard-lifetime enforcement is intentionally **control-side (ctl.c)** and engine-agnostic; P4 backend returns 0 / tracks trivially or reuses the same ctl `check_lifetimes` logic. |
 | `start`/`stop` | Launch packet threads running `rte_swx_pipeline_run`; load `.spec`/`.code` at start; stop join. |
 | `idle()` | Compact/reconcile the SPD tables; drain deferred control work. |
@@ -102,14 +103,19 @@ COVERAGE.md, MILESTONES.md  # claim + plan updated when a runtime lane exists
 
 ## 6. Milestones
 
-1. **p4-backend-m0 — engine load + ctl.** `--dp p4` brings up the SWX pipeline
-   (authored `.spec`), serves the r2dp socket, `ctl_probe` + `r2dpctl dump`
-   pass, `fwd_e2e` control lane runs.  No packet path yet (or a pass-through
-   parse).
-2. **p4-backend-m1 — first behavior (DPDKingest ESP).** Inbound: parse
-   eth/IP/ESP, SAD table `(spi,dip)` → ipsec block decrypt, inner forwarded.
+> NOTE: written pre-implementation. m0's "engine load + ctl" is DONE (load-and-run
+> + SA/SP install committed); the "authored `.spec`" / hand-written path it
+> presumes never happened — the full `.p4`/p4c-dpdk path was used instead.  What
+> remains maps onto m1→m3 below, driven by real packet I/O, not a pass-through.
+
+1. **p4-backend-m0 — engine load + ctl.** This milestone is met: `--dp p4`
+   brings up the SWX pipeline (from `p4c-dpdk` output, not an authored spec),
+   serves the r2dp socket, `ctl_probe` + `r2dpctl dump` pass, and a packet
+   worker runs the pipeline.
+2. **p4-backend-m1 — first behavior (DPDK ingress ESP).** Inbound: parse
+   eth/IP/ESP, SAD table `(dst,spi)` → ipsec block decrypt, inner forwarded.
    `dp_path`-style round trip + the negative cases (replay, unknown SPI,
-   tamper) via the test harness.
+   tamper) via the test harness.  Needs packet I/O into the rings.
 3. **p4-backend-m2 — egress SPD.** OUT PROTECT/BYPASS/DISCARD via the SPD
    table; egress SA encrypt; `fwd_e2e` interop against an independent ESP peer.
 4. **p4-backend-m3 — parity.** Exact drop-counter assertions, lifetimes,
