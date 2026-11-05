@@ -106,11 +106,14 @@ main(int argc, char **argv)
 			return 1;
 		}
 	} else if (strcmp(dpname, "p4") == 0) {
-		/* P4/SWX data plane (fwd/dp_p4.c): load p4/r2dp.out spec. */
-		int r = fwd_dp_p4_probe(&ctl.dp, &eal_argc, &eal_argv, NULL);
+		/* P4/SWX data plane (fwd/dp_p4.c): load the p4c-compiled SWX
+		 * spec, default /usr/local/share/r2dp/p4/r2dp.out, overridable
+		 * with $R2DP_P4_SPEC (see fwd/dp_p4.c). */
+		const char *spec = getenv("R2DP_P4_SPEC");
+		int r = fwd_dp_p4_probe(&ctl.dp, &eal_argc, &eal_argv, spec);
 		if (r < 0) {
 			fprintf(stderr, "r2dp-fwd: P4 dataplane: %s\n",
-			    strerror(-r));
+			    r == -2 ? "no P4 build" : strerror(-r));
 			free(eal_base);
 			return 1;
 		}
