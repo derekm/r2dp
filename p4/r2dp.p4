@@ -1,17 +1,25 @@
-/* r2dp P4 backend — first behavior (PNA arch on p4c '--target dpdk').
- *
- * Modeled on p4c's own backends/dpdk/examples/ipsec.p4, which is the canonical
- * PNA IPsec program for the DPDK soft-switch (rte_swx_pipeline + the
- * rte_swx_ipsec extern).  It expresses the same SPD/SAD behaviour as the r2dp
- * DPDK backend (fwd/dp_dpdk.c) behind the same r2dp socket: inbound ESP ->
- * SAD (dst, spi) -> ipsec extern decap; outbound -> SPD -> ipsec extern encap;
- * bypass/discard otherwise.  The same source can later target a switch ASIC
- * once the P4 abstraction is kept (see p4/PLAN.md).
- *
- * The tables below are populated from the r2dp control plane (SA_ADD/SP_ADD ->
- * rte_swx_ctl_* table entries + rte_swx_ipsec_sa_add), exactly mapping
- * fwd_dp_ops: sa_add/sp_add/sa_del/sp_del/start/stop (see fwd/dp.h).
- */
+// SPDX-License-Identifier: Apache-2.0
+//
+// r2dp P4 backend — first behavior (PNA arch, compiled by p4c-dpdk --arch pna).
+//
+// This program is derived from p4c's backends/dpdk/examples/ipsec.p4
+// (Copyright(c) Intel Corporation / p4lang, Apache-2.0): the parser/control/
+// package structure and the ipsec_accelerator extern usage follow that
+// reference, adapted to r2dp's inbound-SAD / outbound-SPD contract.
+//
+// It expresses the same SPD/SAD behaviour as the r2dp DPDK backend
+// (fwd/dp_dpdk.c) behind the same r2dp socket: inbound ESP -> SAD (dst, spi)
+// -> ipsec extern decap; outbound -> SPD -> ipsec extern encap; bypass otherwise.
+// The same source can later target a switch ASIC once the P4 abstraction is
+// kept (see p4/PLAN.md).
+//
+// The tables below are populated from the r2dp control plane (SA_ADD/SP_ADD ->
+// rte_swx_ctl_* table entries + rte_swx_ipsec_sa_add), mapping fwd_dp_ops:
+// sa_add/sp_add/sa_del/sp_del/start/stop (see fwd/dp.h).
+//
+// Compile:  p4c-dpdk --arch pna r2dp.p4 -o r2dp.out   (NOT `p4c --target dpdk`:
+// the p4c driver only registers dpdk-psa; use the standalone build/backends/
+// dpdk/p4c-dpdk binary, p4c-dpdk itself picks arch pna|psa).
 #include <core.p4>
 #include <dpdk/pna.p4>
 
