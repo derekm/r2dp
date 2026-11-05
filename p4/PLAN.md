@@ -73,7 +73,7 @@ NOTE (post-implementation): `p4c`/p4c-dpdk **is** now built and working (see the
 |---|---|
 | `caps()` | Set `enc_caps`/`integ_caps` from the pipeline's advertised transforms (ipsec block caps; DPDK baseline ok initially). |
 | `sa_add(add, sa, blob, blen)` | Inbound (`FWD_DP_SA_INBOUND`): `rte_swx_ipsec_sa_add` (AEAD key‖salt) + `inbound_table_0` entry keyed `(dst,spi)` → `ipsec_enable(sa_id)`. Outbound/egress SA: `rte_swx_ipsec_sa_add` with encrypt, NO SAD entry (reached through the SPD's `ipsec_protect(sa_id)`). `add==0`: `rte_swx_ipsec_sa_delete` + (if inbound) `inbound_table_0` delete, direction from the stored `e->dir`. |
-| `sp_add(sp)` / `sp_del(sp)` | SPD table (`rte_swx_ctl_*` entry, exact `(src,dst,proto)`): action `ipsec_protect(crypto_sa_id)` / `spd_bypass` / `spd_discard`; `ipsec_protect` resolves the egress SA by tunnel endpoint (like `dpdk_spd.c` `sa_by_policy`), never the policy `slid`. |
+| `sp_add(sp)` / `sp_del(sp)` | SPD table (`rte_swx_ctl_*` entry, exact `(src,dst,proto)`): action `ipsec_protect(crypto_sa_id)` / `spd_bypass` / `spd_discard`; `ipsec_protect` resolves the egress SA by tunnel endpoint + highest install gen (like `dpdk_spd.c` `sa_by_policy`), never the policy `slid`. **Accepts unbound OUT PROTECT** (keeps a policy mirror, writes a `spd_bypass` placeholder, rebinds on `SA_ADD`/`SA_DEL`/rekey). |
 | `sa_bytes(spi,dip)` | **Not implemented**: returns `-1` (no SWX per-SA byte-counter surfaced yet). |
 | `sa_set_hard_bytes/hard_time` | Hard-lifetime enforcement is intentionally **control-side (ctl.c)** and engine-agnostic; P4 backend returns 0 / tracks trivially or reuses the same ctl `check_lifetimes` logic. |
 | `start`/`stop` | Launch packet threads running `rte_swx_pipeline_run`; load `.spec`/`.code` at start; stop join. |
@@ -110,8 +110,9 @@ COVERAGE.md, MILESTONES.md  # claim + plan updated when a runtime lane exists
 
 1. **p4-backend-m0 — engine load + ctl.** This milestone is met: `--dp p4`
    brings up the SWX pipeline (from `p4c-dpdk` output, not an authored spec),
-   serves the r2dp socket, `ctl_probe` + `r2dpctl dump` pass, and a packet
-   worker runs the pipeline.
+   serves the r2dp socket, and a packet worker runs the pipeline.  SA/SP
+   install verified by probe + `r2dpctl dump` (see §8 for the SPD-binding
+   contract and how the bind is proven).
 2. **p4-backend-m1 — first behavior (DPDK ingress ESP).** Inbound: parse
    eth/IP/ESP, SAD table `(dst,spi)` → ipsec block decrypt, inner forwarded.
    `dp_path`-style round trip + the negative cases (replay, unknown SPI,
@@ -161,22 +162,36 @@ and the delegated `deleg_8f37ef0b` review):
      r2dp OUT policy / IKE bypass SP does not collapse to one entry.  Outbound
      miss -> `spd_bypass` matches DPDK; inbound miss -> `drop` is NOT
      `DR_NO_SA_IN`.
-- **Runtime `fwd/dp_p4.c`** (`88ec62d`, `497952c`, `77551a8`) implements
-  `fwd_dp_ops` and now **loads and runs the SWX pipeline** end-to-end:
-  `r2dp-fwd --dp p4` brings up codegen->.so->build_from_lib, a configured
-  cryptodev, and the ipsec extern; `r2dp-ctl-probe` installs an SA + SP and
-  `r2dpctl dump` shows the SA.  Verified live on `.165` (Fedora 44, DPDK
-  24.11, `--vdev crypto_openssl0`).  Runtime gotchas fixed: (a) iospec ring
-  ports + ipsec rings must exist before build_from_lib (else ENODEV);
-  (b) ipsec_create needs a real cryptodev (else EINVAL); (c) r2dp's AEAD
-  blob is key||salt (extern strips trailing 4); (d) table action_ids are
-  global per-pipeline — resolve with rte_swx_ctl_table_action_info_get, never
-  hardcode.  Still open: **framed packet forward** — the SWX pipeline runs and its I/O
-  rings are now bridged to real ethdev legs (memif/tap/vhost, `7dad228`):
-  `p4_io_init` discovers two ports (outer=port0, inner=port1) and the worker
-  RXes each leg into its input ring and TXes the output ring.  Verified on
-  `.165` with `--vdev net_memif0/1` (non-root) — 'I/O: outer=port 0, inner=port
-  1'; net_tap needs root (TUNSETIFF EPERM) and falls back to control-only.  A
-  full **framed ESP round-trip** (crypto + forward through the PNA tables) is
-  the m1 gate and needs the two-forwarder + e2e_tgen bench assembly.  Plus the
-  §8 limits above (IKE/ARP/NAT-T/SPD expressiveness).
+- **Runtime `fwd/dp_p4.c`** (`88ec62d`, `497952c`, `77551a8` … SPD-bind fix in
+  the round-4 follow-up) implements `fwd_dp_ops` and now **loads and runs the
+  SWX pipeline** end-to-end: `r2dp-fwd --dp p4` brings up
+  codegen->.so->build_from_lib, a configured cryptodev, and the ipsec extern;
+  `r2dp-ctl-probe` / `r2dpctl dump` show the SA and SP.  Verified live on
+  `.165` (Fedora 44, DPDK 24.11, `--vdev crypto_openssl0`).  Runtime gotchas
+  fixed: (a) iospec ring ports + ipsec rings must exist before build_from_lib
+  (else ENODEV); (b) ipsec_create needs a real cryptodev (else EINVAL);
+  (c) r2dp's AEAD blob is key||salt (extern strips trailing 4); (d) table
+  action_ids are global per-pipeline — resolve with
+  rte_swx_ctl_table_action_info_get, never hardcode.  Still open: **framed
+  packet forward** — the SWX pipeline runs and its I/O rings are now bridged
+  to real ethdev legs (memif/tap/vhost, `7dad228`): `p4_io_init` discovers two
+  ports (outer=port0, inner=port1) and the worker RXes each leg into its input
+  ring and TXes the output ring.  Verified on `.165` with `--vdev
+  net_memif0/1` (non-root) — 'I/O: outer=port 0, inner=port 1'; net_tap needs
+  root (TUNSETIFF EPERM) and falls back to control-only.  A full **framed ESP
+  round-trip** (crypto + forward through the PNA tables) is the m1 gate and
+  needs the two-forwarder + e2e_tgen bench assembly.  Plus the §8 limits above
+  (IKE/ARP/NAT-T/SPD expressiveness).
+- **SPD binding contract (round-4 review):** the control plane may install an
+  OUT PROTECT policy with no egress SA yet (spmd loads SPD at startup, then
+  GETSPI/SA_ADD) — so `p4_sp_add` **accepts** and never refuses.  It keeps a
+  policy mirror (`pr->spd[]`) and writes an `spd_bypass` placeholder until an
+  outbound SA binds; `p4_sa_add` (outbound add/delete) and rekey call
+  `p4_spd_rebind` to (re)target `outbound_table_0`.  The egress SA is chosen by
+  tunnel endpoint and **highest install generation** (`p4_sa.gen`), not slot
+  index.  The SPD entry is replaced delete-then-add (table_entry_add rejects a
+  duplicate key).  Unbound PROTECT only drops table traffic via the default,
+  and the old `-ENOENT` refusal is removed.  Bind is proven by a
+  `tools/p4_bind_probe.c` that drives both orders (SA→SP direct-bind and SP→SA
+  rebind) and is observed as `OUT PROTECT bind sa_id=N` in the forwarder log —
+  not inferred from `r2dpctl dump`.

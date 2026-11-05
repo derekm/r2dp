@@ -86,15 +86,27 @@
 	fprintf(stderr, "r2dp-fwd: p4: " fmt "\n", ##__VA_ARGS__)
 
 #define P4_SA_MAX 1024
+#define P4_SP_MAX 1024
 
 struct p4_sa {
 	uint32_t spi;        /* host order */
 	uint32_t sip;        /* host order tunnel src */
 	uint32_t dip;        /* host order tunnel dst */
 	uint32_t sl_id;      /* sa_index == ipsec_hdr.sa_id the action writes */
+	uint64_t gen;        /* install generation (higher = newer) */
 	int in_use;
 	uint8_t proto;
 	uint8_t dir;
+};
+
+/* SPD policy mirror (keyed by selector): the control plane may install an OUT
+ * PROTECT policy BEFORE its egress SA exists (spmd loads SPD at startup, then
+ * GETSPI/SA_ADD), so sp_add must NOT refuse.  We keep the policy here and
+ * (re)program outbound_table_0 from sa_add/sa_del as SAs bind/unbind. */
+struct p4_pol {
+	int in_use;
+	struct r2dp_sp sp;               /* full policy (selector, tunnel) */
+	uint32_t bound_sl_id;            /* bound egress crypto id; UINT32_MAX */
 };
 
 struct p4_priv {
@@ -102,6 +114,8 @@ struct p4_priv {
 	struct rte_swx_ctl_pipeline *ctl;
 	struct rte_swx_ipsec *ipsec;
 	struct p4_sa sad[P4_SA_MAX];
+	struct p4_pol spd[P4_SP_MAX];
+	uint64_t gen;                       /* next p4_sa install generation */
 	char *spec_path;
 	char iospec_path[PATH_MAX];
 	int cdev_id;           /* cryptodev for the ipsec extern; -1 none */
@@ -274,6 +288,11 @@ static int p4_io_init(struct p4_priv *pr)
 	return 0;
 }
 
+struct p4_priv;
+
+/* Forward decls (defined below in the SPD mirror section). */
+static void p4_spd_rebind(struct p4_priv *pr);
+
 static void p4_caps(struct fwd_dp *dp)
 {
 	/* Advertise ONLY what the ipsec extern actually installs.  We program
@@ -304,7 +323,7 @@ static struct p4_sa *p4_sad_lookup(struct p4_priv *pr, uint32_t dip,
 /* Find the egress (encrypt) SA for an OUT PROTECT policy, binding by tunnel
  * endpoint like the DPDK backend's sa_by_policy (dpdk_spd.c): the policy's
  * tun_src/tun_dst must equal an outbound SA's src/dst; among overlaps take the
- * newest slot (there is no generation counter here, so last-installed). */
+ * NEWEST INSTALL (highest gen), never the last slot index. */
 static struct p4_sa *p4_spd_sa_lookup(struct p4_priv *pr,
 				      const struct r2dp_sp *sp)
 {
@@ -325,7 +344,8 @@ static struct p4_sa *p4_spd_sa_lookup(struct p4_priv *pr,
 			continue;
 		if (x->sip != ts || x->dip != td)
 			continue;
-		best = x;   /* last-installed wins (rekey overlap) */
+		if (!best || x->gen > best->gen)
+			best = x;
 	}
 	return best;
 }
@@ -667,7 +687,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	struct p4_sa *e;
 	uint8_t key[16], data[4];
 	struct rte_swx_table_entry ent;
-	int rc, i, inbound, deleting;
+	int rc, i, inbound, deleting, new_slot = 0;
 	uint32_t dip, spi, sa_sip = 0;
 
 	/* Direction comes from the vtable flag (dp.h): only SA_ADD with
@@ -722,6 +742,10 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		if (pr->ipsec)
 			rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
 		e->in_use = 0;
+		if (e->dir == R2DP_DIR_OUT) {
+			p4_spd_rebind(pr);   /* retarget/release outbound policies */
+			return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+		}
 		return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 	}
 
@@ -736,7 +760,12 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		e->proto = sa->proto;
 		e->dir = inbound ? R2DP_DIR_IN : R2DP_DIR_OUT;
 		e->sl_id = (uint32_t)i;      /* stable per-install id */
+		e->gen = ++pr->gen;
 		e->in_use = 1;
+		new_slot = 1;
+	} else if (blob && blen) {
+		/* UPDATE (rekey) of a live SA: new gen so the SPD rebind picks it. */
+		e->gen = ++pr->gen;
 	}
 
 	/* Crypto SA in the ipsec extern (spi -> cipher/AEAD params + key).
@@ -748,8 +777,13 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		sp.encrypt = !inbound;    /* encrypt = outbound */
 		sp.crypto.is_aead = 1;
 		sp.crypto.aead.alg = RTE_CRYPTO_AEAD_AES_GCM;
-		if (blen > RTE_SWX_IPSEC_KEY_SIZE_MAX)
+		if (blen > RTE_SWX_IPSEC_KEY_SIZE_MAX) {
+			if (new_slot) {
+				e->in_use = 0;
+				e->sl_id = 0;
+			}
 			return -E2BIG;
+		}
 		memcpy(sp.crypto.aead.key, blob, blen);
 		sp.crypto.aead.key_size = (uint32_t)blen;   /* key || salt */
 		sp.encap.esp.spi = sa->spi;   /* network order SPI */
@@ -764,16 +798,25 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		rc = rte_swx_ipsec_sa_add(pr->ipsec, &sp, &sa_id);
 		if (rc) {
 			P4_LOG("ipsec sa_add %d", rc);
-			e->in_use = 0;
+			if (new_slot) {
+				/* only a fresh slot is ours to free; do not
+				 * clobber a pre-existing live SA on rekey */
+				e->in_use = 0;
+				e->sl_id = 0;
+			}
 			return rc;
 		}
 		e->sl_id = sa_id;   /* the id the action must write */
 	}
 
 	/* Only the inbound (decrypt) SA gets a SAD table entry; outbound SAs
-	 * are reached through the SPD's ipsec_protect(sa_id). */
-	if (!inbound)
-		return 0;
+	 * are reached through the SPD's ipsec_protect(sa_id).  Binding an
+	 * outbound SA (re)targets any OUT PROTECT policy waiting on this
+	 * tunnel (policy-installed-before-SA, or a rekey). */
+	if (!inbound) {
+		p4_spd_rebind(pr);
+		return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+	}
 
 	/* inbound_table_0 entry: (ipv4.dst_addr, esp.spi)
 	 * -> ipsec_enable(sl_id).  Keys are big-endian wire bytes. */
@@ -806,24 +849,54 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 }
 
-static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
+/* ---- SPD policy mirror ---- */
+
+/* Match a policy against the mirror by selector (src,dst,proto,dir). */
+static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 {
-	struct p4_priv *pr = dp->priv;
+	int i;
+	for (i = 0; i < P4_SP_MAX; i++) {
+		struct p4_pol *p = &pr->spd[i];
+		const struct r2dp_sp *q = &p->sp;
+		if (!p->in_use)
+			continue;
+		if (q->dir != sp->dir || q->ul_proto != sp->ul_proto)
+			continue;
+		if (q->sel_src.family != sp->sel_src.family ||
+		    q->sel_dst.family != sp->sel_dst.family)
+			continue;
+		if (memcmp(q->sel_src.addr, sp->sel_src.addr, 4) != 0)
+			continue;
+		if (memcmp(q->sel_dst.addr, sp->sel_dst.addr, 4) != 0)
+			continue;
+		return p;
+	}
+	return NULL;
+}
+
+/* Write one OUT policy to outbound_table_0.  PROTECT binds to the newest
+ * matching egress SA (highest gen); if none exists YET we still accept the
+ * policy (spmd installs SPD before IKE) and write an spd_bypass entry so the
+ * selector never forwards in the clear once IKE later binds it (a missed
+ * bind would silently bypass).  The next SA_ADD rebinds to ipsec_protect.
+ * Returns 0/errno. */
+static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
+{
+	struct r2dp_sp *sp = &p->sp;
 	uint8_t key[16], data[4];
 	struct rte_swx_table_entry ent;
-	int rc;
 	uint32_t ssrc, sdst;
+	struct p4_sa *ea;
+	int rc;
 
-	/* IPv4 selectors only; ports are deferred (exact ipv4 selector). */
+	/* IPv4 selectors only; ports deferred (exact ipv4 selector). */
 	if (sp->sel_src.family != R2DP_AF_INET4 ||
 	    sp->sel_dst.family != R2DP_AF_INET4)
 		return -EAFNOSUPPORT;
 	memcpy(&ssrc, sp->sel_src.addr, 4);
 	memcpy(&sdst, sp->sel_dst.addr, 4);
-	ssrc = ntohl(ssrc);
-	sdst = ntohl(sdst);
+	ssrc = ntohl(ssrc); sdst = ntohl(sdst);
 
-	/* outbound_table_0 keyed (src, dst, proto) in match-field order. */
 	memset(&ent, 0, sizeof(ent));
 	memset(key, 0, sizeof(key));
 	{
@@ -834,56 +907,81 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 		key[8] = sp->ul_proto;
 	}
 	ent.key = key;
+
+	/* Replace: the key may already have an entry (rekey rebind, or a prior
+	 * unbound spare).  table_entry_add rejects a duplicate key (-EEXIST),
+	 * so delete-then-add (same contract spd_rebuild uses).  -ENOENT when
+	 * nothing to remove is fine. */
+	(void)rte_swx_ctl_pipeline_table_entry_delete(pr->ctl, "outbound_table_0",
+						      &ent);
+
 	switch (sp->action) {
 	case R2DP_ACT_DISCARD:
-		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 2); /* spd_discard */
+		p->bound_sl_id = UINT32_MAX;
+		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 2);
 		break;
-	case R2DP_ACT_PROTECT: {
-		/* The SPD action must write the CRYPTO SA id (from
-		 * rte_swx_ipsec_sa_add), not the policy slid.  Resolve the
-		 * egress SA by tunnel endpoint, like sa_by_policy.  If no
-		 * outbound SA is installed yet, refuse the entry rather than
-		 * emit an ipsec_protect bound to a bogus sa_id. */
-		struct p4_sa *ea = p4_spd_sa_lookup(pr, sp);
-		uint32_t id_be;
-		if (!ea) {
-			P4_LOG("OUT PROTECT: no egress SA for tunnel");
-			return -ENOENT;
+	case R2DP_ACT_PROTECT:
+		ea = p4_spd_sa_lookup(pr, sp);
+		p->bound_sl_id = ea ? ea->sl_id : UINT32_MAX;
+		if (ea) {
+			uint32_t id_be = htonl(ea->sl_id);
+			memcpy(data, &id_be, 4);
+			ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 0);
+			ent.action_data = data;
+			P4_LOG("OUT PROTECT bind sa_id=%u", ea->sl_id);
+		} else {
+			/* unbound: spd_bypass placeholder until SA arrives */
+			ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 1);
 		}
-		id_be = htonl(ea->sl_id);
-		memcpy(data, &id_be, 4);
-		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 0); /* ipsec_protect */
-		ent.action_data = data;
+		break;
+	default:                       /* BYPASS */
+		p->bound_sl_id = UINT32_MAX;
+		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 1);
 		break;
 	}
-	default:
-		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 1); /* spd_bypass */
-		break;
-	}
+
 	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "outbound_table_0",
 						  &ent);
-	if (rc) {
+	if (rc)
 		P4_LOG("outbound entry add %d", rc);
-		return rc;
+	return rc;
+}
+
+/* Reprogram every OUT PROTECT policy after an SA add/del so the SPD points at
+ * the current newest egress SA. */
+static void p4_spd_rebind(struct p4_priv *pr)
+{
+	int i;
+	for (i = 0; i < P4_SP_MAX; i++) {
+		struct p4_pol *p = &pr->spd[i];
+		if (!p->in_use)
+			continue;
+		if (p->sp.action != R2DP_ACT_PROTECT ||
+		    p->sp.dir != R2DP_DIR_OUT)
+			continue;
+		p4_spd_bind(pr, p);
 	}
-	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+	rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 }
 
 static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 {
 	struct p4_priv *pr = dp->priv;
+	struct p4_pol *p;
 	uint8_t key[16];
 	struct rte_swx_table_entry ent;
 	uint32_t ssrc, sdst;
 	int rc;
 
+	p = p4_pol_find(pr, sp);
+	if (!p)
+		return -ENOENT;
 	if (sp->sel_src.family != R2DP_AF_INET4 ||
 	    sp->sel_dst.family != R2DP_AF_INET4)
 		return -EAFNOSUPPORT;
 	memcpy(&ssrc, sp->sel_src.addr, 4);
 	memcpy(&sdst, sp->sel_dst.addr, 4);
-	ssrc = ntohl(ssrc);
-	sdst = ntohl(sdst);
+	ssrc = ntohl(ssrc); sdst = ntohl(sdst);
 
 	memset(&ent, 0, sizeof(ent));
 	memset(key, 0, sizeof(key));
@@ -892,7 +990,7 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 		uint32_t dst_be = htonl(sdst);
 		memcpy(&key[0], &src_be, 4);
 		memcpy(&key[4], &dst_be, 4);
-		key[8] = sp->ul_proto;
+		key[8] = p->sp.ul_proto;
 	}
 	ent.key = key;
 	rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl, "outbound_table_0",
@@ -901,6 +999,42 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 		P4_LOG("outbound entry del %d", rc);
 		return rc;
 	}
+	p->in_use = 0;
+	memset(&p->sp, 0, sizeof(p->sp));
+	p->bound_sl_id = UINT32_MAX;
+	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+}
+
+static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
+{
+	struct p4_priv *pr = dp->priv;
+	struct p4_pol *p;
+	int rc, i;
+
+	/* A control plane that does not ask for a slid assigns one before
+	 * reaching us (ctl).  Respect the direction: only OUT policies drive
+	 * the outbound SPD table here. */
+	if (sp->dir != R2DP_DIR_OUT)
+		return 0;    /* IN policies are handled by the SAD path */
+
+	p = p4_pol_find(pr, sp);
+	if (!p) {
+		for (i = 0; i < P4_SP_MAX; i++)
+			if (!pr->spd[i].in_use) { p = &pr->spd[i]; break; }
+		if (!p)
+			return -ENOSPC;
+		p->sp = *sp;
+		p->bound_sl_id = UINT32_MAX;
+		p->in_use = 1;
+	} else {
+		p->sp = *sp;
+	}
+
+	/* Accept whether or not an egress SA exists yet (spmd installs SPD
+	 * first; a later SA_ADD rebinds).  Never refuse a policy. */
+	rc = p4_spd_bind(pr, p);
+	if (rc)
+		return rc;
 	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 }
 
