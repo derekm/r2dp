@@ -195,3 +195,15 @@ and the delegated `deleg_8f37ef0b` review):
   `tools/p4_bind_probe.c` that drives both orders (SA→SP direct-bind and SP→SA
   rebind) and is observed as `OUT PROTECT bind sa_id=N` in the forwarder log —
   not inferred from `r2dpctl dump`.
+- **Egress next-hop staged (round-5):** every classified/processed frame must
+  exit through `routing_table_0` → `next_hop_table_0`, and `next_hop_table_0`'s
+  const default was `drop` — so NO frame could leave the dataplane even after a
+  correct SAD/SPD or crypto pass.  `p4_start` now populates `next_hop_table_0`
+  (id 0 → outer port 0, id 1 → inner port 1; `next_hop_set` with ether_type
+  0x0800), so egress is reachable (`next_hop table populated` on load, forwarder
+  control + bind still pass).  This is the **prerequisite** for framed forward,
+  not a proof of it: proving bytes move still needs a real injected frame
+  (inner-leg input → SPD → outer-leg egress), which requires either adapting
+  `e2e_tgen`/`e2e_bench.sh` (they assume the DPDK worker's `-n W --lcores` and
+  `r2dp-fwd: stats` log format the P4 pthread worker does not emit) or a small
+  ring-injector probe.
