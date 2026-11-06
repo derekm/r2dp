@@ -214,10 +214,24 @@ and the delegated `deleg_8f37ef0b` review):
   out0 out1` + ring-occupancy, printed ~1s from the worker) show
   `in_rx=125 out0=96`, rings drained.  This proves I/O-ring bridge →
   pipeline run → next-hop → output-ring → eth bridge moves bytes end to end.
-  The outbound default (`spd_bypass`) forwards it clear, as designed.  What
-  this does NOT yet prove: framed **ESP crypto** — injecting an ESP frame on
-  the outer leg and observing a decrypted inner exit (and the reverse
-  encrypt).  The framed forward is the prerequisite that now works over tap
-  (root; memif vdevs do not materialize on `.165`).  ctr() in bench/e2e_bench.sh
-  still parses the DPDK `stats` format the P4 worker does not emit — the
-  worker's own `pkt:` line is the P4-leg counter equivalent.
+  The outbound default (`spd_bypass`) forwards it clear, as designed.
+- **Framed ESP encrypt proven (round-8):** with an outbound SA
+  (`aes-gcm-16`) + an exact OUT PROTECT policy bound, a clear IPv4/UDP
+  frame injected on the inner tap is encrypted and egresses the outer tap
+  as genuine tunnel-mode ESP — tcpdump shows outer IPv4
+  `192.0.2.1→203.0.113.1`, proto 0x32 (ESP), `spi=0x01200000`,
+  incrementing seq, distinct ciphertext per frame (fresh IV), plaintext
+  gone from the wire.  Worker shows `ob_hit=N` with the per-action counter
+  on ipsec_protect (`a6`), `crypto: enq=deq=N`, `out0` drained.  Root
+  causes fixed: the default iospec was a stale 4-port file (no `port
+  in/out 2` for the extern rings) so `tx port 2` was a no-op and no frame
+  reached the extern — now always regenerated; and the extern's
+  `.bsz` was all-zero so `rte_swx_ipsec_run` drained 0 frames — now
+  `32 32 32 32`.  The extern's mbuf pool needs `priv >= 128`
+  (`sizeof(struct ipsec_mbuf)`) or crypto prepare fails.
+  **Still open: the inbound/decrypt leg** (inject ESP on the outer leg,
+  observe the decrypted inner exit) and thus the full round-trip — the
+  outbound encrypt path is proven, not the decrypt.  ctr() in
+  bench/e2e_bench.sh still parses the DPDK `stats` format the P4 worker
+  does not emit — the worker's own `pkt:` line is the P4-leg counter
+  equivalent.
