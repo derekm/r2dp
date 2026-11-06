@@ -229,9 +229,16 @@ and the delegated `deleg_8f37ef0b` review):
   `.bsz` was all-zero so `rte_swx_ipsec_run` drained 0 frames — now
   `32 32 32 32`.  The extern's mbuf pool needs `priv >= 128`
   (`sizeof(struct ipsec_mbuf)`) or crypto prepare fails.
-  **Still open: the inbound/decrypt leg** (inject ESP on the outer leg,
-  observe the decrypted inner exit) and thus the full round-trip — the
-  outbound encrypt path is proven, not the decrypt.  ctr() in
+  **Round-trip proven (3e1f8bb):** the inbound/decrypt leg now works too.
+  Inject the ESP a peer emitted on the outer leg (with a matching inbound SA
+  installed) and the inner leg receives the restored plaintext -- inbound
+  SAD hits (`hit=N`, ipsec_enable action), `crypto: enq=deq`, and the
+  decrypted `10.0.0.1→10.0.0.2` proto-17 frame (original payload) exits the
+  inner leg.  The decrypt-leg byte-order fixes (metadata tables match HOST
+  order, not network; only header-field action data stays NBO) and inner-
+  subnet routing are documented in §8 above.  So both directions of framed
+  ESP crypto are proven; the remaining limits are IKE/ARP/NAT-T demux and
+  SPD expressiveness.  ctr() in
   bench/e2e_bench.sh still parses the DPDK `stats` format the P4 worker
   does not emit — the worker's own `pkt:` line is the P4-leg counter
   equivalent.
