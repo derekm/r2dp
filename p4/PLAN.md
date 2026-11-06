@@ -172,15 +172,15 @@ and the delegated `deleg_8f37ef0b` review):
   (else ENODEV); (b) ipsec_create needs a real cryptodev (else EINVAL);
   (c) r2dp's AEAD blob is key||salt (extern strips trailing 4); (d) table
   action_ids are global per-pipeline — resolve with
-  rte_swx_ctl_table_action_info_get, never hardcode.  Still open: **framed
-  packet forward** — the SWX pipeline runs and its I/O rings are now bridged
-  to real ethdev legs (memif/tap/vhost, `7dad228`): `p4_io_init` discovers two
-  ports (outer=port0, inner=port1) and the worker RXes each leg into its input
-  ring and TXes the output ring.  Verified on `.165` with `--vdev
-  net_memif0/1` (non-root) — 'I/O: outer=port 0, inner=port 1'; net_tap needs
-  root (TUNSETIFF EPERM) and falls back to control-only.  A full **framed ESP
-  round-trip** (crypto + forward through the PNA tables) is the m1 gate and
-  needs the two-forwarder + e2e_tgen bench assembly.  Plus the §8 limits above
+  rte_swx_ctl_table_action_info_get, never hardcode.  Framed packet forward
+  is proven (round-6): the worker RXes each ethdev leg into its input ring
+  and TXes the output ring, and a real IPv4/UDP frame crosses
+  inner→pipeline→outer over **root net_tap** (net_memif vdevs do not
+  materialize on `.165` — see below; net_tap needs root, else TUNSETIFF
+  EPERM and control-only fallback).  A full **framed ESP round-trip**
+  (crypto + forward through the PNA tables) is the m1 gate and needs the
+  two-forwarder + e2e_tgen bench assembly, or the extern to actually process
+  a framed ESP packet.  Plus the §8 limits above
   (IKE/ARP/NAT-T/SPD expressiveness).
 - **SPD binding contract (rounds 4+5):** the control plane may install an
   OUT PROTECT policy with no egress SA yet (spmd loads SPD at startup, then

@@ -225,10 +225,41 @@ static void *p4_worker(void *arg)
 			uint32_t q1 = rte_ring_count(pr->in1);
 			uint32_t qo0 = rte_ring_count(pr->out0);
 			uint32_t qo1 = rte_ring_count(pr->out1);
-			P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
-			       "| rings in0=%u in1=%u out0r=%u out1r=%u",
-			       pr->c_outer, pr->c_inner, pr->c_out0, pr->c_out1,
-			       q0, q1, qo0, qo1);
+			struct rte_swx_table_stats ts1;
+			static uint64_t act1[16];
+			struct rte_ring *ipin = rte_ring_lookup("IP_IN");
+			struct rte_ring *ipout = rte_ring_lookup("IP_OUT");
+			uint32_t qi = ipin ? rte_ring_count(ipin) : 0;
+			uint32_t qo = ipout ? rte_ring_count(ipout) : 0;
+			struct rte_cryptodev_stats cst;
+			if (pr->cdev_id >= 0 &&
+			    rte_cryptodev_stats_get(pr->cdev_id, &cst) == 0)
+				P4_LOG("crypto: enq=%llu deq=%llu enq_err=%llu",
+				       (unsigned long long)cst.enqueued_count,
+				       (unsigned long long)cst.dequeued_count,
+				       (unsigned long long)cst.enqueue_err_count);
+			memset(&ts1, 0, sizeof(ts1));
+			ts1.n_pkts_action = act1;
+			if (rte_swx_ctl_pipeline_table_stats_read(pr->p,
+				 "outbound_table_0", &ts1) == 0)
+				P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
+				       "| rings in0=%u in1=%u out0r=%u out1r=%u "
+				       "| ipsec ipin=%u ipout=%u "
+				       "| ob_hit=%llu ob_miss=%llu "
+				       "| ob_act[0]=%llu[1]=%llu[2]=%llu[3]=%llu",
+				       pr->c_outer, pr->c_inner, pr->c_out0,
+				       pr->c_out1, q0, q1, qo0, qo1, qi, qo,
+				       (unsigned long long)ts1.n_pkts_hit,
+				       (unsigned long long)ts1.n_pkts_miss,
+				       (unsigned long long)act1[0],
+				       (unsigned long long)act1[1],
+				       (unsigned long long)act1[2],
+				       (unsigned long long)act1[3]);
+			else
+				P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
+				       "| rings in0=%u in1=%u out0r=%u out1r=%u",
+				       pr->c_outer, pr->c_inner, pr->c_out0,
+				       pr->c_out1, q0, q1, qo0, qo1);
 			last_dump = rte_get_tsc_cycles();
 		}
 	}
@@ -266,7 +297,15 @@ static int p4_io_init(struct p4_priv *pr)
 	}
 
 	pr->pool = rte_pktmbuf_pool_create("r2dp_p4_pool", P4_POOL_SIZE,
-					   P4_POOL_CACHE, 0,
+					   P4_POOL_CACHE,
+					   /* priv >= sizeof(struct ipsec_mbuf):
+					    * the SWX ipsec extern does
+					    * rte_mbuf_to_priv() on every frame it
+					    * consumes; with 0 bytes the crypto
+					    * prepare fails and every packet is
+					    * freed untouched.  Reference
+					    * pipeline uses meta 128. */
+					   128,
 					   RTE_MBUF_DEFAULT_BUF_SIZE,
 					   SOCKET_ID_ANY);
 	if (!pr->pool) {
@@ -557,6 +596,14 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 					      io_f);
 					fputs("port out 1 ring R2DP_OUT1 bsz 32\n",
 					      io_f);
+					/* ipsec extern wiring (matches the DPDK
+					 * ipsec example: the extern's return ring
+					 * is a pipeline INPUT port and its consume
+					 * ring is a pipeline OUTPUT port). */
+					fputs("port in 2 ring IP_OUT bsz 32\n",
+					      io_f);
+					fputs("port out 2 ring IP_IN bsz 32\n",
+					      io_f);
 					fclose(io_f);
 				}
 			}
@@ -640,6 +687,8 @@ static int p4_start(struct fwd_dp *dp)
 		P4_LOG("outbound table info %d", rc);
 		return -EIO;
 	}
+	P4_LOG("table keys: inbound=%u outbound=%u", pr->inbound_key_size,
+	       pr->outbound_key_size);
 
 	/* ipsec extern instance the spec's ipsec_enable/protect actions
 	 * resolve into; SA ids written to ipsec_hdr.sa_id are looked up here.
@@ -670,15 +719,21 @@ static int p4_start(struct fwd_dp *dp)
 	 * extern rings' identity (see PLAN §8 / spec apply). */
 	(void)rte_swx_ctl_pipeline_regarray_write(pr->p, "direction", 0, 0);
 	(void)rte_swx_ctl_pipeline_regarray_write(pr->p, "direction", 1, 1);
-	/* Parser `from_ipsec` = (input_port == ipsec_port_in_*).  The extern
-	 * returns processed packets on its own port; for our two-leg topology
-	 * the SAD is keyed per-leg by the port the wire packet arrives on, so
-	 * mark neither static leg as from_ipsec.  Pointer-only content; see
-	 * regarray_name resolution below. */
+	/* ipsec extern port wiring.  The iospec binds port in 2 = IP_OUT (the
+	 * extern's return ring) and port out 2 = IP_IN (the extern's consume
+	 * ring), matching the DPDK ipsec.spec/ipsec.io reference.  The parser's
+	 * `from_ipsec` = (input_port == ipsec_port_in_*), and the apply's
+	 * post-extern `tx` uses ipsec_port_out_*; both must name the extern
+	 * port (2), or an ESP frame is never handed to the extern and never
+	 * recognized as returning from it. */
 	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
-		"ipsec_port_in_inbound", 0, (uint64_t)0xffffffffUL);
+		"ipsec_port_in_inbound", 0, 2);
 	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
-		"ipsec_port_in_outbound", 0, (uint64_t)0xffffffffUL);
+		"ipsec_port_in_outbound", 0, 2);
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
+		"ipsec_port_out_inbound", 0, 2);
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
+		"ipsec_port_out_outbound", 0, 2);
 
 	/* Egress must be reachable, or no frame can leave the dataplane:
 	 * routing_table_0 (id 2) maps an outer/host dst (LPM) to a next_hop_id
@@ -712,7 +767,7 @@ static int p4_start(struct fwd_dp *dp)
 			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
 				 "next_hop_table_0", &en))
 				P4_LOG("next_hop id1 add failed");
-			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 1);
 			P4_LOG("next_hop table populated (id0->outer, id1->inner)");
 		}
 	}
@@ -819,13 +874,22 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			if (pr->ipsec)
 				rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
 			e->sl_id = 0;
-			return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+			return rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+		}
+		/* Inbound delete: the (dip,spi) table delete is already scheduled.
+		 * Apply it BEFORE tearing down the crypto SA / slot: with
+		 * abort_on_fail=1 a failed commit rolls the delete back, and ctl
+		 * keeps the SA on error, so the dataplane must still own it. */
+		rc = rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+		if (rc) {
+			P4_LOG("inbound sa del commit %d; keeping SA", rc);
+			return rc;
 		}
 		if (pr->ipsec)
 			rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
 		e->in_use = 0;
 		e->sl_id = 0;
-		return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+		return 0;
 	}
 
 	if (!e) {
@@ -889,6 +953,8 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			return rc;
 		}
 		e->sl_id = sa_id;   /* the id the action must write */
+		P4_LOG("ipsec SA add ok id=%u spi=%08x mode=%d", sa_id,
+		       sa->spi, sa->mode);
 	}
 
 	/* Only the inbound (decrypt) SA gets a SAD table entry; outbound SAs
@@ -915,7 +981,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			}
 			return rc;
 		}
-		return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+		return rte_swx_ctl_pipeline_commit(pr->ctl, 1);
 	}
 
 	/* inbound_table_0 entry: (ipv4.dst_addr, esp.spi)
@@ -957,7 +1023,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		}
 		return rc;
 	}
-	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+	return rte_swx_ctl_pipeline_commit(pr->ctl, 1);
 }
 
 /* ---- SPD policy mirror ---- */
@@ -1011,10 +1077,15 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 	memset(&ent, 0, sizeof(ent));
 	memset(key, 0, sizeof(key));
 	{
-		uint32_t src_be = htonl(ssrc);
-		uint32_t dst_be = htonl(sdst);
-		memcpy(&key[0], &src_be, 4);
-		memcpy(&key[4], &dst_be, 4);
+		/* Explicitly test the REVERSE byte order (host integer LE bytes):
+		 * key bytes 01 00 00 0a for sel_src=10.0.0.1. */
+		uint32_t s_le, d_le;
+		memcpy(&s_le, sp->sel_src.addr, 4);
+		memcpy(&d_le, sp->sel_dst.addr, 4);
+		s_le = ntohl(s_le);   /* now 0x0a000001 host int -> LE bytes 01 00 00 0a */
+		d_le = ntohl(d_le);
+		memcpy(&key[0], &s_le, 4);
+		memcpy(&key[4], &d_le, 4);
 		key[8] = sp->ul_proto;
 	}
 	ent.key = key;
@@ -1069,6 +1140,12 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 	}
 	if (rc)
 		P4_LOG("outbound entry add %d", rc);
+	else
+		P4_LOG("OUT BIND installed sel=%08x/%08x proto=%u action=%u "
+		       "key=%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+		       ssrc, sdst, sp->ul_proto, (unsigned)ent.action_id,
+		       key[0], key[1], key[2], key[3], key[4], key[5],
+		       key[6], key[7], key[8]);
 	return rc;
 }
 
@@ -1098,7 +1175,7 @@ static int p4_spd_rebind(struct p4_priv *pr)
 		rte_swx_ctl_pipeline_abort(pr->ctl);
 		return rerr;
 	}
-	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+	return rte_swx_ctl_pipeline_commit(pr->ctl, 1);
 }
 
 static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
@@ -1107,7 +1184,6 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 	struct p4_pol *p;
 	uint8_t key[16];
 	struct rte_swx_table_entry ent;
-	uint32_t ssrc, sdst;
 	int rc;
 
 	p = p4_pol_find(pr, sp);
@@ -1116,36 +1192,53 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 	if (sp->sel_src.family != R2DP_AF_INET4 ||
 	    sp->sel_dst.family != R2DP_AF_INET4)
 		return -EAFNOSUPPORT;
-	memcpy(&ssrc, sp->sel_src.addr, 4);
-	memcpy(&sdst, sp->sel_dst.addr, 4);
-	ssrc = ntohl(ssrc); sdst = ntohl(sdst);
 
 	memset(&ent, 0, sizeof(ent));
 	memset(key, 0, sizeof(key));
 	{
-		uint32_t src_be = htonl(ssrc);
-		uint32_t dst_be = htonl(sdst);
-		memcpy(&key[0], &src_be, 4);
-		memcpy(&key[4], &dst_be, 4);
+		/* The SPD table key is the LITTLE-ENDIAN host bytes of the
+		 * selector, SAME layout p4_spd_bind installs (exactly-matched
+		 * `bit<32>` metadata fields hash as host-order in SWX).  A
+		 * network-order key here would never match the installed entry
+		 * and the delete would silently no-op, orphaning the row. */
+		uint32_t s_le, d_le;
+		memcpy(&s_le, p->sp.sel_src.addr, 4);
+		memcpy(&d_le, p->sp.sel_dst.addr, 4);
+		s_le = ntohl(s_le);
+		d_le = ntohl(d_le);
+		memcpy(&key[0], &s_le, 4);
+		memcpy(&key[4], &d_le, 4);
 		key[8] = p->sp.ul_proto;
 	}
 	ent.key = key;
 	rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl, "outbound_table_0",
-						     &ent);
+					     &ent);
 	if (rc) {
 		P4_LOG("outbound entry del %d", rc);
+		return rc;
+	}
+	/* Schedule applied only on commit.  Do NOT clear the mirror before it
+	 * succeeds: with abort_on_fail=1 a failed commit rolls the delete back,
+	 * and ctl keeps the policy on error -- so the mirror must too (else the
+	 * next rebind re-programs a policy ctl already dropped, and the bucket
+	 * they agree on never empties). */
+	rc = rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+	if (rc) {
+		P4_LOG("sp_del commit %d; keeping policy", rc);
 		return rc;
 	}
 	p->in_use = 0;
 	memset(&p->sp, 0, sizeof(p->sp));
 	p->bound_sl_id = UINT32_MAX;
-	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+	return 0;
 }
 
 static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 {
 	struct p4_priv *pr = dp->priv;
 	struct p4_pol *p;
+	struct r2dp_sp saved_sp;
+	uint32_t saved_bound, saved_in_use;
 	int was_live = 0;
 	int rc, i;
 
@@ -1169,21 +1262,52 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 		 * ghost policy that wedges later outbound SA ops (ctl rolls its
 		 * own copy back on our error, so our mirror must match). */
 	} else {
-		p->sp = *sp;
+		/* Live update: snapshot the current policy so that, if the bind
+		 * or the commit fails, we restore BOTH the selector and the
+		 * bound-sa id.  Otherwise a failed PROTECT->BYPASS update would
+		 * leave the mirror holding the rejected policy, and the next
+		 * outbound rebind would program it -- a fail-open on a policy
+		 * ctl still holds. */
+		saved_sp = p->sp;
+		saved_bound = p->bound_sl_id;
+		saved_in_use = p->in_use;
 		was_live = 1;
+		p->sp = *sp;
 	}
 
 	/* Accept whether or not an egress SA exists yet (spmd installs SPD
 	 * first; a later SA_ADD rebinds).  Never refuse a policy. */
 	rc = p4_spd_bind(pr, p);
 	if (rc) {
-		if (!was_live)
-			memset(p, 0, sizeof(*p));  /* drop the new ghost */
+		if (was_live) {
+			p->sp = saved_sp;
+			p->bound_sl_id = saved_bound;
+			p->in_use = saved_in_use;
+		} else {
+			memset(p, 0, sizeof(*p));   /* drop the new ghost */
+		}
 		rte_swx_ctl_pipeline_abort(pr->ctl);
 		return rc;
 	}
+
+	/* Now that the exact table entry is scheduled, publish it.  Only mark
+	 * in_use after we know the whole add succeeded; on a failed commit
+	 * (abort_on_fail=1 rolls the table op back) mirror the rollback so our
+	 * view matches ctl's, which keeps its policy on error. */
+	rc = rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+	if (rc) {
+		if (was_live) {
+			p->sp = saved_sp;
+			p->bound_sl_id = saved_bound;
+			p->in_use = saved_in_use;
+		} else {
+			memset(p, 0, sizeof(*p));
+		}
+		P4_LOG("sp_add commit %d; mirror rolled back", rc);
+		return rc;
+	}
 	p->in_use = 1;
-	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+	return 0;
 }
 
 static int64_t p4_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)

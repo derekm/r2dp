@@ -16,6 +16,11 @@ endif
 # (bench/e2e_bench.sh drives it against two r2dp-fwd instances over memif).
 if dpdk.found()
   e2e_tgen = executable('e2e_tgen', 'e2e_tgen.c', dependencies: dpdk)
+  # Single-forwarder P4 frame driver: sends one plaintext frame into the P4
+  # forwarder's inner leg and reports whether a frame egresses the outer leg,
+  # proving the I/O ring bridge + pipeline run + next-hop + eth bridge moves
+  # bytes.  Requires -Denable_p4 (the P4 backend).
+  p4_memif = executable('p4_memif', 'p4_memif.c', dependencies: dpdk)
 endif
 
 # Reproducible sweep (build dir = this one): `meson compile -C BUILD bench`

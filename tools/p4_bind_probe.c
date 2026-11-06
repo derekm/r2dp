@@ -11,6 +11,12 @@
  * we drive the real OUTBOUND order (SA first, then SP) and the spmd startup
  * order (SP first) to prove rebind AND fail-closed.
  *
+ * Honest scope: this proves the TABLE INSTALL action from the log, NOT that a
+ * real packet hits spd_discard.  It installs R2DP_PROTO_ANY and /24 selectors
+ * (like spmd), and the SPD table is exact (src,dst,proto)-only — so a concrete
+ * packet misses the entry and falls to the spd_bypass default.  See PLAN §8
+ * limit 4: fail-closed is exact-hit-only, not DR_NO_SA_OUT parity.
+ *
  * Usage: p4_bind_probe [sock] [fwd-log-path]
  *   fwd-log-path (optional) enables the log-action assertions; without it
  *   only the control-plane return codes are checked, which do NOT prove the
