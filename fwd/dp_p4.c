@@ -136,6 +136,9 @@ struct p4_priv {
 	int th_started;
 	atomic_int running;
 
+	/* RX/egress packet counters (set by p4_worker, dumped on SIGUSR1). */
+	unsigned long c_outer, c_inner, c_out0, c_out1;
+
 	int started;
 	int wake_fd;
 };
@@ -162,6 +165,7 @@ struct p4_priv {
 static void *p4_worker(void *arg)
 {
 	struct p4_priv *pr = arg;
+	uint64_t last_dump = 0;
 
 	while (atomic_load_explicit(&pr->running, __ATOMIC_RELAXED)) {
 		/* Bridge RX: outer -> in0, inner -> in1. */
@@ -169,17 +173,21 @@ static void *p4_worker(void *arg)
 			struct rte_mbuf *pkts[P4_BURST_SZ];
 			uint16_t n = rte_eth_rx_burst(pr->outer_port, 0,
 						      pkts, P4_BURST_SZ);
-			if (n)
+			if (n) {
+				pr->c_outer += n;
 				rte_ring_enqueue_bulk(pr->in0, (void **)pkts,
 						      n, NULL);
+			}
 		}
 		if (pr->inner_port >= 0 && pr->in1 && pr->pool) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
 			uint16_t n = rte_eth_rx_burst(pr->inner_port, 0,
 						      pkts, P4_BURST_SZ);
-			if (n)
+			if (n) {
+				pr->c_inner += n;
 				rte_ring_enqueue_bulk(pr->in1, (void **)pkts,
 						      n, NULL);
+			}
 		}
 
 		/* Run the pipeline + ipsec extern. */
@@ -194,16 +202,34 @@ static void *p4_worker(void *arg)
 			uint16_t n = rte_ring_dequeue_burst(pr->out0,
 							    (void **)pkts,
 							    P4_BURST_SZ, NULL);
-			if (n)
+			if (n) {
+				pr->c_out0 += n;
 				rte_eth_tx_burst(pr->outer_port, 0, pkts, n);
+			}
 		}
 		if (pr->inner_port >= 0 && pr->out1) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
 			uint16_t n = rte_ring_dequeue_burst(pr->out1,
 							    (void **)pkts,
 							    P4_BURST_SZ, NULL);
-			if (n)
+			if (n) {
+				pr->c_out1 += n;
 				rte_eth_tx_burst(pr->inner_port, 0, pkts, n);
+			}
+		}
+
+		/* Periodic activity dump (every ~1s) so ingress/egress is
+		 * visible even with no signal handler wired. */
+		if (rte_get_tsc_cycles() - last_dump > rte_get_tsc_hz()) {
+			uint32_t q0 = rte_ring_count(pr->in0);
+			uint32_t q1 = rte_ring_count(pr->in1);
+			uint32_t qo0 = rte_ring_count(pr->out0);
+			uint32_t qo1 = rte_ring_count(pr->out1);
+			P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
+			       "| rings in0=%u in1=%u out0r=%u out1r=%u",
+			       pr->c_outer, pr->c_inner, pr->c_out0, pr->c_out1,
+			       q0, q1, qo0, qo1);
+			last_dump = rte_get_tsc_cycles();
 		}
 	}
 	return NULL;
