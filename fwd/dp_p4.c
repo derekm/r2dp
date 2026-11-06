@@ -750,6 +750,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	struct p4_sa *e;
 	uint8_t key[16], data[4];
 	struct rte_swx_table_entry ent;
+	uint32_t orig_sl_id = 0;   /* pre-rekey id (restore on bind/table fail) */
 	int rc, i, inbound, deleting, new_slot = 0;
 	uint32_t dip, spi, sa_sip = 0;
 
@@ -802,17 +803,28 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 				return rc;
 			}
 		}
+		if (e->dir == R2DP_DIR_OUT) {
+			/* Retarget/release outbound policies FIRST, while the SA being
+			 * deleted is still in the crypto extern.  Mark the slot not-in-use
+			 * so the lookup skips it, but do NOT free the crypto SA or slot
+			 * until the rebind has succeeded: on failure we restore the slot
+			 * and return, so ctl's keep-on-error contract holds and a retry
+			 * can still find it. */
+			e->in_use = 0;
+			rc = p4_spd_rebind(pr);
+			if (rc) {
+				e->in_use = 1;   /* keep the live SA for ctl's retry */
+				return rc;
+			}
+			if (pr->ipsec)
+				rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
+			e->sl_id = 0;
+			return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+		}
 		if (pr->ipsec)
 			rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
 		e->in_use = 0;
-		if (e->dir == R2DP_DIR_OUT) {
-			/* retarget/release outbound policies; a failed rebind must
-			 * surface (do not report success when a bind errored). */
-			rc = p4_spd_rebind(pr);
-			if (rc)
-				return rc;
-			return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
-		}
+		e->sl_id = 0;
 		return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 	}
 
@@ -831,7 +843,10 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		e->in_use = 1;
 		new_slot = 1;
 	} else if (blob && blen) {
-		/* UPDATE (rekey) of a live SA: new gen so the SPD rebind picks it. */
+		/* UPDATE (rekey) of a live SA: remember the pre-rekey crypto id so a
+		 * later failure can restore it, and bump gen so SPD rebind takes the
+		 * new SA. */
+		orig_sl_id = e->sl_id;
 		e->gen = ++pr->gen;
 	}
 
@@ -882,10 +897,24 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	 * tunnel (policy-installed-before-SA, or a rekey). */
 	if (!inbound) {
 		/* Binding an outbound SA (re)targets any OUT PROTECT policy
-		 * waiting on this tunnel.  Propagate a failed rebind. */
+		 * waiting on this tunnel.  On failure, delete the just-added
+		 * crypto SA and roll back the slot to its pre-call state so
+		 * ctl's keep-on-error contract and a retry stay consistent. */
 		rc = p4_spd_rebind(pr);
-		if (rc)
+		if (rc) {
+			if (pr->ipsec)
+				rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
+			if (new_slot) {
+				e->in_use = 0;
+				e->sl_id = 0;
+			} else {
+				/* rekey: restore the pre-rekey crypto id (still
+				 * live in the extern); the new one is deleted
+				 * above. */
+				e->sl_id = orig_sl_id;
+			}
 			return rc;
+		}
 		return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 	}
 
@@ -920,9 +949,11 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			e->in_use = 0;
 			e->sl_id = 0;
 		} else {
-			/* rekey raced: the old crypto binding at e->sl_id is now
-			 * superseded; leave the slot live and let ctl retry. */
-			e->gen = ++pr->gen;
+			/* rekey: delete the NEW crypto SA and restore the
+			 * pre-rekey id, which is still the live binding. */
+			if (pr->ipsec)
+				rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
+			e->sl_id = orig_sl_id;
 		}
 		return rc;
 	}
@@ -1028,6 +1059,13 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 		rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
 							  "outbound_table_0",
 							  &ent);
+		if (rc) {
+			/* The delete above is already scheduled; a later commit
+			 * would drop this selector to the (bypass) default.
+			 * Abort so the previous entry (e.g. the unbound DISCARD
+			 * or a prior protect) is not silently removed. */
+			rte_swx_ctl_pipeline_abort(pr->ctl);
+		}
 	}
 	if (rc)
 		P4_LOG("outbound entry add %d", rc);
@@ -1052,8 +1090,14 @@ static int p4_spd_rebind(struct p4_priv *pr)
 		if (rc && !rerr)
 			rerr = rc;
 	}
-	if (rerr)
-		return rerr;   /* do not commit a partial delete+add */
+	if (rerr) {
+		/* Abort ALL pending table ops (not just this bind): a scheduled
+		 * delete whose paired add failed would otherwise be committed by
+		 * a later success, dropping the selector to the (bypass) default
+		 * -- the exact fail-open this path is meant to prevent. */
+		rte_swx_ctl_pipeline_abort(pr->ctl);
+		return rerr;
+	}
 	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 }
 
@@ -1102,6 +1146,7 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 {
 	struct p4_priv *pr = dp->priv;
 	struct p4_pol *p;
+	int was_live = 0;
 	int rc, i;
 
 	/* A control plane that does not ask for a slid assigns one before
@@ -1112,22 +1157,32 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 
 	p = p4_pol_find(pr, sp);
 	if (!p) {
+		int ghost = -1;
 		for (i = 0; i < P4_SP_MAX; i++)
-			if (!pr->spd[i].in_use) { p = &pr->spd[i]; break; }
-		if (!p)
+			if (!pr->spd[i].in_use) { ghost = i; break; }
+		if (ghost < 0)
 			return -ENOSPC;
+		p = &pr->spd[ghost];
 		p->sp = *sp;
 		p->bound_sl_id = UINT32_MAX;
-		p->in_use = 1;
+		/* Do NOT mark in_use before bind: a failed bind must not leave a
+		 * ghost policy that wedges later outbound SA ops (ctl rolls its
+		 * own copy back on our error, so our mirror must match). */
 	} else {
 		p->sp = *sp;
+		was_live = 1;
 	}
 
 	/* Accept whether or not an egress SA exists yet (spmd installs SPD
 	 * first; a later SA_ADD rebinds).  Never refuse a policy. */
 	rc = p4_spd_bind(pr, p);
-	if (rc)
+	if (rc) {
+		if (!was_live)
+			memset(p, 0, sizeof(*p));  /* drop the new ghost */
+		rte_swx_ctl_pipeline_abort(pr->ctl);
 		return rc;
+	}
+	p->in_use = 1;
 	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 }
 
