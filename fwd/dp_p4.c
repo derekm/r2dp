@@ -1211,6 +1211,9 @@ static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 		if (q->sel_src.family != sp->sel_src.family ||
 		    q->sel_dst.family != sp->sel_dst.family)
 			continue;
+		if (q->sel_src.port != sp->sel_src.port ||
+		    q->sel_dst.port != sp->sel_dst.port)
+			continue;
 		if (memcmp(q->sel_src.addr, sp->sel_src.addr, 4) != 0)
 			continue;
 		if (memcmp(q->sel_dst.addr, sp->sel_dst.addr, 4) != 0)
@@ -1219,6 +1222,45 @@ static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 	}
 	return NULL;
 }
+
+/* Do two selectors map to the SAME ACL row in outbound_table_0?  The table is
+ * a WILDCARD (ternary) keyed on (protocol, masked src, masked dst) only --
+ * ports and host bits below the prefix are NOT part of the ACL key.  Two
+ * policies that differ ONLY in port, or ONLY in host bits inside the prefix
+ * (/24 10.0.0.5 vs /24 10.0.0.0), are one row.  The control plane's mirror
+ * (ctl sel_eq_d) keys on the full selector, so the ACL cannot name both;
+ * p4_sp_add must reject the second rather than -EEXIST-replace and report
+ * success (a later SP_DEL of either then deletes the row for BOTH -- fail-open).
+ * Returns 1 if they collide on a row, 0 if both can coexist. */
+static int
+p4_pol_row_conflicts(const struct r2dp_sp *a, const struct r2dp_sp *b)
+{
+	uint8_t ma[8], mb[8];
+	int i;
+
+	if (a->dir != b->dir || a->ul_proto != b->ul_proto ||
+	    a->pref_src != b->pref_src || a->pref_dst != b->pref_dst)
+		return 0;
+	if (a->sel_src.family != b->sel_src.family ||
+	    a->sel_dst.family != b->sel_dst.family ||
+	    a->sel_src.family != R2DP_AF_INET4)
+		return 0;
+	pref2mask_bytes(a->pref_src, &ma[0]);
+	pref2mask_bytes(a->pref_dst, &ma[4]);
+	pref2mask_bytes(b->pref_src, &mb[0]);
+	pref2mask_bytes(b->pref_dst, &mb[4]);
+	/* Mask each selector addr to its prefix; equal masked seeds => the
+	 * two selectors differ only in port or host bits => one ACL row. */
+	for (i = 0; i < 4; i++)
+		if ((a->sel_src.addr[i] & ma[i]) != (b->sel_src.addr[i] & mb[i]))
+			return 0;
+	for (i = 0; i < 4; i++)
+		if ((a->sel_dst.addr[i] & ma[4 + i]) !=
+		    (b->sel_dst.addr[i] & mb[4 + i]))
+			return 0;
+	return 1;
+}
+
 
 /* SPD rule priority for the wildcard (ACL) outbound table.  rte_swx_table_wm.c
  * sets acl_rule->data.priority = RTE_ACL_MAX_PRIORITY - entry->key_priority,
@@ -1388,8 +1430,15 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 	int rc;
 
 	p = p4_pol_find(pr, sp);
-	if (!p)
+	if (!p) {
+		/* A non-OUT policy is never stored here (p4_sp_add returns 0
+		 * for IN/FWD without keeping it), so deleting it is a no-op
+		 * success -- NOT -ENOENT, which would make ctl keep its entry
+		 * forever (it refuses to drop what the dataplane still owns). */
+		if (sp->dir != R2DP_DIR_OUT)
+			return 0;
 		return -ENOENT;
+	}
 	if (sp->sel_src.family != R2DP_AF_INET4 ||
 	    sp->sel_dst.family != R2DP_AF_INET4)
 		return -EAFNOSUPPORT;
@@ -1442,6 +1491,22 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	p = p4_pol_find(pr, sp);
 	if (!p) {
 		int ghost = -1;
+		/* The OUT SPD table is a WILDCARD keyed on (proto, masked src,
+		 * masked dst) only.  A selector that differs from an existing
+		 * OUT policy only by port, or only by host bits inside the
+		 * prefix, shares its ACL row, but ctl (sel_eq_d) keys on the
+		 * full selector and so a later SP_DEL of either would delete
+		 * the row for BOTH (fail-open).  Refuse the new policy before
+		 * it is committed; do not alias two selectors into one row.
+		 * Don't take a ghost slot or touch any mirror state on this
+		 * path -- ctl rolls its own copy back on our error. */
+		for (i = 0; i < P4_SP_MAX; i++) {
+			struct p4_pol *q = &pr->spd[i];
+			if (!q->in_use || q->sp.dir != R2DP_DIR_OUT)
+				continue;
+			if (p4_pol_row_conflicts(&q->sp, sp))
+				return -E2BIG;  /* ACL cannot name both selectors */
+		}
 		for (i = 0; i < P4_SP_MAX; i++)
 			if (!pr->spd[i].in_use) { ghost = i; break; }
 		if (ghost < 0)

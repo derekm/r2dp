@@ -4,9 +4,10 @@ Status: **in progress.** The full `.p4`/PNA compile path works (p4c-dpdk on
 `.165`, compiled `p4/r2dp.out`) and the `fwd/dp_p4.c` backend loads **and runs**
 the SWX pipeline: `--dp p4` brings up codegen->.so->build_from_lib, a cryptodev,
 the ipsec extern, a packet-path worker (`rte_swx_pipeline_run` + `rte_swx_ipsec_run`),
-and serves the r2dp control socket (SA/SP install + commit verified).  What is
-NOT done: real packet I/O (nothing feeds the ring ports yet) and the first-spec
-limits in §8.  Superseded pre-toolchain sections: §3/§5/§6/§7 (see §8).
+and serves the r2dp control socket (SA/SP install + commit verified).  Framed
+ESP encrypt + decrypt round-trip over root net_tap, plus all four first-spec
+limits in §8, are closed.  Superseded pre-toolchain sections: §3/§5/§6/§7
+(see §8).
 
 ## 1. Why this is buildable now
 
@@ -163,7 +164,8 @@ later at the extern (`8f0f38a`), 4 remains open.
 - **Limits 3 & 4 (as of `b60d0cd`):** crypto-failure->drop appeared still dead
   (`MainControlT_status` unwritten) and SPD was still exact
   `(src,dst,proto)` (no prefix/ANY/ports).  Limit 3's drop was later proven at
-  the extern (`8f0f38a`); see the next update.  Only Limit 4 remains open.
+  the extern (`8f0f38a`); Limit 4 (prefix/ANY) was implemented in `a8aedd2`
+  and proven — see the next update.  No limits remain open.
 
 **§8 update (2026-11-07):** Limit 3's *security* property is verified at the
 crypto layer even though the P4 `status` branch is unwritten.
@@ -230,10 +232,13 @@ and the delegated `deleg_8f37ef0b` review):
      pipeline, so the drop already happens; the P4 status branch is
      dead-but-harmless.  Do not "fix" the P4 status until a path that
      returns bad frames exists.
-  4. **SPD is exact `(src,dst,proto)` only** — no prefix/ports/proto-ANY.  FIXED
-     `a8aedd2`: now a WILDCARD (ternary) table with prefix/ANY selectors and
-     per-rule priority (see §8 Limit 4 above).  Outbound miss -> `spd_bypass`;
-     inbound miss -> `drop` is NOT `DR_NO_SA_IN`.
+  4. **SPD is a WILDCARD (ternary) table on (protocol, src, dst) with
+     prefix/ANY selectors and per-rule priority** — set by `a8aedd2` (Limit 4,
+     §8 above).  Ports and IPv6 selectors remain unexpressed by the table (the
+     ACL keys IPv4 proto/src/dst only); two such policies that would share one
+     ACL row are rejected by the dataplane (`-E2BIG`) rather than aliased, so
+     a later `SP_DEL` cannot delete the row for both.  Outbound miss ->
+     `spd_bypass`; inbound miss -> `drop` is NOT `DR_NO_SA_IN`.
 - **Runtime `fwd/dp_p4.c`** (`88ec62d`, `497952c`, `77551a8` … SPD-bind fix in
   the round-4 follow-up) implements `fwd_dp_ops` and now **loads and runs the
   SWX pipeline** end-to-end: `r2dp-fwd --dp p4` brings up
@@ -333,3 +338,27 @@ and the delegated `deleg_8f37ef0b` review):
   itself. `sa_set_hard_bytes/time` remain NULL on P4 (ctl-side lifetimes
   cover the control path; DPDK enforces in the datapath) — the one remaining
   parity gap.
+
+### §8 addendum 2026-11-07 — SPD mirror identity + ACL-row aliasing (deleg_0e75fd7b)
+Review `deleg_0e75fd7b` found the delete/same-prefix fix correct but the mirror
+identity incomplete vs ctl, and stale doc/skill lines.  All closed:
+- **Ports now in the mirror.** `p4_pol_find` also matches `sel_src.port`/
+  `sel_dst.port` (mirrors ctl `sel_eq_d`).  Before, two OUT policies differing
+  only by port shared one mirror slot and one ACL row; `SP_DEL` of either
+  deleted the row for both (fail-open).  Now a second policy that would share
+  an ACL row — same (proto, masked src, masked dst) but different port or host
+  bits inside the prefix — is **rejected with `-E2BIG`** by `p4_pol_row_conflicts`
+  + `p4_sp_add` before any mirror state changes, so ctl never commits it.
+  Same-policy live updates still bind via the `-EEXIST` delete-then-add path.
+- **IN/FWD `SP_DEL` un-stuck.** `p4_sp_add` never stores non-OUT policies, so
+  `p4_sp_del` returning `-ENOENT` made ctl keep the IN/FWD entry forever.
+  Non-OUT delete now returns 0 (no-op), matching the add.
+- **Docs/skill:** PLAN item 4 lead now leads with the wildcard fact; removed
+  "Only Limit 4 remains open" and the "packet I/O not done" status line; probe
+  comment no longer says ANY//24 "collapse" (they're separate rows); skill
+  fix `p4_spd_del` -> `p4_sp_del` and documented the row-alias rejection.
+
+Verified on `.165`: `/32 udp PROTECT` + `/24 udp BYPASS` still coexist (2 OUT
+BIND) and `/24` survives SP_DEL; port-conflict `sport=1234` and host-bit
+`10.0.0.99/24` adds both return "Argument list too long" (`-E2BIG`); IN policy
+add+del both return OK.
