@@ -1398,13 +1398,15 @@ static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 
 /* Do two selectors map to the SAME ACL row in outbound_table_0?  The table is
  * a WILDCARD (ternary) keyed on (protocol, masked src, masked dst) only --
- * ports and host bits below the prefix are NOT part of the ACL key.  Two
- * policies that differ ONLY in port, or ONLY in host bits inside the prefix
- * (/24 10.0.0.5 vs /24 10.0.0.0), are one row.  The control plane's mirror
- * (ctl sel_eq_d) keys on the full selector, so the ACL cannot name both;
- * p4_sp_add must reject the second rather than -EEXIST-replace and report
- * success (a later SP_DEL of either then deletes the row for BOTH -- fail-open).
- * Returns 1 if they collide on a row, 0 if both can coexist. */
+ * ports, scope, and host bits below the prefix are NOT part of the ACL key.
+ * Two policies that differ ONLY in port, scope, or host bits inside the
+ * prefix (/24 10.0.0.5 vs /24 10.0.0.0), are one row.  The control plane's
+ * mirror (ctl sel_eq_d) keys on the full selector, so the ACL cannot name
+ * both; p4_sp_add must reject the second rather than -EEXIST-replace and
+ * report success (a later SP_DEL of either then deletes the row for BOTH --
+ * fail-open).  Returns 1 if they collide on a row, 0 if both can coexist.
+ * Scope/port/host-bits are compared ONLY here (identity/alias); they are
+ * never written into the ACL key image (not match fields). */
 static int
 p4_pol_row_conflicts(const struct r2dp_sp *a, const struct r2dp_sp *b)
 {
@@ -1536,8 +1538,11 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 		break;
 	}
 
-	/* Add.  table_entry_add rejects a duplicate key (-EEXIST) on a
-	 * re-bind/rekey, so if it is already present, delete-then-add.  Do NOT
+	/* Add.  On DPDK 24.11.4 table_entry_add does NOT return -EEXIST: a
+	 * duplicate-key hit is moved to pending_modify and add returns 0
+	 * (rebind/bind-in-place).  The -EEXIST->delete-then-add branch below is
+	 * therefore dead against this DPDK -- keep it defensively for other
+	 * backends/versions, but it is not the executing re-bind path.  Do NOT
 	 * delete first unconditionally: a delete+failed-add would commit the
 	 * deletion and leave the selector at the default. */
 	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "outbound_table_0",
@@ -1669,7 +1674,7 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 		int ghost = -1;
 		/* The OUT SPD table is a WILDCARD keyed on (proto, masked src,
 		 * masked dst) only.  A selector that differs from an existing
-		 * OUT policy only by port, or only by host bits inside the
+		 * OUT policy only by port, scope, or host bits inside the
 		 * prefix, shares its ACL row, but ctl (sel_eq_d) keys on the
 		 * full selector and so a later SP_DEL of either would delete
 		 * the row for BOTH (fail-open).  Refuse the new policy before
@@ -1708,7 +1713,10 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	}
 
 	/* Accept whether or not an egress SA exists yet (spmd installs SPD
-	 * first; a later SA_ADD rebinds).  Never refuse a policy. */
+	 * first; a later SA_ADD rebinds).  The alias check above refuses a
+	 * selector the ACL cannot name (-E2BIG); -ENOSPC covers a full mirror
+	 * and bind can return -EAFNOSUPPORT/commit errors.  Otherwise accept,
+	 * including an unbound PROTECT (fail-closed). */
 	rc = p4_spd_bind(pr, p);
 	if (rc) {
 		if (was_live) {
