@@ -135,21 +135,24 @@ lane green, m1–m3 each closing a named `COVERAGE.md` row.
 - Whether `p4c` DPDK/PNA emits `.spec`+`.code` that the installed 25.11 SWX
   version accepts, or whether the hand-authored `.spec` is the loadable input
   and `.p4` is forward-looking only.
-- IKE/ARP exception handling in a parse-defined pipeline (exception port vs a
-  `bypass` table).
+- ~~IKE/ARP exception handling in a parse-defined pipeline (exception port vs a
+  `bypass` table).~~ **Resolved `b60d0cd`** — non-ESP forwards clear (IPv4 routes
+  by dst, ARP via `next_hop_preserve`), the pre-§8 drop is gone.
 - SWX replay-window semantics vs our RFC 4303 window (the SWX ipsec block must
   be validated against the `dp_sa`/`kfwd` reference, exactly as the DPDK
   backend was).
 
 ## 8. History (post-implementation record)
 
-**§8 update (2026-11-07, `b60d0cd`):** limits 1 and 2 (of the four below) are
-now closed on-box; limits 3 and 4 remain open.
+**§8 update (2026-11-07, `b60d0cd`):** limits 1 and 2 (of the four below) closed
+on-box; limits 3 and 4 were still open **at that commit** — 3 was proven closed
+later at the extern (`8f0f38a`), 4 remains open.
 - **Limit 1 (IKE/ARP dropped) — FIXED.** Non-ESP inbound/outbound frames
   (IKE UDP/500, ARP, plaintext) now forward clear instead of dropping:
-  ARP is parsed (`arp_t`, ethertype 0x0806), routed to the inner leg via a
-  new `next_hop_preserve(port_id)` action that keeps the original L2
-  (next_hop ids 2=inner, 3=outer).  Inbound SAD still hits and ESP decrypt
+  ARP is parsed (`arp_t`, ethertype 0x0806), forwarded with its L2 preserved
+  via a `next_hop_preserve(port_id)` action that keeps the original ethertype
+  (inbound forced to the inner leg id 2, outbound to the outer leg id 3);
+  IPv4 clears route by dst LPM.  Inbound SAD still hits and ESP decrypt
   is intact (`crypto enq=32 deq=32` with the round-trip proof frame).
 - **Limit 2 (every UDP/4500 parsed as ESP) — FIXED, zero-marker path proven.**
   RFC 3948 demux in the parser: `nat_demux` does `pkt.lookahead<bit<32>>()`
@@ -157,9 +160,10 @@ now closed on-box; limits 3 and 4 remain open.
   terminates to `accept` and the frame is forwarded clear; a non-zero SPI is
   ESP-in-UDP.  On-box: UDP/4500 with `00 00 00 00` marker egresses inner
   clear (381 frames), never dropped, never offered to the SAD.
-- **Limits 3 & 4 still open:** crypto-failure->drop is still dead
-  (`MainControlT_status` unwritten) and SPD is still exact
-  `(src,dst,proto)` (no prefix/ANY/ports).  See list below.
+- **Limits 3 & 4 (as of `b60d0cd`):** crypto-failure->drop appeared still dead
+  (`MainControlT_status` unwritten) and SPD was still exact
+  `(src,dst,proto)` (no prefix/ANY/ports).  Limit 3's drop was later proven at
+  the extern (`8f0f38a`); see the next update.  Only Limit 4 remains open.
 
 **§8 update (2026-11-07):** Limit 3's *security* property is verified at the
 crypto layer even though the P4 `status` branch is unwritten.
@@ -219,11 +223,11 @@ and the delegated `deleg_8f37ef0b` review):
   and TXes the output ring, and a real IPv4/UDP frame crosses
   inner→pipeline→outer over **root net_tap** (net_memif vdevs do not
   materialize on `.165` — see below; net_tap needs root, else TUNSETIFF
-  EPERM and control-only fallback).  A full **framed ESP round-trip**
-  (crypto + forward through the PNA tables) is the m1 gate and needs the
-  two-forwarder + e2e_tgen bench assembly, or the extern to actually process
-  a framed ESP packet.  Plus the §8 limits above
-  (IKE/ARP/NAT-T/SPD expressiveness).
+  TUNSETIFF EPERM and control-only fallback).  A full framed ESP forward
+  (crypto + routing through the PNA tables) was later proven end-to-end
+  (`f50470f` round-trip; `3e1f8bb` decrypt/HBO/routing) on root net_tap.
+  Still open: only Limit 4 (SPD prefix/ANY expressiveness) — limits 1-3 are
+  closed (see the dated §8 updates at the top of this section).
 - **SPD binding contract (rounds 4+5):** the control plane may install an
   OUT PROTECT policy with no egress SA yet (spmd loads SPD at startup, then
   GETSPI/SA_ADD) — so `p4_sp_add` **accepts** and never refuses.  It keeps a
@@ -279,8 +283,8 @@ and the delegated `deleg_8f37ef0b` review):
   inner leg.  The decrypt-leg byte-order fixes (metadata tables match HOST
   order, not network; only header-field action data stays NBO) and inner-
   subnet routing are documented in §8 above.  So both directions of framed
-  ESP crypto are proven; the remaining limits are IKE/ARP/NAT-T demux and
-  SPD expressiveness.  ctr() in
+  ESP crypto are proven; the only remaining limit is SPD prefix/ANY
+  expressiveness (the IKE/ARP/NAT-T limits 1-2 are closed).  ctr() in
   bench/e2e_bench.sh still parses the DPDK `stats` format the P4 worker
   does not emit — the worker's own `pkt:` line is the P4-leg counter
   equivalent.
