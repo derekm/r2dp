@@ -153,6 +153,7 @@ struct p4_priv {
 #define P4_RUN_QUANTA 1000
 
 static void p4_stats_on_req(struct p4_priv *p);
+static void *p4_bench_worker(void *arg);
 
 /* Packet-path worker: drain the pipeline's input, execute the PNA program,
  * run the ipsec extern head-of-line, then loop.  Mirrors examples/pipeline
@@ -278,6 +279,162 @@ static void *p4_worker(void *arg)
 				       pr->c_out1, q0, q1, qo0, qo1);
 			last_dump = rte_get_tsc_cycles();
 		}
+	}
+	return NULL;
+}
+
+/* Self-injecting TAP-FREE bench mode (env R2DP_P4_BENCH=1, launch --dp p4).
+
+ * The normal worker bridges ethdev legs to the pipeline rings; a tap-free
+ * measurement of the P4 data plane must bypass ethdev entirely (the net_tap
+ * user<->kernel skb crossing caps lab throughput around a quarter Mpps and
+ * hides the real SWX+crypto cost that fwd_bench exposes for the DPDK
+ * backend).  This worker, launched INSTEAD of p4_worker, feeds the pipeline
+ * directly: it waits until the control plane has bound at least one OUT
+ * PROTECT policy (so the SPD->ipsec_protect path is armed), allocates a burst
+ * of plaintext IPv4/UDP frames targeting that policy, then loops
+ * enqueue(in1) -> rte_swx_pipeline_run -> rte_swx_ipsec_run -> dequeue(out0),
+ * counting what the data plane accepts and egresses and reporting pps and
+ * cycles/pkt from TSC.  No ethdev, no tap, no memif. */
+#define P4_BENCH_WAIT_HZ 120     /* wait up to 120s for a bound OUT PROTECT
+				  * (the control plane installs SA+SP after
+				  * the forwarder is up, so this must cover
+				  * bring-up + a real policy install) */
+#define P4_BENCH_SECS    3      /* timed window per trial */
+#define P4_BENCH_TRIALS  5
+static void *p4_bench_worker(void *arg)
+{
+	struct p4_priv *pr = arg;
+	unsigned waited = 0;
+
+	while (atomic_load_explicit(&pr->running, __ATOMIC_RELAXED) &&
+	       waited++ < P4_BENCH_WAIT_HZ * 2) {
+		for (int i = 0; i < P4_SP_MAX; i++) {
+			struct p4_pol *q = &pr->spd[i];
+			if (q->in_use && q->sp.dir == R2DP_DIR_OUT &&
+			    q->sp.action == R2DP_ACT_PROTECT &&
+			    q->bound_sl_id != UINT32_MAX)
+				goto armed;
+		}
+		rte_delay_ms(500);
+	}
+	P4_LOG("bench: no bound OUT PROTECT within %ds; aborting",
+	       P4_BENCH_WAIT_HZ);
+	return NULL;
+armed:
+	/* Build one plaintext IPv4/UDP frame for src=10.0.0.1 dst=10.0.0.2
+	 * proto=UDP dport=9 (the standard /32,/32 PROTECT selector).  We reuse
+	 * a single template mbuf and clone per inject so substitution is
+	 * exact.  mbuf pool must exist (tap mode has one; control-only does
+	 * not, so create a local one here). */
+	{
+		struct rte_mempool *pool = pr->pool;
+		uint64_t t0, t1, min_c, best = 0, tot_pkt = 0;
+		int trial;
+
+		if (!pool)
+			pool = rte_pktmbuf_pool_create("p4bench_pool",
+						       P4_POOL_SIZE,
+						       P4_POOL_CACHE, 128,
+						       RTE_MBUF_DEFAULT_BUF_SIZE,
+						       SOCKET_ID_ANY);
+		if (!pool) {
+			P4_LOG("bench: pool create failed");
+			return NULL;
+		}
+		/* Time trials. */
+		for (trial = 0; trial < P4_BENCH_TRIALS; trial++) {
+			uint64_t end;
+			uint64_t npkt = 0;
+			/* drain any residue from the previous trial */
+			{
+				void *pkts[P4_BURST_SZ];
+				uint16_t r;
+				while ((r = rte_ring_dequeue_burst(pr->out0,
+								      pkts,
+								      P4_BURST_SZ,
+								      NULL))) {
+					for (int k = 0; k < r; k++)
+						rte_pktmbuf_free(pkts[k]);
+				}
+			}
+			t0 = rte_get_tsc_cycles();
+			end = t0 + (uint64_t)rte_get_tsc_hz() * P4_BENCH_SECS;
+			while (rte_get_tsc_cycles() < end) {
+				struct rte_mbuf *mk[P4_BURST_SZ];
+				uint16_t n = 0, enq;
+				/* alloc + build a burst of plaintext */
+				for (int k = 0; k < P4_BURST_SZ; k++) {
+					struct rte_mbuf *m =
+					    rte_pktmbuf_alloc(pool);
+					uint8_t *f;
+					if (!m)
+						break;
+					f = (uint8_t *)rte_pktmbuf_append(m, 64);
+					if (!f) {
+						rte_pktmbuf_free(m);
+						break;
+					}
+					memset(f, 0, 64);
+					/* eth dst6 src6 + 0x0800 */
+					f[0]=0x02; f[5]=0x01;
+					f[6]=0x02; f[11]=0x02;
+					f[12]=0x08; f[13]=0x00;
+					/* IPv4 hdr @14 (ver/ihl, total len
+					 * 0x32=50, ttl 64, proto 17 udp) */
+					f[14]=0x45; f[15]=0x00; f[19]=0x32;
+					f[22]=0x40; f[23]=0x11;
+					/* src 10.0.0.1 @26, dst 10.0.0.2 @30 */
+					f[26]=0x0a; f[27]=0x00; f[28]=0x00;
+					f[29]=0x01;
+					f[30]=0x0a; f[31]=0x00; f[32]=0x00;
+					f[33]=0x02;
+					/* UDP @34: sport 1024, dport 9 */
+					f[34]=0x04; f[35]=0x00;
+					f[36]=0x00; f[37]=0x09;
+					f[38]=0x00; f[39]=0x08;
+					mk[n++] = m;
+				}
+				if (!n)
+					break;
+				/* feed the pipeline's inner leg */
+				enq = rte_ring_enqueue_burst(pr->in1,
+							     (void **)mk,
+							     n, NULL);
+				/* free any not enqueued (ring full) */
+				for (int k = enq; k < n; k++)
+					rte_pktmbuf_free(mk[k]);
+				/* run data plane */
+				rte_swx_pipeline_run(pr->p, P4_RUN_QUANTA);
+				rte_swx_ipsec_run(pr->ipsec);
+				/* drain egress (ESP to the outer leg) */
+				{
+					struct rte_mbuf *rx[P4_BURST_SZ];
+					uint16_t r =
+					    rte_ring_dequeue_burst(pr->out0,
+								   (void **)rx,
+								   P4_BURST_SZ,
+								   NULL);
+					npkt += r;
+					for (int k = 0; k < r; k++)
+						rte_pktmbuf_free(rx[k]);
+				}
+			}
+			t1 = rte_get_tsc_cycles();
+			npkt = npkt > 0 ? npkt : 1;
+			min_c = (t1 - t0) / npkt;
+			tot_pkt = npkt;
+			best = (trial == 0 || min_c < best) ? min_c : best;
+			P4_LOG("bench[%d]: pkt=%llu cyc/pkt=%llu pps=%llu",
+			       trial,
+			       (unsigned long long)npkt,
+			       (unsigned long long)min_c,
+			       (unsigned long long)((uint64_t)rte_get_tsc_hz() *
+						    npkt / (t1 - t0)));
+			(void)tot_pkt;
+		}
+		P4_LOG("bench: best_cyc_pkt=%llu",
+		       (unsigned long long)best);
 	}
 	return NULL;
 }
@@ -952,12 +1109,18 @@ static int p4_start(struct fwd_dp *dp)
 	pr->out0 = rte_ring_lookup("R2DP_OUT0");
 	pr->out1 = rte_ring_lookup("R2DP_OUT1");
 
-	/* Launch the packet-path worker. */
+	/* Launch the packet-path worker (or the self-injecting bench worker
+	 * when R2DP_P4_BENCH is set -- a tap-free dataplane measurement that
+	 * feeds the pipeline rings directly, no ethdev). */
 	atomic_store_explicit(&pr->running, 1, __ATOMIC_RELAXED);
-	if (pthread_create(&pr->th, NULL, p4_worker, pr) != 0) {
-		P4_LOG("worker create failed");
-		atomic_store_explicit(&pr->running, 0, __ATOMIC_RELAXED);
-		return -EIO;
+	{
+		void *(*wk)(void *) =
+		    getenv("R2DP_P4_BENCH") ? p4_bench_worker : p4_worker;
+		if (pthread_create(&pr->th, NULL, wk, pr) != 0) {
+			P4_LOG("worker create failed");
+			atomic_store_explicit(&pr->running, 0, __ATOMIC_RELAXED);
+			return -EIO;
+		}
 	}
 	pr->th_started = 1;
 
