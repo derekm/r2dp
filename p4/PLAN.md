@@ -267,9 +267,11 @@ and the delegated `deleg_8f37ef0b` review):
   bind probe install, does NOT collapse to one exact entry: the real packet
   holds a concrete proto/address that misses the entry and falls to the
   `spd_bypass` default.  DPDK honors ANY/prefix (`dpdk_spd.c:250,307`); this
-  backend does not yet.  So the unbound-PROTECT drop is exact-hit-only, not
-  `DR_NO_SA_OUT` parity until SPD expressiveness lands.  PLAN is explicit
-  about this rather than overclaiming.
+  backend does not yet (it is exact-only today).  So the unbound-PROTECT drop
+  is exact-hit-only, not `DR_NO_SA_OUT` parity until SPD expressiveness lands
+  — which IS achievable (SWX wildcard tables update non-incrementally, see §8
+  limit 4) but needs the ACL key byte-order work; not imminent.  PLAN is
+  explicit about this rather than overclaiming.
 - **Framed forward proven (round-6):** a real IPv4/UDP frame injected on the
   inner tap (`r2pi`, outbound leg) is processed by the SWX pipeline and
   egresses the outer tap (`r2po`) — captured by tcpdump (`10.0.0.1.1024 >
