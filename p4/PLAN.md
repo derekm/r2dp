@@ -143,6 +143,24 @@ lane green, m1–m3 each closing a named `COVERAGE.md` row.
 
 ## 8. History (post-implementation record)
 
+**§8 update (2026-11-07, `b60d0cd`):** limits 1 and 2 (of the four below) are
+now closed on-box; limits 3 and 4 remain open.
+- **Limit 1 (IKE/ARP dropped) — FIXED.** Non-ESP inbound/outbound frames
+  (IKE UDP/500, ARP, plaintext) now forward clear instead of dropping:
+  ARP is parsed (`arp_t`, ethertype 0x0806), routed to the inner leg via a
+  new `next_hop_preserve(port_id)` action that keeps the original L2
+  (next_hop ids 2=inner, 3=outer).  Inbound SAD still hits and ESP decrypt
+  is intact (`crypto enq=32 deq=32` with the round-trip proof frame).
+- **Limit 2 (every UDP/4500 parsed as ESP) — FIXED, zero-marker path proven.**
+  RFC 3948 demux in the parser: `nat_demux` does `pkt.lookahead<bit<32>>()`
+  on the candidate SPI; a zero marker (NAT-T keepalive / IKE behind NAT)
+  terminates to `accept` and the frame is forwarded clear; a non-zero SPI is
+  ESP-in-UDP.  On-box: UDP/4500 with `00 00 00 00` marker egresses inner
+  clear (381 frames), never dropped, never offered to the SAD.
+- **Limits 3 & 4 still open:** crypto-failure->drop is still dead
+  (`MainControlT_status` unwritten) and SPD is still exact
+  `(src,dst,proto)` (no prefix/ANY/ports).  See list below.
+
 The plan above was filed before the P4 toolchain existed.  What actually
 happened, per the review of commits `5b42982`..`6efe910` (`p4-dpdk-swx` skill
 and the delegated `deleg_8f37ef0b` review):
