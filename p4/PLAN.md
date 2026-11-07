@@ -314,3 +314,22 @@ and the delegated `deleg_8f37ef0b` review):
   bench/e2e_bench.sh still parses the DPDK `stats` format the P4 worker
   does not emit — the worker's own `pkt:` line is the P4-leg counter
   equivalent.
+
+### §8 addendum 2026-11-07 — harness integration + P4-vs-DPDK benchmark
+- **Harness:** `bench/p4_bench.sh` drives the P4 leg end-to-end. The P4
+  pthread worker now also emits DPDK-format `r2dp-fwd: stats ... spd_fail` /
+  `drops ... tx_full` / `tables` on SIGUSR1 (`8894456`), mirroring
+  dpd_stats_dump, so the shared `e2e_bench.sh ctr()` parser reads either
+  backend. P4 measurement is taken from the worker's `pkt: in_rx=/out0=`
+  line; DPDK from `stats rx=/esp=`. Both run on root net_tap (memif only
+  materializes in the DPDK harness), same SA/SP, same raw-AF_PACKET inner-tap
+  injector.
+- **Benchmark (i5-6500T 4-core, tap, crypto_openssl0, 64B UDP PROTECT):**
+  P4 ≈ **132K pps** (single pthread worker; the dataplane is the bottleneck —
+  the 400K-frame injector outruns it and ~half drop at the rings);
+  DPDK ≈ **252K pps** (2 lcores; the injector/tap was the bottleneck, it
+  accepts everything). **DPDK ≈ 1.9× faster** on this box. The P4 gap is the
+  single-threaded SWX run + extern head-of-line serialisation, not the SPD
+  itself. `sa_set_hard_bytes/time` remain NULL on P4 (ctl-side lifetimes
+  cover the control path; DPDK enforces in the datapath) — the one remaining
+  parity gap.
