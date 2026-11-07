@@ -288,10 +288,13 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
                     }
                     // else: ipsec extern consumes the frame (decrypt).
                 } else {
-                    /* Non-ESP inbound (IKE/ARP/plaintext): forward clear to
-                     * the inner leg, never drop.  IPv4 -> route; non-IP (ARP)
-                     * -> next_hop id 2 = next_hop_preserve(inner), which keeps
-                     * the original L2. */
+                    /* Non-ESP inbound (IKE/plaintext/UDP/ARP): forward clear,
+                     * never drop.  IPv4 (IKE etc.) routes by destination IP
+                     * (10/8 -> inner in this lab; the routing LPM decides the
+                     * leg, so an IKE dst outside 10/8 egresses outer) -- this
+                     * is "route, don't drop", NOT a forced-inner guarantee.
+                     * non-IP (ARP) -> next_hop id 2 = next_hop_preserve(inner),
+                     * which keeps the original L2. */
                     if (hdrs.ipv4.isValid())
                         routing_table.apply();
                     else

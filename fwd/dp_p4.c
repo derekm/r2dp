@@ -796,7 +796,10 @@ static int p4_start(struct fwd_dp *dp)
 	}
 
 	/* Clear-forward hops for non-IP / control-plane (ARP): preserve the frame
-	 * unchanged (next_hop_preserve) to inner (id 2) or outer (id 3) leg. */
+	 * unchanged (next_hop_preserve) to inner (id 2) or outer (id 3) leg.
+	 * These are load-bearing: an ARP/control-plane frame that misses here
+	 * dies at next_hop_table's drop default, so a failed add must fail the
+	 * start (fail-closed), not just log. */
 	{
 		struct rte_swx_table_entry en;
 		int rid = p4_table_action_id(pr->p, 3, 1);  /* next_hop_preserve */
@@ -804,25 +807,32 @@ static int p4_start(struct fwd_dp *dp)
 		uint8_t ab[4];
 		if (rid < 0) {
 			P4_LOG("next_hop_preserve action id lookup failed");
-		} else {
-			memset(&en, 0, sizeof(en));
-			memset(ab, 0, sizeof(ab));
-			en.action_id = (uint64_t)rid;
-			en.action_data = ab;
-			/* port_id at offset 0, HOST order (LE 1 = {1,0,0,0}). */
-			ab[0] = 0x01;   /* inner leg (port 1) */
-			en.key = k2;
-			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
-				"next_hop_table_0", &en))
-				P4_LOG("next_hop id2 (preserve->inner) add failed");
-			ab[0] = 0x00;   /* outer leg (port 0) */
-			en.key = k3;
-			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
-				"next_hop_table_0", &en))
-				P4_LOG("next_hop id3 (preserve->outer) add failed");
-			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 1);
-			P4_LOG("next_hop preserve hops populated (id2->inner, id3->outer)");
+			return -EIO;
 		}
+		memset(&en, 0, sizeof(en));
+		memset(ab, 0, sizeof(ab));
+		en.action_id = (uint64_t)rid;
+		en.action_data = ab;
+		/* port_id at offset 0, HOST order (LE 1 = {1,0,0,0}). */
+		ab[0] = 0x01;   /* inner leg (port 1) */
+		en.key = k2;
+		if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+			"next_hop_table_0", &en)) {
+			P4_LOG("next_hop id2 (preserve->inner) add failed");
+			return -EIO;
+		}
+		ab[0] = 0x00;   /* outer leg (port 0) */
+		en.key = k3;
+		if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+			"next_hop_table_0", &en)) {
+			P4_LOG("next_hop id3 (preserve->outer) add failed");
+			return -EIO;
+		}
+		if (rte_swx_ctl_pipeline_commit(pr->ctl, 1)) {
+			P4_LOG("preserve-hop commit failed");
+			return -EIO;
+		}
+		P4_LOG("next_hop preserve hops populated (id2->inner, id3->outer)");
 	}
 
 	/* Decrypt egress: a frame the extern returns on IP_OUT is re-parsed and
@@ -839,18 +849,26 @@ static int p4_start(struct fwd_dp *dp)
 		uint8_t rdata[4] = { 1, 0, 0, 0 };          /* next_hop_id 1, meta */
 		if (rid < 0) {
 			P4_LOG("next_hop_id_set action id lookup failed");
-		} else {
-			memset(&en, 0, sizeof(en));
-			en.key = rkey;
-			en.key_mask = rmask;
-			en.action_id = (uint64_t)rid;
-			en.action_data = rdata;
-			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
-				 "routing_table_0", &en))
-				P4_LOG("routing 10/8 add failed");
-			else
-				P4_LOG("routing 10/8 -> next_hop 1 (inner)");
-			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+			return -EIO;
+		}
+		memset(&en, 0, sizeof(en));
+		en.key = rkey;
+		en.key_mask = rmask;
+		en.action_id = (uint64_t)rid;
+		en.action_data = rdata;
+		/* Fail-closed: without the inner route a decrypted frame that is not
+		 * already in 10/8 egresses clear on the outer wire (fail-open).  This
+		 * 10/8 entry is the lab's inner-leg post-decrypt route; its absence
+		 * must not silently start a loop that leaks plaintext outward. */
+		if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+			 "routing_table_0", &en)) {
+			P4_LOG("routing 10/8 add failed");
+			return -EIO;
+		}
+		P4_LOG("routing 10/8 -> next_hop 1 (inner)");
+		if (rte_swx_ctl_pipeline_commit(pr->ctl, 1)) {
+			P4_LOG("routing 10/8 commit failed");
+			return -EIO;
 		}
 	}
 
