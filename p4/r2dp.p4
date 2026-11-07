@@ -7,12 +7,17 @@
 // Intel Corporation, Apache-2.0).
 //
 // It targets the same SPD/SAD contract as the r2dp DPDK backend
-// (fwd/dp_dpdk.c) behind the same r2dp socket.  NOTE this first version's
-// limits (see p4/PLAN.md §8): inbound non-ESP (IKE/ARP) is dropped, every
-// UDP/4500 is parsed as ESP (no NAT-T marker demux), SPD is exact
-// (src,dst,proto) only, and the inbound miss action is `drop`, which is NOT the
-// DPDK backend's DR_NO_SA_IN counter.  These are scope decisions for the first
-// behavior, not full parity.
+// (fwd/dp_dpdk.c) behind the same r2dp socket.
+//
+// Behavior (2026-11-07, §8): inbound/outbound NON-ESP frames (IKE UDP/500,
+// ARP, plaintext) are NOT dropped — they forward clear (IPv4 routes by dst,
+// non-IP ARP is forced inner/outer via next_hop_preserve ids 2/3).  UDP/4500
+// is demuxed on the RFC 3948 zero marker (non-ESP keepalive/IKE forwarded
+// clear; a non-zero SPI is ESP-in-UDP).  SAD/SPD are still exact
+// (src,dst,proto) only, and the inbound miss action is `drop`, which is NOT
+// the DPDK backend's DR_NO_SA_IN counter — those remain as known scoped
+// limits, not full parity.  Do not reintroduce the pre-§8 IKE/ARP drops or
+// the blanket "every UDP/4500 is ESP" parse.
 //
 // The tables below are populated from the r2dp control plane (SA_ADD/SP_ADD ->
 // rte_swx_ctl_* table entries + rte_swx_ipsec_sa_add), mapping fwd_dp_ops:
@@ -279,7 +284,9 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
             if (!ipsec.from_ipsec(status)) {
                 // Pre-decrypt: an inbound ESP frame -> SAD -> ipsec extern.
                 // Non-ESP inbound (IKE/ARP/plaintext) forwards clear, never
-                // dropped: route over the inner leg.
+                // dropped: IPv4 routes by destination IP (the routing LPM,
+                // not 10/8 in general, decides the leg); non-IP (ARP) is
+                // forced inner via next_hop id 2.
                 if (hdrs.ipv4.isValid() && hdrs.esp.isValid()) {
                     inbound_table.apply();
                     if (meta.bypass == 1) {

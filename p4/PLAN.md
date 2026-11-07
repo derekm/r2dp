@@ -185,15 +185,21 @@ and the delegated `deleg_8f37ef0b` review):
 
 - **Compile path verified working**: `p4c-dpdk --arch pna r2dp.p4 -o r2dp.out`
   (`6efe910`).  `p4/r2dp.out` is a genuine SWX spec.
-- **Honest limits of this first spec** (fixes deferred, not bugs in the wiring
-  yet):
-  1. Inbound **IKE and ARP are dropped** (the apply block requires both
-     `ipv4` and `esp` valid, else `drop_packet()`) — one-way vs the DPDK
-     backend's IKE/ARP forwarding. An iked e2e will expose it.
-  2. Every **UDP/4500 is parsed as ESP** — no NAT-T marker/keepalive demux.
+- **Honest limits of this first spec** (at the original `6efe910` state; the
+  ones now closed are marked — see the dated §8 updates at the top of this
+  section before treating any as current):
+  1. **Inbound `IKE` and `ARP` are dropped** — FIXED `b60d0cd`: non-ESP
+     inbound/outbound (IKE UDP/500, ARP, plaintext) now forwards clear
+     (IPv4 routes by dst, ARP forced inner/outer). Do not re-add the drops.
+  2. **Every `UDP/4500` is parsed as ESP** — FIXED `91607d6`: RFC 3948
+     zero-marker demux (keepalive/IKE clear, non-zero SPI is ESP-in-UDP).
+     Do not re-add the blanket parse.
   3. The crypto-failure -> drop branch is **dead** in the artifact: nothing
-     writes `MainControlT_status`, so post-decrypt/encrypt always take the
-     success path. Do not wire a test expecting bad-ICV drops here yet.
+     writes `MainControlT_status`.  RESOLVED `8f0f38a` at the extern —
+     `rte_ipsec_pkt_process` frees a bad-ICV frame before it re-enters the
+     pipeline, so the drop already happens; the P4 status branch is
+     dead-but-harmless.  Do not "fix" the P4 status until a path that
+     returns bad frames exists.
   4. **SPD is exact `(src,dst,proto)` only** — no prefix/ports/proto-ANY, so an
      r2dp OUT policy / IKE bypass SP does not collapse to one entry.  Outbound
      miss -> `spd_bypass` matches DPDK; inbound miss -> `drop` is NOT
