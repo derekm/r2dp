@@ -38,6 +38,22 @@ header ethernet_t {
 }
 
 #define ETHERNET_ETHERTYPE_IPV4 0x0800
+#define ETHERNET_ETHERTYPE_ARP  0x0806
+
+// ARP (RFC 826): two 4-byte addresses + two 2-byte codes, so the whole
+// grouped header is 28 bytes.  Parsed only so an ARP frame is NOT dropped:
+// it is forwarded clear (non-ESP inbound), never offered to the SAD.
+header arp_t {
+    bit<16> htype;
+    bit<16> ptype;
+    bit<8>  hlen;
+    bit<8>  plen;
+    bit<16> oper;
+    bit<48> sha;
+    bit<32> spa;
+    bit<48> tha;
+    bit<32> tpa;
+}
 
 header ipv4_t {
     bit<4>  version;
@@ -58,7 +74,11 @@ header ipv4_t {
 #define IP_PROTOCOL_ESP 0x32
 #define IP_PROTOCOL_UDP 0x11
 
-// ESP-in-UDP (NAT-T): the outer UDP header carries ESP on UDP/4500.
+// ESP-in-UDP (NAT-T, RFC 3948): the outer UDP header carries ESP on UDP/4500.
+// A UDP/4500 datagram that is NOT ESP-in-UDP (an IKE message or a NAT-T
+// keepalive) begins with a 32-bit zero "non-ESP marker" where the ESP SPI
+// would be.  We parse the candidate SPI via lookahead and treat a zero
+// marker as non-ESP (forwarded clear); a non-zero SPI is ESP-in-UDP.
 header udp_t {
     bit<16> src_port;
     bit<16> dst_port;
@@ -67,6 +87,7 @@ header udp_t {
 }
 
 #define UDP_DST_ESP 4500
+#define UDP_DST_IKE 500
 
 header esp_t {
     bit<32> spi;
@@ -75,6 +96,7 @@ header esp_t {
 
 struct headers_t {
     ethernet_t ethernet;
+    arp_t      arp;
     ipv4_t     ipv4;
     udp_t      udp;
     esp_t      esp;
@@ -84,6 +106,8 @@ struct headers_t {
 struct metadata_t {
     bit<32> next_hop_id;
     bit<32> bypass;    /* 1 = forward clear (IKE/plaintext), not IPSEC */
+    bit<32> nat_marker;/* UDP/4500 first-4: 0 = non-ESP, else ESP SPI */
+    bit<32> is_esp;    /* 1 = this frame carries ESP (direct or UDP/4500) */
 }
 
 // ------------------------------------------------------------------ extern
@@ -107,25 +131,47 @@ parser MainParserImpl(packet_in pkt, out headers_t hdrs, inout metadata_t meta,
         pkt.extract(hdrs.ethernet);
         transition select(hdrs.ethernet.ether_type) {
             ETHERNET_ETHERTYPE_IPV4 : parse_ipv4;
+            ETHERNET_ETHERTYPE_ARP  : parse_arp;
             default                 : accept;
         }
+    }
+
+    state parse_arp {
+        pkt.extract(hdrs.arp);
+        transition accept;   /* forwarded clear; never offered to the SAD */
     }
 
     state parse_ipv4 {
         pkt.extract(hdrs.ipv4);
         transition select(hdrs.ipv4.protocol) {
-            IP_PROTOCOL_ESP : parse_esp;
+            IP_PROTOCOL_ESP : set_esp;
             IP_PROTOCOL_UDP : parse_udp;
-            default         : accept;
+            default         : accept;    /* e.g. ICMP / IKE on 500 */
         }
     }
 
     state parse_udp {
         pkt.extract(hdrs.udp);
         transition select(hdrs.udp.dst_port) {
-            UDP_DST_ESP : parse_esp;   /* NAT-T ESP on 4500 */
-            default     : accept;      /* IKE / plaintext UDP */
+            UDP_DST_ESP : nat_demux;   /* ESP-in-UDP vs non-ESP marker */
+            default     : accept;      /* IKE (500) / plaintext UDP */
         }
+    }
+
+    /* RFC 3948 demux: a UDP/4500 datagram with a zero first-32-bits is the
+     * non-ESP marker (NAT-T keepalive / IKE behind NAT), forwarded clear.
+     * A non-zero first-32-bits is the ESP SPI of an ESP-in-UDP packet. */
+    state nat_demux {
+        meta.nat_marker = pkt.lookahead<bit<32>>();
+        transition select(meta.nat_marker) {
+            0       : accept;           /* non-ESP marker -> clear */
+            default : set_esp;          /* ESP SPI -> parse ESP */
+        }
+    }
+
+    state set_esp {
+        meta.is_esp = 1;
+        transition parse_esp;
     }
 
     state parse_esp {
@@ -209,6 +255,12 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
     action next_hop_id_set(bit<32> next_hop_id) {
         meta.next_hop_id = next_hop_id;
     }
+    /* Clear-forward that preserves the incoming frame unchanged (non-IP /
+     * ARP / control-plane traffic): only the target port is set, ethernet
+     * kept intact so ARP keeps ethertype 0x0806. */
+    action next_hop_preserve(bit<32> port_id) {
+        send_to_port((PortId_t)port_id);
+    }
     table routing_table {
         key = { hdrs.ipv4.dst_addr : lpm; }
         actions = { next_hop_id_set; drop; }
@@ -216,7 +268,7 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
     }
     table next_hop_table {
         key = { meta.next_hop_id : exact; }
-        actions = { next_hop_set; drop; }
+        actions = { next_hop_set; next_hop_preserve; drop; }
         const default_action = drop;
     }
 
@@ -226,6 +278,8 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
 
             if (!ipsec.from_ipsec(status)) {
                 // Pre-decrypt: an inbound ESP frame -> SAD -> ipsec extern.
+                // Non-ESP inbound (IKE/ARP/plaintext) forwards clear, never
+                // dropped: route over the inner leg.
                 if (hdrs.ipv4.isValid() && hdrs.esp.isValid()) {
                     inbound_table.apply();
                     if (meta.bypass == 1) {
@@ -234,7 +288,15 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
                     }
                     // else: ipsec extern consumes the frame (decrypt).
                 } else {
-                    drop_packet();
+                    /* Non-ESP inbound (IKE/ARP/plaintext): forward clear to
+                     * the inner leg, never drop.  IPv4 -> route; non-IP (ARP)
+                     * -> next_hop id 2 = next_hop_preserve(inner), which keeps
+                     * the original L2. */
+                    if (hdrs.ipv4.isValid())
+                        routing_table.apply();
+                    else
+                        meta.next_hop_id = 2;
+                    next_hop_table.apply();
                 }
             } else {
                 // Post-decrypt: the plaintext inner exits on the inner net.
@@ -257,7 +319,10 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
                         next_hop_table.apply();
                     }
                 } else {
-                    drop_packet();
+                    /* non-IP (ARP): clear-forward to outer leg, frame
+                     * preserved via next_hop id 3 (next_hop_preserve->outer). */
+                    meta.next_hop_id = 3;
+                    next_hop_table.apply();
                 }
             } else {
                 // Post-encrypt: give the outer frame its L2 + port.
@@ -277,6 +342,7 @@ control MainDeparserImpl(packet_out pkt, in headers_t hdrs, in metadata_t meta,
                          in pna_main_output_metadata_t ostd) {
     apply {
         pkt.emit(hdrs.ethernet);
+        pkt.emit(hdrs.arp);
         pkt.emit(hdrs.ipv4);
         pkt.emit(hdrs.udp);
         pkt.emit(hdrs.esp);
