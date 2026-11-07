@@ -177,11 +177,19 @@ crypto layer even though the P4 `status` branch is unwritten.
   IPSEC_SUCCESS` branches are therefore dead-but-harmless: the drop already
   happened in the extern.  Do not "fix" the P4 status until/unless a real
   failure path that returns bad frames exists.
-- **Limit 4 (SPD prefix/ANY) still open** — the external SPD classifier in
-  dp_dpdk.c is rte_acl (native prefix/priority); the P4/SWX `outbound_table`
-  is a single exact `(src,dst,proto)` table.  Making it prefix-capable
-  means an LPM/ternary table + per-prefix priorities in the runtime bind and
-  is the highest-blast-radius change; see list below.
+- **Limit 4 (SPD prefix/ANY) still open — and not implementable via a match-kind
+  switch** — the external SPD classifier in dp_dpdk.c is rte_acl (native
+  prefix/priority); the P4/SWX `outbound_table` is a single exact
+  `(src,dst,proto)` table.  Making it prefix-capable by converting it to
+  `ternary`/`lpm` does NOT work on this backend: p4c-dpdk lowers `ternary` to
+  a SWX `wildcard` (ACL) table whose ops have no runtime `.add`/`.del`
+  (`rte_swx_table_wm.c`) — its ACL is built once at startup and can never be
+  reprogrammed, so runtime SPD policies silently miss; and only ONE `lpm`
+  field is allowed per table, but SPD needs prefixes on both src and dst plus
+  proto.  Exact and single-LPM tables DO runtime-update; wildcard does not.
+  So runtime SPD prefix/ANY stays a backend limit on the P4/SWX path (a real
+  hardware ternary/TCAM target would express it as runtime-updatable masked
+  rules with priority); see list below.
 
 The plan above was filed before the P4 toolchain existed.  What actually
 happened, per the review of commits `5b42982`..`6efe910` (`p4-dpdk-swx` skill
@@ -223,7 +231,7 @@ and the delegated `deleg_8f37ef0b` review):
   and TXes the output ring, and a real IPv4/UDP frame crosses
   inner→pipeline→outer over **root net_tap** (net_memif vdevs do not
   materialize on `.165` — see below; net_tap needs root, else TUNSETIFF
-  TUNSETIFF EPERM and control-only fallback).  A full framed ESP forward
+  EPERM and control-only fallback).  A full framed ESP forward
   (crypto + routing through the PNA tables) was later proven end-to-end
   (`f50470f` round-trip; `3e1f8bb` decrypt/HBO/routing) on root net_tap.
   Still open: only Limit 4 (SPD prefix/ANY expressiveness) — limits 1-3 are
