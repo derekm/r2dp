@@ -177,19 +177,28 @@ crypto layer even though the P4 `status` branch is unwritten.
   IPSEC_SUCCESS` branches are therefore dead-but-harmless: the drop already
   happened in the extern.  Do not "fix" the P4 status until/unless a real
   failure path that returns bad frames exists.
-- **Limit 4 (SPD prefix/ANY) still open — and not implementable via a match-kind
-  switch** — the external SPD classifier in dp_dpdk.c is rte_acl (native
-  prefix/priority); the P4/SWX `outbound_table` is a single exact
-  `(src,dst,proto)` table.  Making it prefix-capable by converting it to
-  `ternary`/`lpm` does NOT work on this backend: p4c-dpdk lowers `ternary` to
-  a SWX `wildcard` (ACL) table whose ops have no runtime `.add`/`.del`
-  (`rte_swx_table_wm.c`) — its ACL is built once at startup and can never be
-  reprogrammed, so runtime SPD policies silently miss; and only ONE `lpm`
-  field is allowed per table, but SPD needs prefixes on both src and dst plus
-  proto.  Exact and single-LPM tables DO runtime-update; wildcard does not.
-  So runtime SPD prefix/ANY stays a backend limit on the P4/SWX path (a real
-  hardware ternary/TCAM target would express it as runtime-updatable masked
-  rules with priority); see list below.
+- **Limit 4 (SPD prefix/ANY) — achievable on the P4/SWX path; the open item is
+  the ACL key byte-order, not the match kind.** The external SPD classifier in
+  dp_dpdk.c is rte_acl (native prefix/priority); the P4/SWX `outbound_table`
+  is a single exact `(src,dst,proto)` table.  To make it prefix-capable:
+  p4c-dpdk lowers `ternary` to a SWX `wildcard` (ACL) table.  Earlier notes
+  here said wildcard tables "have no runtime add" and are "built once at
+  startup" — that is WRONG.  `rte_swx_table_wildcard_match_ops` has .add/.del
+  NULL only because it has no *incremental* update; SWX updates such tables
+  NON-INCREMENTALLY with a full rebuild on commit (`rte_swx_ctl.c`
+  `table_rollfwd0` duplicates entries+pending_add+pending_modify1 and calls
+  `table->ops.create` — DPDK "support non-incremental table updates",
+  Dumitrescu, 21.05+, in v24.11).  `p4-dpdk-target`'s pipe_mgr drives exactly
+  this to serve P4Runtime ternary/TCAM entry add on SWX.  Caveats that remain:
+  (a) wm.c `acl_table_cfg_get` splits the ACL key as [1-byte][4-byte][4-byte]
+  and reads header fields big-endian, so the control-plane key/mask must match
+  that layout — verify with on-box ob hit + crypto enq, not a compile; (b) only
+  one `lpm`/`ternary`-style match can express a prefix, and a full wildcard
+  (proto-ANY) is a masked-out proto byte; a multi-field prefix needs the field
+  order/layout right; (c) full-rebuild update cost is O(table), a perf note
+  not a wall.  A real hardware TCAM target expresses the same SPD as
+  runtime-updatable masked rules with priority — the P4 semantics map, the SWX
+  byte-order is the software-only sharp edge; see list below.
 
 The plan above was filed before the P4 toolchain existed.  What actually
 happened, per the review of commits `5b42982`..`6efe910` (`p4-dpdk-swx` skill
