@@ -1195,7 +1195,10 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 
 /* ---- SPD policy mirror ---- */
 
-/* Match a policy against the mirror by selector (src,dst,proto,dir). */
+/* Match a policy against the mirror by selector (dir, ul_proto, pref_src,
+ * pref_dst, family, ports, addr) -- the full ctl identity (sel_eq_d).  The
+ * P4 ACL row keys only (proto, masked src, masked dst); the extra fields keep
+ * the mirror 1:1 with ctl so a delete finds exactly the policy it installed. */
 static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 {
 	int i;
