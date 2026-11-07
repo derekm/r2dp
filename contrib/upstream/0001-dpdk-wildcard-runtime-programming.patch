@@ -1,0 +1,113 @@
+From: Terre d'Hermes <derek.p.moore@gmail.com>
+Subject: [PATCH] pipeline/table: document runtime programming of wildcard (ACL) tables
+
+This is a documentation + example patch (no runtime change). It records
+behavior that exists since the "support non-incremental table updates"
+change (21.05, Dumitrescu) but is undocumented outside the original patch
+thread: a SWX *wildcard match* (ACL/ternary) table -- whose ops have
+`.add == NULL` / `.del == NULL` -- is still fully runtime-programmable via
+the control layer, which on commit rebuilds the whole table (full ACL
+`rte_acl_build`) through `table_rollfwd0`'s non-incremental branch
+(`rte_swx_ctl.c`).
+
+Why it matters: p4c-dpdk lowers P4 `ternary` to the SWX wildcard match
+type, so anyone compiling a P4 ternary/TCAM-style table (e.g. an IPsec SPD
+with prefix / ANY selectors and per-rule priority) must know that
+entry-add at runtime works -- and exactly what the ACL key image looks
+like. This patch writes both down so the next project does not have to
+reverse-engineer `rte_swx_table_wm.c`.
+
+The two gotchas (both observed by building a real SPD and matching on the
+dataplane):
+
+1. The wildcard table's ACL key is NOT the packed concatenation of the
+   match fields. `table_params_get` builds `key_mask0` from the match
+   fields' real offsets (for header fields, their byte offset within the
+   packet), so the key image preserves the header byte GAPS between the
+   fields. Example: an outbound SPD keyed on (ipv4.protocol, ipv4.src_addr,
+   ipv4.dst_addr) has protocol at IPv4 byte 9, src at byte 12, dst at
+   byte 16, so relative to the first field the key is
+   [protocol@0][2-byte gap@1-2][src@3-6][dst@7-10], key_size = 11 -- NOT
+   a packed 9. Writing a contiguous [proto][src][dst] image makes every
+   lookup miss even though the values are correct. Consult the table's
+   `key_mask0` / match-field offsets rather than assuming contiguity.
+
+2. Mask and value bytes are big-endian (MSB first): `acl_table_rule_field32`
+   reads field[0] as the most significant byte, and the priority is
+   `rte_acl_rule->data.priority = RTE_ACL_MAX_PRIORITY - entry->key_priority`
+   with rte_acl returning the HIGHEST-priority match. So to make a
+   /24-prefixed PROTECT beat a /0,/0 ANY that also matches, the /24 rule
+   must carry the LOWER `key_priority` value.
+
+A working reference (build + on-box proof using the DPDK SWX ipsec extern)
+is in the second hunk of this patch as a documented example; the selectors,
+masks and priorities shown match a real SPD whose exact-equiv /32,/32
+protect drove `crypto enq=deq>0` and whose /24 ANY bypass matched the
+remaining traffic.
+
+Signed-off-by: Terre d'Hermes <derek.p.moore@gmail.com>
+---
+ doc/guides/prog_guide/pipeline.rst                        | 28 ++++++
+ examples/pipeline/README.rst                              | 24 +++++
+ 2 files changed, 52 insertions(+)
+
+diff --git a/doc/guides/prog_guide/pipeline.rst b/doc/guides/prog_guide/pipeline.rst
+index 0000000..ccccccc 100644
+--- a/doc/guides/prog_guide/pipeline.rst
++++ b/doc/guides/prog_guide/pipeline.rst
+@@ -0,0 +1,28 @@
++Programming wildcard (ACL/ternary) tables at runtime
++----------------------------------------------------
++
++A wildcard-match table (``RTE_SWX_TABLE_MATCH_WILDCARD``, the
++``rte_swx_table_wildcard_match_ops`` implementation) has ``.add == NULL``
++and ``.del == NULL``: there is no *incremental* entry interface. It is
++still fully runtime-programmable. ``rte_swx_ctl_pipeline_table_entry_add``
++buffers the entry in ``pending_add``, and the next
++``rte_swx_ctl_pipeline_commit`` rebuilds the entire table from the merged
++entry list via ``table->ops.create`` (the non-incremental branch of
++``table_rollfwd0`` in ``lib/pipeline/rte_swx_ctl.c``). Each commit is a
++full ``rte_acl_build`` of O(n) rules -- fine for a control plane, not a
++per-packet operation.
++
++The ACL key image is *not* the packed concatenation of the match fields.
++``table_params_get`` builds ``key_mask0`` from each field's offset (for
++header fields, the byte offset in the packet), so the image preserves the
++header byte gaps between fields. Build the key and mask from the field
++offsets (prefer reading them back with ``rte_swx_ctl_table_match_field_info_get``
++rather than assuming contiguity). Mask and value bytes are big-endian
++(MSB first). ``rte_acl`` returns the highest-priority match, and
++``rte_swx_table_wm.c`` sets the priority to
++``RTE_ACL_MAX_PRIORITY - entry->key_priority``, so the most-specific rule
++(longest prefix, concrete protocol) must carry the LOWEST ``key_priority``.
++
+diff --git a/examples/pipeline/README.rst b/examples/pipeline/README.rst
+index 0000000..ddddddd 100644
+--- a/examples/pipeline/README.rst
++++ b/examples/pipeline/README.rst
+@@ -0,0 +1,24 @@
++Runtime-programmed wildcard (ternary) table example
++---------------------------------------------------
++
++The IPsec SPD is the canonical use: a control plane installs PROTECT /
++BYPASS / DISCARD rules whose selectors are prefixes (``10.0.0.0/24``) and
++protocol ANY (``0xff``), and expects the most-specific rule to win per
++packet. On the SWX target this is a wildcard table over
++``(ipv4.protocol, ipv4.src_addr, ipv4.dst_addr)``.
++
++Key image (relative to the first match field, protocol at IPv4 byte 9):
++
++::
++
++    [protocol @ 0] [2-byte gap @1-2] [src_addr @3-6] [dst_addr @7-10]
++    key_size = 11, key_offset = 9
++
++The two-gap bytes are the IPv4 checksum; a packed ``[proto][src][dst]`` 9-byte
++image misses every lookup. Masks are MSB-first (``/24`` = ``ff ff ff 00``,
++protocol ANY = mask[0] = 0x00). To make a ``/32,/32 udp`` PROTECT beat a
++``/24 ANY`` BYPASS that also matches, give the /32 rule the lower
++``key_priority``.
++
++Verified on-box against the SWX ipsec extern: the /32,/32 PROTECT drove
++``crypto enq=deq>0`` and the /24 ANY BYPASS matched all remaining traffic
++without offering it to the SAD (``ob_hit`` = all frames, no miss).

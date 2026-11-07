@@ -1,0 +1,144 @@
+From: Terre d'Hermes <derek.p.moore@gmail.com>
+Subject: [PATCH] backends/dpdk: add SPD example with prefix/ANY selectors and note wildcard key layout
+
+The bundled IPsec sample (examples/ipsec.p4) is exact-only and is a crypto
+demo, not a parity reference for a real SPD. Real IPsec control planes
+(spmd/racoon) install SPD rules with prefix selectors (10.0.0.0/24),
+protocol ANY, and require per-packet precedence so the most-specific rule
+wins. This patch adds a focused example showing how to express that in P4
+for the p4c-dpdk backend, keyed on real IPv4 header fields (protocol,
+src_addr, dst_addr), plus a README note about the SWX wildcard key layout
+so a runtime that writes table entries does not guess.
+
+Behavioural notes (verified against the DPDK SWX target and its ipsec
+extern in an outbound SPD):
+- P4 `ternary` lowers to the SWX wildcard (ACL) match type. The SWX table IS
+  runtime-programmable: `rte_swx_ctl_pipeline_table_entry_add` + commit
+  rebuilds the ACL (non-incremental update). `.add/.del == NULL` only means
+  there is no *incremental* interface.
+- The ACL key image is NOT the packed concatenation of match fields: it
+  preserves header byte gaps. Keyed on real IPv4 fields, protocol is at IPv4
+  byte 9, src at byte 12, dst at byte 16, so relative to the first field the
+  image is [protocol@0][2-byte gap@1-2][src@3-6][dst@7-10], key_size 11, not
+  a packed 9. A contiguous [proto][src][dst] image misses every lookup.
+  (A custom packed header would hide this: the gap only appears when keying
+  real header fields, which is what a real SPD does.)
+- Masks and values are MSB-first (big-endian). protocol ANY = mask[0]=0x00;
+  /N prefix = the top N bits of the field set in the mask.
+- rte_acl returns the highest-priority match and the wildcard table sets
+  rule priority = RTE_ACL_MAX_PRIORITY - key_priority, so the most-specific
+  rule carries the LOWEST key_priority.
+
+Signed-off-by: Terre d'Hermes <derek.p.moore@gmail.com>
+---
+ backends/dpdk/examples/spd_prefix.p4 | 104 ++++++++++++++++++++++++++++
+ backends/dpdk/README.md              |  14 +++++
+ 2 files changed, 118 insertions(+)
+
+diff --git a/backends/dpdk/examples/spd_prefix.p4 b/backends/dpdk/examples/spd_prefix.p4
+new file mode 100644
+index 0000000..eeeeeee 0
+--- /dev/null
++++ b/backends/dpdk/examples/spd_prefix.p4
+@@ -0,0 +1,104 @@
++/* SPDX-FileCopyrightText: 2026 Terre d'Hermes
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * An outbound SPD with PREFIX and ANY selectors, for the p4c-dpdk (PNA)
++ * backend. Demonstrates the wildcard (ternary) table shape a real IPsec
++ * control plane needs: /N prefixes on src/dst and protocol ANY, with
++ * per-packet precedence so the most-specific rule wins.
++ *
++ * Runtime contract (SWX target): the compiled table is a WILDCARD/ACL table
++ * and is fully runtime-programmable via entry_add + commit (non-incremental
++ * rebuild). The key image is gap-aware and MSB-first -- read the note in
++ * backends/dpdk/README.md before writing entries.
++ */
++#include <core.p4>
++#include <dpdk/pna.p4>
++
++header ethernet_t { bit<48> dst_addr; bit<48> src_addr; bit<16> ether_type; }
++
++header ipv4_t {
++    bit<4>  version;
++    bit<4>  ihl;
++    bit<6>  dscp;
++    bit<2>  ecn;
++    bit<16> total_length;
++    bit<16> identification;
++    bit<3>  flags;
++    bit<13> fragment_offset;
++    bit<8>  ttl;
++    bit<8>  protocol;        /* IPv4 byte 9 */
++    bit<16> header_checksum; /* IPv4 bytes 10-11 : the ACL key gap */
++    bit<32> src_addr;        /* IPv4 byte 12 */
++    bit<32> dst_addr;        /* IPv4 byte 16 */
++}
++
++struct headers_t { ethernet_t eth; ipv4_t ipv4; }
++struct metadata_t { bit<32> nh; }
++
++parser spd_parse(packet_in pkt, out headers_t hdr, inout metadata_t meta,
++                 in pna_main_parser_input_metadata_t istd) {
++    state start {
++        pkt.extract(hdr.eth);
++        pkt.extract(hdr.ipv4);
++        transition accept;
++    }
++}
++
++control spd_pre(in headers_t hdr, inout metadata_t meta,
++                in pna_pre_input_metadata_t istd,
++                inout pna_pre_output_metadata_t ostd) { apply {} }
++
++action spd_protect(bit<32> sa_index) { meta.nh = sa_index; }
++action spd_bypass()                   { meta.nh = 0; }
++action spd_discard()                  { meta.nh = 0xffffffff; }
++
++control spd_main(inout headers_t hdr, inout metadata_t meta,
++                 in pna_main_input_metadata_t istd,
++                 inout pna_main_output_metadata_t ostd) {
++    table outbound_spd {
++        /* protocol declared FIRST: the SWX ACL reads fields relative to the
++         * first field, so the 1-byte protocol must begin the key image. */
++        key = {
++            hdr.ipv4.protocol : ternary;
++            hdr.ipv4.src_addr : ternary;
++            hdr.ipv4.dst_addr : ternary;
++        }
++        actions = { spd_protect; spd_bypass; spd_discard; }
++        const default_action = spd_bypass;
++    }
++    apply { outbound_spd.apply(); }
++}
++
++control spd_dep(packet_out pkt, in headers_t hdr, in metadata_t meta,
++                in pna_main_output_metadata_t ostd) {
++    apply {
++        pkt.emit(hdr.eth);
++        pkt.emit(hdr.ipv4);
++    }
++}
++
++PNA_NIC(spd_parse(), spd_pre(), spd_main(), spd_dep()) main;
+diff --git a/backends/dpdk/README.md b/backends/dpdk/README.md
+index 0000000..fffffff 100644
+--- a/backends/dpdk/README.md
++++ b/backends/dpdk/README.md
+@@ -0,0 +1,14 @@
++### Wildcard (ternary) tables and their runtime key layout
++
++P4 `ternary` on the DPDK backend lowers to the SWX wildcard/ACL match type.
++The SWX table is runtime-programmable (entry_add + commit rebuilds the ACL
++non-incrementally); `.add/.del == NULL` only means there is no incremental
++interface. Two layout facts matter for any control plane that writes
++entries:
++
++- The ACL key image is not the packed concatenation of match fields: it
++  preserves header byte gaps. For (ipv4.protocol, ipv4.src_addr,
++  ipv4.dst_addr) the image is [protocol@0][gap@1-2][src@3-6][dst@7-10]
++  (key_size 11). Derive the key and mask from real field offsets.
++- Masks and values are MSB-first (big-endian); rte_acl returns the
++  highest-priority match and the wildcard table sets rule priority =
++  `RTE_ACL_MAX_PRIORITY - key_priority`, so the most-specific rule carries
++  the lowest `key_priority`.
