@@ -177,28 +177,34 @@ crypto layer even though the P4 `status` branch is unwritten.
   IPSEC_SUCCESS` branches are therefore dead-but-harmless: the drop already
   happened in the extern.  Do not "fix" the P4 status until/unless a real
   failure path that returns bad frames exists.
-- **Limit 4 (SPD prefix/ANY) — achievable on the P4/SWX path; the open item is
-  the ACL key byte-order, not the match kind.** The external SPD classifier in
-  dp_dpdk.c is rte_acl (native prefix/priority); the P4/SWX `outbound_table`
-  is a single exact `(src,dst,proto)` table.  To make it prefix-capable:
-  p4c-dpdk lowers `ternary` to a SWX `wildcard` (ACL) table.  Earlier notes
-  here said wildcard tables "have no runtime add" and are "built once at
-  startup" — that is WRONG.  `rte_swx_table_wildcard_match_ops` has .add/.del
-  NULL only because it has no *incremental* update; SWX updates such tables
+- **Limit 4 (SPD prefix/ANY) — DONE on the P4/SWX path (proven on `.165`).**
+  `outbound_table` is now a WILDCARD (ternary) table on (protocol, src, dst);
+  the runtime (`p4_spd_bind`/`p4_spd_del`) programs key + key_mask +
+  key_priority at runtime.  How it works: p4c-dpdk lowers `ternary` to the SWX
+  `wildcard` (ACL) match type; `rte_swx_table_wildcard_match_ops` has .add/.del
+  NULL only because it has no *incremental* update — SWX updates such tables
   NON-INCREMENTALLY with a full rebuild on commit (`rte_swx_ctl.c`
   `table_rollfwd0` duplicates entries+pending_add+pending_modify1 and calls
-  `table->ops.create` — DPDK "support non-incremental table updates",
-  Dumitrescu, 21.05+, in v24.11).  `p4-dpdk-target`'s pipe_mgr drives exactly
-  this to serve P4Runtime ternary/TCAM entry add on SWX.  Caveats that remain:
-  (a) wm.c `acl_table_cfg_get` splits the ACL key as [1-byte][4-byte][4-byte]
-  and reads header fields big-endian, so the control-plane key/mask must match
-  that layout — verify with on-box ob hit + crypto enq, not a compile; (b) only
-  one `lpm`/`ternary`-style match can express a prefix, and a full wildcard
-  (proto-ANY) is a masked-out proto byte; a multi-field prefix needs the field
-  order/layout right; (c) full-rebuild update cost is O(table), a perf note
-  not a wall.  A real hardware TCAM target expresses the same SPD as
-  runtime-updatable masked rules with priority — the P4 semantics map, the SWX
-  byte-order is the software-only sharp edge; see list below.
+  `table->ops.create`; DPDK "support non-incremental table updates", 21.05+,
+  in v24.11).  `p4-dpdk-target`'s pipe_mgr drives the same path for
+  P4Runtime ternary/TCAM entry add.  ACL key layout (the hard part, proven
+  on-box): the ACL does NOT pack the key contiguously — `table_params_get`
+  builds `key_mask0` from real IPv4 header bit offsets, so the key image is
+  `[protocol@0][src@3][dst@7]` in NETWORK order (the 2 bytes 1-2 are the
+  checksum gap), key_size=11, NOT a packed 9; masks are MSB-first
+  (`/32`=ff ff ff ff, `/24`=ff ff ff 00, proto-ANY = mask[0]=0x00);
+  `rte_acl` picks the HIGHEST priority match, so `p4_spd_prio` returns
+  LOWEST for the most specific rule (0 for /32,/32 concrete-proto, growing as
+  the selector broadens).  Full-rebuild update cost is O(table), a perf note
+  not a wall.  Proof (all on `.165`, tap path): an exact-equiv /32,/32 udp
+  PROTECT drives `ob_hit` + `crypto enq=32 deq=32` + ESP egress; a /32,/32 udp
+  PROTECT alongside a /24 ANY BYPASS gives `ob_hit=120 ob_miss=0`,
+  `a6=60` (specific PROTECT) and `a7=60` (broad ANY BYPASS) — the specific
+  rule wins for its packets, the prefix/ANY rule matches everything else
+  (including non-udp) without offering it to the SAD.  A real hardware TCAM
+  target expresses the identical SPD as runtime rules with priority; the P4
+  semantics map, the SWX byte-order/gap layout is the software-only sharp
+  edge, now documented in `fwd/dp_p4.c`; see list below.
 
 The plan above was filed before the P4 toolchain existed.  What actually
 happened, per the review of commits `5b42982`..`6efe910` (`p4-dpdk-swx` skill
@@ -243,8 +249,8 @@ and the delegated `deleg_8f37ef0b` review):
   EPERM and control-only fallback).  A full framed ESP forward
   (crypto + routing through the PNA tables) was later proven end-to-end
   (`f50470f` round-trip; `3e1f8bb` decrypt/HBO/routing) on root net_tap.
-  Still open: only Limit 4 (SPD prefix/ANY expressiveness) — limits 1-3 are
-  closed (see the dated §8 updates at the top of this section).
+  All §8 limits 1-4 are now closed (Limit 4 SPD prefix/ANY proven 2026-11-07) —
+  see the dated §8 updates at the top of this section.
 - **SPD binding contract (rounds 4+5):** the control plane may install an
   OUT PROTECT policy with no egress SA yet (spmd loads SPD at startup, then
   GETSPI/SA_ADD) — so `p4_sp_add` **accepts** and never refuses.  It keeps a
@@ -261,17 +267,15 @@ and the delegated `deleg_8f37ef0b` review):
   `r2dp-p4-bind-probe`), which reads the forwarder log: SA-first → direct bind
   with NO discard; SP-first → `OUT PROTECT unbound -> DISCARD` then a rebind to
   `ipsec_protect` — not inferred from `r2dpctl dump`.
-  **Honest scope of the fail-closed claim:** it holds only for an **exact**
-  `(src,dst,proto)` table hit (see §8 limit 4 — SPD is exact only, no
-  prefix/ports/ANY).  A policy shaped `R2DP_PROTO_ANY`/`/24`, as spmd and the
-  bind probe install, does NOT collapse to one exact entry: the real packet
-  holds a concrete proto/address that misses the entry and falls to the
-  `spd_bypass` default.  DPDK honors ANY/prefix (`dpdk_spd.c:250,307`); this
-  backend does not yet (it is exact-only today).  So the unbound-PROTECT drop
-  is exact-hit-only, not `DR_NO_SA_OUT` parity until SPD expressiveness lands
-  — which IS achievable (SWX wildcard tables update non-incrementally, see §8
-  limit 4) but needs the ACL key byte-order work; not imminent.  PLAN is
-  explicit about this rather than overclaiming.
+  **Honest scope of the fail-closed claim:** it holds for any SPD table hit
+  (exact or prefix/ANY, see §8 limit 4 — SPD is now WILDCARD/ternary, proven
+  2026-11-07).  A `R2DP_PROTO_ANY`/`/24` policy as spmd and the bind probe
+  install now collapses to ONE wildcard entry (masked src/dst, proto byte
+  masked off) and matches by prefix + priority.  DPDK honors ANY/prefix
+  (`dpdk_spd.c:250,307`); this backend now does too.  The fail-closed
+  unbound-PROTECT -> spd_discard still applies on a hit; a packet that matches
+  NO rule falls to the `spd_bypass` default (mirroring DPDK's miss behavior).
+  PLAN is explicit about this rather than overclaiming.
 - **Framed forward proven (round-6):** a real IPv4/UDP frame injected on the
   inner tap (`r2pi`, outbound leg) is processed by the SWX pipeline and
   egresses the outer tap (`r2po`) — captured by tcpdump (`10.0.0.1.1024 >
@@ -302,8 +306,8 @@ and the delegated `deleg_8f37ef0b` review):
   inner leg.  The decrypt-leg byte-order fixes (metadata tables match HOST
   order, not network; only header-field action data stays NBO) and inner-
   subnet routing are documented in §8 above.  So both directions of framed
-  ESP crypto are proven; the only remaining limit is SPD prefix/ANY
-  expressiveness (the IKE/ARP/NAT-T limits 1-2 are closed).  ctr() in
+  ESP crypto are proven; Limit 4 (SPD prefix/ANY) completed 2026-11-07 —
+  see §8.  ctr() in
   bench/e2e_bench.sh still parses the DPDK `stats` format the P4 worker
   does not emit — the worker's own `pkt:` line is the P4-leg counter
   equivalent.
