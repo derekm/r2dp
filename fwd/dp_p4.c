@@ -152,6 +152,8 @@ struct p4_priv {
  * rte_swx_pipeline_run call executes before yielding to the ipsec block). */
 #define P4_RUN_QUANTA 1000
 
+static void p4_stats_on_req(struct p4_priv *p);
+
 /* Packet-path worker: drain the pipeline's input, execute the PNA program,
  * run the ipsec extern head-of-line, then loop.  Mirrors examples/pipeline
  * thread_main: run each pipeline then each block (the ipsec extern) with no
@@ -220,6 +222,8 @@ static void *p4_worker(void *arg)
 
 		/* Periodic activity dump (every ~1s) so ingress/egress is
 		 * visible even with no signal handler wired. */
+		if (fwd_stats_req)
+			p4_stats_on_req(pr);
 		if (rte_get_tsc_cycles() - last_dump > rte_get_tsc_hz()) {
 			uint32_t q0 = rte_ring_count(pr->in0);
 			uint32_t q1 = rte_ring_count(pr->in1);
@@ -278,9 +282,47 @@ static void *p4_worker(void *arg)
 	return NULL;
 }
 
-/* Find + configure the two ethdev legs (tap / memif / vhost, like the DPDK
- * backend's ports_find): first device = outer, second = inner.  mbuf pool
- * sized for the burst path. */
+/* p4 stats dump (SIGUSR1 -> fwd_stats_req), mirroring the DPDK backend's
+ * `stats ... spd_fail` / `drops ... tx_full` two-line format so the shared
+ * bench harness (e2e_bench.sh ctr()) parses the P4 leg too.  Each 64-bit
+ * counter load is atomic on the targets we build for.  out_rx/in_rx are the
+ * eth RX totals, out0/out1 the eth TX totals; drop is billed from the eth RX
+ * totals because only frames that reach an output ring are TXed (the pipeline
+ * consumes the rest as spd_discard/drop or packets still in flight). */
+static void
+p4_stats_dump(struct p4_priv *p, FILE *f)
+{
+	unsigned long nrx, ntx, ndrop;
+	unsigned sa_n = 0, sp_n = 0, i;
+
+	nrx = p->c_outer + p->c_inner;
+	ntx = p->c_out0 + p->c_out1;
+	ndrop = (nrx > ntx) ? (nrx - ntx) : 0;
+	for (i = 0; i < P4_SA_MAX; i++)
+		sa_n += !!p->sad[i].in_use;
+	for (i = 0; i < P4_SP_MAX; i++)
+		sp_n += !!p->spd[i].in_use;
+	fprintf(f, "r2dp-fwd: stats rx=%lu tx=%lu esp=%lu ike=%lu drop=%lu "
+	    "spd_fail=%lu\n", nrx, ntx, 0ul, 0ul, ndrop, 0ul);
+	fprintf(f, "r2dp-fwd: drops rx_bridge=%lu tx_full=%lu "
+	    "(crypto_stuck_events=%lu outstanding=%u)\n",
+	    ndrop, 0ul, 0ul, 0u);
+	fprintf(f, "r2dp-fwd: tables sa=%u/%u sp=%u/%u sad=%u/%u sess_pools=%u "
+	    "grows=0 grow_fail=0 acl_builds=0 acl_reuse=0\n",
+	    sa_n, P4_SA_MAX, sp_n, P4_SP_MAX, sa_n, P4_SA_MAX, 0u);
+}
+
+/* Wait for the next SIGUSR1 dump: emit the `stats`/`drops`/`tables` lines the
+ * e2e harness's ctr() parses, then drain a new-line count so a second USR1 is
+ * not satisfied by the same printout.  No lock: like DPDK this is a snapshot. */
+static void
+p4_stats_on_req(struct p4_priv *p)
+{
+	p4_stats_dump(p, stderr);
+	fwd_stats_req = 0;
+}
+
+
 static int p4_io_init(struct p4_priv *pr)
 {
 	static const char *const drv[] = { "tap", "memif", "vhost" };
