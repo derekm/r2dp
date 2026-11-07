@@ -14,10 +14,11 @@
 // non-IP ARP is forced inner/outer via next_hop_preserve ids 2/3).  UDP/4500
 // is demuxed on the RFC 3948 zero marker (non-ESP keepalive/IKE forwarded
 // clear; a non-zero SPI is ESP-in-UDP).  SAD is exact (ipv4.dst_addr, spi);
-// SPD is exact (src_addr, dst_addr, protocol) — SAD's exact key is correct;
-// the SPD exact-only (no prefix/ANY/ports) and the inbound miss action `drop`,
-// which is NOT the DPDK backend's DR_NO_SA_IN counter, are the known scoped
-// limits, not full parity.  Do not reintroduce the pre-§8 IKE/ARP drops or
+// SPD is a WILDCARD (ternary) table on (src_addr, dst_addr, protocol) with
+// prefix/ANY selectors + per-rule priority — SAD's exact key is correct;
+// the remaining scoped limits are the inbound miss action `drop` (NOT the
+// DPDK backend's DR_NO_SA_IN counter) and no selector ports.  Do not
+// reintroduce the pre-§8 IKE/ARP drops or
 // the blanket "every UDP/4500 is ESP" parse.
 //
 // The tables below are populated from the r2dp control plane (SA_ADD/SP_ADD ->
@@ -239,14 +240,15 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
     }
     table outbound_table {
         /* WILDCARD (ternary) SPD.  p4c-dpdk lowers `ternary` to the SWX
-         * `wildcard`/ACL match type.  The ACL image the runtime must build is
-         * [protocol(1)][src(4)][dst(4)] in NETWORK byte order — same layout as
-         * the routing 10/8 LPM entry ({0a,0,0,0}/ff,0,0,0) which is proven to
-         * match on this same wildcard path.  Full-mask entries (all-ones
-         * key_mask, priority 0) are equivalent to the previous exact table;
-         * prefix/ANY entries mask bits off and set priority src_plen+dst_plen
-         * so the most-specific rule wins.  key field order must match the ACL
-         * [1][4][4] split, hence protocol FIRST. */
+         * `wildcard`/ACL match type.  The control plane (p4_spd_key_image in
+         * fwd/dp_p4.c) installs the ACL key image GAP-AWARE, NOT packed:
+         * [protocol@0][checksum-gap@1-2][src@3-6][dst@7-10] (key_size 11) in
+         * NETWORK order, because SWX builds key_mask0 from real IPv4 header
+         * byte offsets.  `rte_acl` returns the highest-priority match and the
+         * wildcard table sets priority = RTE_ACL_MAX_PRIORITY - key_priority,
+         * so p4_spd_prio gives the LOWEST value to the most-specific rule
+         * (0 for /32,/32 concrete-proto).  Full-mask entries equal the old
+         * exact table; prefix/ANY mask bits off via key_mask. */
         key = {
             hdrs.ipv4.protocol : ternary;
             hdrs.ipv4.src_addr : ternary;

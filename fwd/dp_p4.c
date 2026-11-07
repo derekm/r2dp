@@ -1164,6 +1164,8 @@ static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 			continue;
 		if (q->dir != sp->dir || q->ul_proto != sp->ul_proto)
 			continue;
+		if (q->pref_src != sp->pref_src || q->pref_dst != sp->pref_dst)
+			continue;
 		if (q->sel_src.family != sp->sel_src.family ||
 		    q->sel_dst.family != sp->sel_dst.family)
 			continue;
@@ -1199,6 +1201,31 @@ static uint32_t p4_spd_prio(const struct r2dp_sp *sp)
  * DISCARD -- never bypass: an OUT PROTECT with no SA must not forward in
  * the clear (dpdk_esp.c DR_NO_SA_OUT).  A later SA_ADD rebinds to
  * ipsec_protect.  Returns 0/errno. */
+
+/* Build the SPD table key image for a policy, used by BOTH bind and del so a
+ * deleted row is by construction the one bind installed (a mismatched image
+ * makes table_entry_delete silently no-op and orphan the ACL row).
+ * outbound_table_0 is a WILDCARD (ternary, SWX ACL) table keyed on the IPv4
+ * header fields (protocol, src_addr, dst_addr).  The ACL key image is
+ * GAP-AWARE, not packed: table_params_get builds key_mask0 from real header
+ * bit-offsets, so relative to the first field (protocol @ IPv4 byte 9):
+ * protocol@0, checksum-gap@1-2, src_addr@3-6, dst_addr@7-10, key_size=11.
+ * A contiguous [proto][src][dst] image misses every lookup.  Key/mask bytes
+ * are NETWORK order (big-endian; acl_table_rule_field32 reads header fields
+ * that way), masks MSB-first. */
+static void p4_spd_key_image(const struct r2dp_sp *sp, uint8_t *key,
+			     uint8_t *mask)
+{
+	memset(key, 0, 16);
+	memset(mask, 0, 16);
+	key[0] = sp->ul_proto;
+	memcpy(&key[3], sp->sel_src.addr, 4);
+	memcpy(&key[7], sp->sel_dst.addr, 4);
+	mask[0] = (sp->ul_proto == R2DP_PROTO_ANY) ? 0x00 : 0xff;
+	pref2mask_bytes(sp->pref_src, &mask[3]);
+	pref2mask_bytes(sp->pref_dst, &mask[7]);
+}
+
 static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 {
 	struct r2dp_sp *sp = &p->sp;
@@ -1217,29 +1244,10 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 	ssrc = ntohl(ssrc); sdst = ntohl(sdst);
 
 	memset(&ent, 0, sizeof(ent));
-	memset(key, 0, sizeof(key));
-	{
-		/* outbound_table_0 is a WILDCARD (ternary) table keyed on the IPv4
-		 * header fields (protocol, src_addr, dst_addr).  The SWX ACL
-		 * (rte_swx_table_wm.c) does NOT pack the key contiguously: it
-		 * preserves the ACTUAL header byte gaps between match fields via
-		 * key_mask0 (set from real header bit-offsets in table_params_get).
-		 * Relative to the first field (protocol @ IPv4 byte 9): proto@0,
-		 * then a 2-byte gap (IPv4 checksum @ bytes 10-11), src@3-6, dst@7-10
-		 * => key_size=11, key_offset=9.  The routing 10/8 (single dst field,
-		 * key_size=4) has no gap, which is why it works while a contiguous
-		 * SPD image misses.  Key/mask bytes are NETWORK order (big-endian,
-		 * acl_table_rule_field32 reads header fields that way). */
-		key[0] = sp->ul_proto;            /* protocol */
-		memcpy(&key[3], sp->sel_src.addr, 4);  /* src @ byte3 */
-		memcpy(&key[7], sp->sel_dst.addr, 4);  /* dst @ byte7 */
-		mask[0] = (sp->ul_proto == R2DP_PROTO_ANY) ? 0x00 : 0xff;
-		pref2mask_bytes(sp->pref_src, &mask[3]);
-		pref2mask_bytes(sp->pref_dst, &mask[7]);
-		ent.key = key;
-		ent.key_mask = mask;
-		ent.key_priority = p4_spd_prio(sp);
-	}
+	p4_spd_key_image(sp, key, mask);
+	ent.key = key;
+	ent.key_mask = mask;
+	ent.key_priority = p4_spd_prio(sp);
 
 	switch (sp->action) {
 	case R2DP_ACT_DISCARD:
@@ -1345,19 +1353,10 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 		return -EAFNOSUPPORT;
 
 	memset(&ent, 0, sizeof(ent));
-	memset(key, 0, sizeof(key));
-	memset(mask, 0, sizeof(mask));
-	{
-		/* Same wildcard key image p4_spd_bind installs: [proto][src][dst]
-		 * NETWORK order + matching key_mask + priority.  A delete with any
-		 * other key/mask would silently no-op and orphan the row. */
-		key[0] = p->sp.ul_proto;
-		memcpy(&key[1], p->sp.sel_src.addr, 4);
-		memcpy(&key[5], p->sp.sel_dst.addr, 4);
-		mask[0] = (p->sp.ul_proto == R2DP_PROTO_ANY) ? 0x00 : 0xff;
-		pref2mask_bytes(p->sp.pref_src, &mask[1]);
-		pref2mask_bytes(p->sp.pref_dst, &mask[5]);
-	}
+	/* Use the SAME key image builder as p4_spd_bind; a mismatched image
+	 * (e.g. the pre-helper packed [1][5] layout) makes table_entry_delete
+	 * silently no-op and orphan the ACL row. */
+	p4_spd_key_image(&p->sp, key, mask);
 	ent.key = key;
 	ent.key_mask = mask;
 	ent.key_priority = p4_spd_prio(&p->sp);
