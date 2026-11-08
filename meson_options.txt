@@ -2,3 +2,5 @@ option('enable_dpdk', type: 'feature', value: 'auto',
   description: 'Build the DPDK dataplane (r2dp-fwd forwarding). Requires libdpdk >= 23.11.')
 option('enable_p4', type: 'feature', value: 'disabled',
   description: 'Build the P4/SWX dataplane backend (fwd/dp_p4.c). Requires DPDK SWX + a compiled p4/r2dp.out spec.')
+option('dp_max_wk', type: 'integer', value: 8,
+  description: 'Max packet workers (DP_MAX_WK). Override for machines with more cores, e.g. -Ddp_max_wk=12.')

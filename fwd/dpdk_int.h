@@ -164,7 +164,9 @@ enum dp_drop {
 #define DROP(w, r, n) do { uint64_t n_ = (n); (w)->n_drop += n_; \
 	(w)->n_dropr[(r)] += n_; } while (0)
 
-#define DP_MAX_WK 8       /* packet workers (-n) */
+#ifndef DP_MAX_WK
+#define DP_MAX_WK 8       /* packet workers (-n); override with -DDP_MAX_WK=N */
+#endif
 
 struct dpdk_priv;
 

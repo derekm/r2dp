@@ -8,7 +8,8 @@ if dpdk.found()
     include_directories: [include_directories('../fwd'), r2dp_inc],
     dependencies: dpdk,
     link_with: libr2dp,
-    c_args: ['-DR2DP_HAVE_DPDK=1'])
+    c_args: ['-DR2DP_HAVE_DPDK=1',
+      '-DDP_MAX_WK=' + get_option('dp_max_wk').to_string()])
   benchmark('fwd_bench', fwd_bench, args: ['--check'], timeout: 300)
 endif
 
