@@ -173,13 +173,34 @@ R2DP_P4_BENCH=1 r2dp-fwd --dp p4 ... --vdev=crypto_aesni_mb0
 **Multicore (`.179`, aesni):**
 ```
 R2DP_P4_WORKERS=4 R2DP_P4_BENCH=1 r2dp-fwd --dp p4 ... \
-  --vdev='crypto_aesni_mb0,max_nb_queue_pairs=4'
+  --vdev='crypto_aesni_mb0,max_nb_queue_pairs=4' --no-huge -m 1024
 # install SA+SP; expect 4 bench workers; aggregate ~= 4 x per-shard
 ```
+**Proven 2026-11-08 (this refactor), aggregate tap-free Mpps (sum of
+per-slice best_cyc_pkt pps):**
+- `.179` aesni 64B: W1 **1.728**, W2 **3.240**, W4 **4.855**, W6 **5.781**,
+  W8 **6.605**.
+- `.165` openssl 64B: W1 **0.998**, W2 **1.884**, W3 **2.613**, W4 **3.344**.
+- N=1 restates the historical single-instance figure (1.72 / 0.99) => the
+  regression gate is intact at the same commit that runs N>1.
+- Fan-out proven on the log: every shard prints `slice i ipsec SA add ok`
+  and `slice i OUT BIND installed` with the same selector; each shard's
+  extern gets its own sa_id.
+
+**Status at this commit (`fab9236`):**
+- VERIFIED (bench path): N=1 regression, per-shard build/start/fan-out,
+  one cryptodev N QPs, per-shard pipeline/extern/pool/rings, core pinning,
+  N-worker bench, honest aggregate, no pool OOM under `-m 1024`.
+- **NOT YET VERIFIED / still open:** live-path steering (Section 5) — the
+  bench self-injects per shard so it never exercises RX steering; the
+  tap/memif live path has not been proved to give per-flow/per-SA affinity
+  across shards.  Delete-proof-per-shard (Section 2) and live replay/seq
+  integrity across shards also need a live-path proof.  These require the
+  live-path tests in the next section and are the gate for a full APPROVE.
 
 **Checks on the live path (memif/tap), not just bench:**
 - per-SA affinity: inject one flow, confirm it always hits shard k
-  (crypto enq/deq on one extern).
+  (crypto enq/deq on one extern).  <-- NOT YET RUN: steering unimplemented
 - delete proof per shard (Section 2).
 - replay/seq integrity: a single flow on one shard does not interleave seqs.
 
