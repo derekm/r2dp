@@ -19,6 +19,7 @@
  * (default 1024).  It is not a limit: the table doubles as it fills.
  */
 #include <getopt.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,14 +123,28 @@ main(int argc, char **argv)
 		free(eal_base);
 		return 2;
 	} else
-	/* Optional DPDK dataplane probe.  Failure is non-fatal: we still serve
-	 * the control socket (racoon2 bring-up + M0 tests). */
+	/* DPDK dataplane probe.  Control-only (no dataplane, ESP dropped, IKE
+	 * still answered) is only valid when there is no backend to ask for:
+	 * -2 = built without DPDK, -ENODEV = no crypto device / no dataplane
+	 * port.  Any other failure (e.g. -n exceeds the cryptodev's queue
+	 * pairs, setup errors) is an operator/config error and must stop the
+	 * process: degrading to control-only there would silently accept
+	 * SA_ADD/SP_ADD -- and racoon2 would think ESP is flowing when it is
+	 * not.  Fail closed on those. */
 	{
 		int r = fwd_dp_dpdk_probe(&ctl.dp, &eal_argc, &eal_argv,
 		    sockpath, verbose, nb_workers, (unsigned)nh_size);
-		if (r < 0)
+		if (r == -2 || r == -ENODEV) {
 			fprintf(stderr, "r2dp-fwd: DPDK dataplane unavailable (%s); "
-			    "serving control-only\n", r == -2 ? "no DPDK build" : strerror(-r));
+			    "serving control-only\n",
+			    r == -2 ? "no DPDK build" : strerror(-r));
+		} else if (r < 0) {
+			fprintf(stderr, "r2dp-fwd: DPDK dataplane failed to start "
+			    "(%s); refusing to run control-only -- fix the config "
+			    "and retry\n", strerror(-r));
+			free(eal_base);
+			return 1;
+		}
 		(void)g_stop;
 	}
 	free(eal_base);   /* rte_eal_init advanced eal_argv; free the calloc base */

@@ -918,9 +918,8 @@ crypto_init(struct dpdk_priv *d)
 		 * device's queue pairs at creation, e.g.
 		 * --vdev='crypto_openssl0,max_nb_queue_pairs=12'. */
 		fprintf(stderr, "r2dp-fwd: %s only has %u queue pairs but -n %u was "
-		    "requested; add max_nb_queue_pairs=<n> to the --vdev so the "
-		    "device can serve %u queue pairs, or refuse to start with "
-		    "fewer (no silent clamp).\n",
+		    "requested; add max_nb_queue_pairs=<n> to the --vdev (e.g. "
+		    "--vdev='crypto_openssl0,max_nb_queue_pairs=%u') and relaunch\n",
 		    rte_cryptodev_name_get(d->cdev_id),
 		    d->cdev_info.max_nb_queue_pairs, d->nb_wk, d->nb_wk);
 		return -EINVAL;
@@ -1052,9 +1051,11 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	ret = crypto_init(d);
 	/* -ENODEV: no crypto device found -- tolerate, ESP is dropped and IKE
 	 * still flows.  Any other failure (device present but too few queue
-	 * pairs for -n, configure/setup errors) must refuse to start rather than
-	 * silently drop ESP or under-provision workers. */
+	 * pairs for -n, configure/setup errors) must refuse the dataplane
+	 * rather than silently drop ESP or under-provision workers. */
 	if (ret < 0 && ret != -ENODEV) {
+		if (d->pool)
+			rte_mempool_free(d->pool);
 		free(d);
 		return ret;
 	}

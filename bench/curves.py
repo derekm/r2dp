@@ -21,7 +21,8 @@ The P4 tap-free point and the tap-path values are read from the data JSON's
 Data schema (curves_data.json):
 {
   "dpdk": [ {"box": "...", "pmd": "openssl", "size": 64, "hz": 3.19e9,
-             "enc": {worker: mpps, ...}, "dec": {...}}, ... ],
+             "enc": {worker: mpps, ...}, "dec": {...},
+             "enc_cyc": {worker: cyc/pkt}, "dec_cyc": {...}}, ... ],
   "p4":   {"tapless_mpps": 1.00, "tap_mpps": 0.132, "dpdk_tap_mpps": 0.252,
            "note": "..."},
 }
@@ -90,6 +91,8 @@ def collect_from_bin(data, args):
         src = {"box": box, "pmd": pmd, "size": size,
                "hz": hz, "enc": {}, "dec": {}, "enc_cyc": {}, "dec_cyc": {}}
         data["dpdk"].append(src)
+    src.setdefault("enc_cyc", {})
+    src.setdefault("dec_cyc", {})
     src["size"], src["hz"] = size, hz
     for w in ws:
         cmd = [path, "--pmd", pmd, "--sizes", str(size), "--tunnels", "1",
@@ -125,6 +128,8 @@ def collect_from_file(data, args):
         src = {"box": args.box, "pmd": args.pmd, "enc": {}, "dec": {},
                "enc_cyc": {}, "dec_cyc": {}}
         data["dpdk"].append(src)
+    src.setdefault("enc_cyc", {})
+    src.setdefault("dec_cyc", {})
     for r in rows:
         src["enc"][str(r["workers"])] = r["enc"]
         src["dec"][str(r["workers"])] = r["dec"]
@@ -208,7 +213,7 @@ def plot(data, out):
         ax.text(i, v, f"{v:.2f}" if v >= 1 else f"{v*1e3:.0f}K",
                 ha="center", va="bottom", fontsize=9)
     ax.set_ylabel("Mpps")
-    ax.set_title("Tap-free dataplane vs real I/O via shared net_tap (.165, 64B)")
+    ax.set_title("Tap-free dataplane vs real I/O via shared net_tap (64B)")
     ax.grid(True, axis="y", alpha=0.3)
     plt.setp(ax.get_xticklabels(), rotation=20, ha="right")
 
