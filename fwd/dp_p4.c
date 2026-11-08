@@ -45,6 +45,7 @@
 #include <rte_swx_pipeline.h>
 #include <rte_swx_ctl.h>
 #include <rte_swx_ipsec.h>
+#include <sched.h>
 #include <rte_ring.h>
 #include <rte_cryptodev.h>
 #include <rte_mbuf.h>
@@ -186,6 +187,20 @@ struct p4_priv {
 static void p4_stats_on_req(struct p4_priv *p);
 static void *p4_bench_worker(void *arg);
 
+/* Pin a slice worker to its own CPU core so N pipelines run on N cores
+ * (deterministic, not probabilistic scheduling -- a requirement for the
+ * multicore sweep and for later SmartNIC/ASIC affinity models).  Slice s
+ * pins to CPU s; on boxes with fewer than n_inst cores the OS falls back
+ * to co-scheduling rather than failing. */
+static void p4_pin(unsigned s)
+{
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(s % CPU_SETSIZE, &set);
+	if (sched_setaffinity(0, sizeof(set), &set) != 0)
+		P4_LOG("slice %u: sched_setaffinity failed", s);
+}
+
 /* Packet-path worker: drain the pipeline's input, execute the PNA program,
  * run the ipsec extern head-of-line, then loop.  Mirrors examples/pipeline
  * thread_main: run each pipeline then each block (the ipsec extern) with no
@@ -200,6 +215,7 @@ static void *p4_worker(void *arg)
 {
 	struct p4_inst *it = arg;
 	struct p4_priv *pr = it->priv;
+	p4_pin(it->s);
 	unsigned s = it->s;
 	uint64_t last_dump = 0;
 
@@ -356,6 +372,7 @@ static void *p4_bench_worker(void *arg)
 {
 	struct p4_inst *it = arg;
 	struct p4_priv *pr = it->priv;
+	p4_pin(it->s);
 	unsigned waited = 0;
 
 	while (atomic_load_explicit(&it->running, __ATOMIC_RELAXED) &&
@@ -379,26 +396,36 @@ armed:
 	 * exact.  mbuf pool must exist (tap mode has one; control-only does
 	 * not, so create a local one here). */
 	{
-		struct rte_mempool *pool = pr->pool;
+		struct rte_mempool *pool = NULL;
 		unsigned fsz = p4_bench_size();   /* inner frame length */
 		unsigned totlen, udplen;
 		uint64_t t0, t1, min_c, best = 0, tot_pkt = 0;
 		int trial;
 
-		/* IPv4 total len = 20 (hdr) + 8 (udp) + payload; UDP len = 8 + payload.
-		 * fsz = 14 eth + ip; payload = fsz - 14 - 20 - 8. */
-		totlen = fsz - 14;             /* ip hdr + udp + payload */
-		udplen = fsz - 14 - 20;        /* udp hdr + payload */
-		if (!pool)
-			pool = rte_pktmbuf_pool_create("p4bench_pool",
-						       P4_POOL_SIZE,
+		/* Isolated, per-slice bench pool: the whole point of the multicore
+		 * sweep is that every slice is an independent single-owner data path,
+		 * so each bench worker owns its own mbuf pool with a unique name (a
+		 * shared pool under N workers is both a contention point and an
+		 * EEXIST/ENOMEM hazard -- rte_pktmbuf_pool_create fails if the name
+		 * already exists, so a second worker reusing 'p4bench_pool' would
+		 * get NULL). */
+		{
+			char pn[64];
+			snprintf(pn, sizeof(pn), "p4bench_pool%u", it->s);
+			pool = rte_pktmbuf_pool_create(pn, P4_POOL_SIZE,
 						       P4_POOL_CACHE, 128,
 						       RTE_MBUF_DEFAULT_BUF_SIZE,
 						       SOCKET_ID_ANY);
+		}
+		(void)pr->pool;
 		if (!pool) {
 			P4_LOG("bench: pool create failed");
 			return NULL;
 		}
+		/* IPv4 total len = 20 (hdr) + 8 (udp) + payload; UDP len = 8 +
+		 * payload.  fsz = 14 eth + ip; payload = fsz - 14 - 20 - 8. */
+		totlen = fsz - 14;             /* ip hdr + udp + payload */
+		udplen = fsz - 14 - 20;        /* udp hdr + payload */
 		/* Time trials. */
 		for (trial = 0; trial < P4_BENCH_TRIALS; trial++) {
 			uint64_t end;
@@ -571,6 +598,18 @@ static int p4_io_init(struct p4_priv *pr)
 		/* No NIC: run control-only (pipeline loads, no packet I/O). */
 		P4_LOG("no tap/memif/vhost device; serving control-only");
 		pr->outer_port = pr->inner_port = -1;
+		return 0;
+	}
+
+	/* Tap-free bench mode (R2DP_P4_BENCH): the bench workers self-inject
+	 * into their OWN per-slice pools and drain their own rings; they do not
+	 * bridge eth legs.  Skip building one shared mbuf pool -- under N slices
+	 * an extra static-allocation r2dp_p4_pool (8192 mbufs) plus N extern
+	 * session pools exhausts --no-huge static EAL memory (W=4 'Invalid
+	 * memory').  Each bench worker allocates its isolated pool lazily. */
+	if (getenv("R2DP_P4_BENCH")) {
+		P4_LOG("bench mode: skip eth/pool init");
+		pr->pool = NULL;
 		return 0;
 	}
 
