@@ -238,11 +238,21 @@ per-slice best_cyc_pkt pps):**
   documented in `p4_spd_bind`/`p4_sp_del`/`p4_sp_add` as inherently
   per-pipeline (a slice whose commit already succeeded cannot be rolled
   back in one-shot; the common failure is symmetric).  An explicit live
-  multi-packet replay test on the P4 INBOUND path is still NOT verified
-  (the scapy harness reached the forwarder but `ib: hit=0`, so the replay
-  window was never exercised); replay-state single-ownership is guaranteed
-  by construction (per-slice extern + steering) but the live demonstration
-  remains a reviewer action.
+  multi-packet replay test on the P4 INBOUND path is still NOT verified:
+  the harness frames now demonstrably hit the inbound SAD and reach crypto
+  (ib hit=380, crypto enq=deq=288) but no synthetic frame yet yields a
+  decrypting far-leg inner frame (out1 stayed 0 on BOTH the P4 and the
+  proven DPDK backend -- the P4 run used Ethernet-framed ESP while the DPDK
+  backend ingests bare IP, so the comparison is not a clean ICV discriminator
+  and the decrypt/egress + replay window were never exercised).  Replay-state
+  single-ownership is guaranteed by construction (per-slice extern +
+  steering) but the live demonstration remains a reviewer action.
+- **VERIFIED (`191aaf2`) inbound SAD key byte order:** the (dip,spi) exact
+  key was built as host dip + NETWORK spi, so no inbound frame ever matched
+  (ib hit=0, crypto enq=0).  SWX exact-matches the parse fields as HOST
+  uint32s; the correct key is { ntohl(dip), ntohl(spi) } in BOTH fields.
+  Live N=2 openssl: ib hit 0->380, crypto enq=deq 0->288 for 300 distinct
+  ESP seqs (previously 0).  N=1 bench gate unchanged.
 - Remaining for a full APPROVE (procedures, not missing code):
   - live replay/seq-integrity assertion (same-flow monotonic seq on the
     pinned shard) -- steering makes this possible by construction (per-SA
