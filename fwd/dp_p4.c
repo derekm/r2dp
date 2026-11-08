@@ -125,7 +125,11 @@ struct p4_pol {
  * single-owner (rte_swx_* is not threaded), exactly like one P4 pipeline
  * stage on a NIC.  N slices run on N cores; R2DP_P4_WORKERS sets N (default 1
  * = the historical single-pipeline layout, byte-for-byte). */
+struct p4_priv;
+
 struct p4_inst {
+	struct p4_priv *priv;            /* back-pointer to the owner */
+	unsigned s;                       /* this slice's index (0..n_inst-1) */
 	struct rte_swx_pipeline *p;
 	struct rte_swx_ctl_pipeline *ctl;
 	struct rte_swx_ipsec *ipsec;
@@ -194,56 +198,58 @@ static void *p4_bench_worker(void *arg);
  * leg.  An empty ring or PMD is a no-op. */
 static void *p4_worker(void *arg)
 {
-	struct p4_priv *pr = arg;
+	struct p4_inst *it = arg;
+	struct p4_priv *pr = it->priv;
+	unsigned s = it->s;
 	uint64_t last_dump = 0;
 
-	while (atomic_load_explicit(&pr->inst[0].running, __ATOMIC_RELAXED)) {
+	while (atomic_load_explicit(&it->running, __ATOMIC_RELAXED)) {
 		/* Bridge RX: outer -> in0, inner -> in1. */
-		if (pr->outer_port >= 0 && pr->inst[0].in0 && pr->pool) {
+		if (pr->outer_port >= 0 && it->in0 && pr->pool) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
 			uint16_t n = rte_eth_rx_burst(pr->outer_port, 0,
 						      pkts, P4_BURST_SZ);
 			if (n) {
-				pr->inst[0].c_outer += n;
-				rte_ring_enqueue_bulk(pr->inst[0].in0, (void **)pkts,
+				it->c_outer += n;
+				rte_ring_enqueue_bulk(it->in0, (void **)pkts,
 						      n, NULL);
 			}
 		}
-		if (pr->inner_port >= 0 && pr->inst[0].in1 && pr->pool) {
+		if (pr->inner_port >= 0 && it->in1 && pr->pool) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
 			uint16_t n = rte_eth_rx_burst(pr->inner_port, 0,
 						      pkts, P4_BURST_SZ);
 			if (n) {
-				pr->inst[0].c_inner += n;
-				rte_ring_enqueue_bulk(pr->inst[0].in1, (void **)pkts,
+				it->c_inner += n;
+				rte_ring_enqueue_bulk(it->in1, (void **)pkts,
 						      n, NULL);
 			}
 		}
 
 		/* Run the pipeline + ipsec extern. */
-		if (pr->inst[0].p)
-			rte_swx_pipeline_run(pr->inst[0].p, P4_RUN_QUANTA);
-		if (pr->inst[0].ipsec)
-			rte_swx_ipsec_run(pr->inst[0].ipsec);
+		if (it->p)
+			rte_swx_pipeline_run(it->p, P4_RUN_QUANTA);
+		if (it->ipsec)
+			rte_swx_ipsec_run(it->ipsec);
 
 		/* Bridge TX: out0 -> outer, out1 -> inner. */
-		if (pr->outer_port >= 0 && pr->inst[0].out0) {
+		if (pr->outer_port >= 0 && it->out0) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
-			uint16_t n = rte_ring_dequeue_burst(pr->inst[0].out0,
+			uint16_t n = rte_ring_dequeue_burst(it->out0,
 							    (void **)pkts,
 							    P4_BURST_SZ, NULL);
 			if (n) {
-				pr->inst[0].c_out0 += n;
+				it->c_out0 += n;
 				rte_eth_tx_burst(pr->outer_port, 0, pkts, n);
 			}
 		}
-		if (pr->inner_port >= 0 && pr->inst[0].out1) {
+		if (pr->inner_port >= 0 && it->out1) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
-			uint16_t n = rte_ring_dequeue_burst(pr->inst[0].out1,
+			uint16_t n = rte_ring_dequeue_burst(it->out1,
 							    (void **)pkts,
 							    P4_BURST_SZ, NULL);
 			if (n) {
-				pr->inst[0].c_out1 += n;
+				it->c_out1 += n;
 				rte_eth_tx_burst(pr->inner_port, 0, pkts, n);
 			}
 		}
@@ -253,14 +259,18 @@ static void *p4_worker(void *arg)
 		if (fwd_stats_req)
 			p4_stats_on_req(pr);
 		if (rte_get_tsc_cycles() - last_dump > rte_get_tsc_hz()) {
-			uint32_t q0 = rte_ring_count(pr->inst[0].in0);
-			uint32_t q1 = rte_ring_count(pr->inst[0].in1);
-			uint32_t qo0 = rte_ring_count(pr->inst[0].out0);
-			uint32_t qo1 = rte_ring_count(pr->inst[0].out1);
+			uint32_t q0 = rte_ring_count(it->in0);
+			uint32_t q1 = rte_ring_count(it->in1);
+			uint32_t qo0 = rte_ring_count(it->out0);
+			uint32_t qo1 = rte_ring_count(it->out1);
 			struct rte_swx_table_stats ts1;
 			static uint64_t act1[16];
-			struct rte_ring *ipin = rte_ring_lookup("IP_IN");
-			struct rte_ring *ipout = rte_ring_lookup("IP_OUT");
+			char ipn[64], ipon[64];
+			struct rte_ring *ipin, *ipout;
+			snprintf(ipn, sizeof(ipn), s ? "IP_IN_%u" : "IP_IN", s);
+			snprintf(ipon, sizeof(ipon), s ? "IP_OUT_%u" : "IP_OUT", s);
+			ipin  = rte_ring_lookup(ipn);
+			ipout = rte_ring_lookup(ipon);
 			uint32_t qi = ipin ? rte_ring_count(ipin) : 0;
 			uint32_t qo = ipout ? rte_ring_count(ipout) : 0;
 			struct rte_cryptodev_stats cst;
@@ -277,7 +287,7 @@ static void *p4_worker(void *arg)
 				static uint64_t iba[16];
 				memset(&ibs, 0, sizeof(ibs));
 				ibs.n_pkts_action = iba;
-				if (rte_swx_ctl_pipeline_table_stats_read(pr->inst[0].p,
+				if (rte_swx_ctl_pipeline_table_stats_read(it->p,
 					 "inbound_table_0", &ibs) == 0)
 					P4_LOG("ib: hit=%llu miss=%llu a0=%llu a1=%llu",
 					       (unsigned long long)ibs.n_pkts_hit,
@@ -285,15 +295,15 @@ static void *p4_worker(void *arg)
 					       (unsigned long long)iba[0],
 					       (unsigned long long)iba[1]);
 			}
-			if (rte_swx_ctl_pipeline_table_stats_read(pr->inst[0].p,
+			if (rte_swx_ctl_pipeline_table_stats_read(it->p,
 				 "outbound_table_0", &ts1) == 0)
 				P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
 				       "| rings in0=%u in1=%u out0r=%u out1r=%u "
 				       "| ipsec ipin=%u ipout=%u "
 				       "| ob_hit=%llu ob_miss=%llu "
 				       "| act a5=%llu a6=%llu a7=%llu",
-				       pr->inst[0].c_outer, pr->inst[0].c_inner, pr->inst[0].c_out0,
-				       pr->inst[0].c_out1, q0, q1, qo0, qo1, qi, qo,
+				       it->c_outer, it->c_inner, it->c_out0,
+				       it->c_out1, q0, q1, qo0, qo1, qi, qo,
 				       (unsigned long long)ts1.n_pkts_hit,
 				       (unsigned long long)ts1.n_pkts_miss,
 				       (unsigned long long)act1[5],
@@ -302,8 +312,8 @@ static void *p4_worker(void *arg)
 			else
 				P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
 				       "| rings in0=%u in1=%u out0r=%u out1r=%u",
-				       pr->inst[0].c_outer, pr->inst[0].c_inner, pr->inst[0].c_out0,
-				       pr->inst[0].c_out1, q0, q1, qo0, qo1);
+				       it->c_outer, it->c_inner, it->c_out0,
+				       it->c_out1, q0, q1, qo0, qo1);
 			last_dump = rte_get_tsc_cycles();
 		}
 	}
@@ -344,10 +354,11 @@ p4_bench_size(void)
 }
 static void *p4_bench_worker(void *arg)
 {
-	struct p4_priv *pr = arg;
+	struct p4_inst *it = arg;
+	struct p4_priv *pr = it->priv;
 	unsigned waited = 0;
 
-	while (atomic_load_explicit(&pr->inst[0].running, __ATOMIC_RELAXED) &&
+	while (atomic_load_explicit(&it->running, __ATOMIC_RELAXED) &&
 	       waited++ < P4_BENCH_WAIT_HZ * 2) {
 		for (int i = 0; i < P4_SP_MAX; i++) {
 			struct p4_pol *q = &pr->spd[i];
@@ -396,7 +407,7 @@ armed:
 			{
 				void *pkts[P4_BURST_SZ];
 				uint16_t r;
-				while ((r = rte_ring_dequeue_burst(pr->inst[0].out0,
+				while ((r = rte_ring_dequeue_burst(it->out0,
 								      pkts,
 								      P4_BURST_SZ,
 								      NULL))) {
@@ -450,20 +461,20 @@ armed:
 				if (!n)
 					break;
 				/* feed the pipeline's inner leg */
-				enq = rte_ring_enqueue_burst(pr->inst[0].in1,
+				enq = rte_ring_enqueue_burst(it->in1,
 							     (void **)mk,
 							     n, NULL);
 				/* free any not enqueued (ring full) */
 				for (int k = enq; k < n; k++)
 					rte_pktmbuf_free(mk[k]);
 				/* run data plane */
-				rte_swx_pipeline_run(pr->inst[0].p, P4_RUN_QUANTA);
-				rte_swx_ipsec_run(pr->inst[0].ipsec);
+				rte_swx_pipeline_run(it->p, P4_RUN_QUANTA);
+				rte_swx_ipsec_run(it->ipsec);
 				/* drain egress (ESP to the outer leg) */
 				{
 					struct rte_mbuf *rx[P4_BURST_SZ];
 					uint16_t r =
-					    rte_ring_dequeue_burst(pr->inst[0].out0,
+					    rte_ring_dequeue_burst(it->out0,
 								   (void **)rx,
 								   P4_BURST_SZ,
 								   NULL);
@@ -1018,6 +1029,7 @@ static int p4_start(struct fwd_dp *dp)
 	struct p4_priv *pr = dp->priv;
 	const char *spec = pr->spec_path ? pr->spec_path : R2DP_P4_SPEC;
 	int rc;
+	unsigned s;
 
 	if (pr->started)
 		return 0;
@@ -1026,14 +1038,9 @@ static int p4_start(struct fwd_dp *dp)
 	if (rc)
 		return rc;
 
-	pr->inst[0].ctl = rte_swx_ctl_pipeline_create(pr->inst[0].p);
-	if (!pr->inst[0].ctl) {
-		P4_LOG("ctl pipeline create failed");
-		return -EIO;
-	}
-
 	/* Cache table key sizes (0 = inbound SAD, 1 = outbound SPD; order
-	 * matches the spec -- see header notes). */
+	 * matches the spec -- see header notes).  Identical for every slice
+	 * (they share one compiled program), so cache once from slice 0. */
 	rc = p4_table_key_size(pr->inst[0].p, 0, &pr->inbound_key_size);
 	if (rc) {
 		P4_LOG("inbound table info %d", rc);
@@ -1047,203 +1054,217 @@ static int p4_start(struct fwd_dp *dp)
 	P4_LOG("table keys: inbound=%u outbound=%u", pr->inbound_key_size,
 	       pr->outbound_key_size);
 
-	/* ipsec extern instance the spec's ipsec_enable/protect actions
-	 * resolve into; SA ids written to ipsec_hdr.sa_id are looked up here.
-	 * It needs a configured cryptodev (param validation requires one). */
+	/* One configured cryptodev with one queue pair per slice (the extern
+	 * for slice s binds crypto_dev_queue_pair_id = s). */
 	rc = p4_crypto_init(pr);
 	if (rc)
 		return rc;
-	rc = rte_swx_ipsec_create(&pr->inst[0].ipsec, "r2dp-ipsec",
-				  &(struct rte_swx_ipsec_params){
-					.ring_in_name    = "IP_IN",
-					.ring_out_name   = "IP_OUT",
-					.crypto_dev_name = rte_cryptodev_name_get(
-					    pr->cdev_id),
-					.n_sa_max        = P4_SA_MAX,
-					/* burst sizes must be non-zero or the
-					 * extern never drains its input ring
-					 * (bsz all 0 -> read 0 frames).  Reference
-					 * ipsec.cli uses 32 32 32 32. */
-					.bsz = { 32, 32, 32, 32 },
-				  }, 0);
-	if (rc) {
-		P4_LOG("ipsec_create %d", rc);
-		return -EIO;
-	}
-	/* ipsec extern drains IP_IN; see create() bsz */
 
-	/* Program the classification regarrays the spec's parser/apply read
-	 * (they default to 0).  PNA direction: 0 = NET_TO_HOST (inbound /
-	 * decrypt), 1 = HOST_TO_NET (outbound / encrypt).  Port 0 = outer
-	 * (ciphertext/wire) leg, port 1 = inner (plaintext) leg; both are
-	 * inbound-candidate on their own leg, so they are NOT from_ipsec (the
-	 * ipsec extern's own return rings, IP_IN/IP_OUT, are the from_ipsec
-	 * ports).  Set direction per port and leave ipsec_port_in_* at their
-	 * extern rings' identity (see PLAN §8 / spec apply). */
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p, "direction", 0, 0);
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p, "direction", 1, 1);
-	/* ipsec extern port wiring.  The iospec binds port in 2 = IP_OUT (the
-	 * extern's return ring) and port out 2 = IP_IN (the extern's consume
-	 * ring), matching the DPDK ipsec.spec/ipsec.io reference.  The parser's
-	 * `from_ipsec` = (input_port == ipsec_port_in_*), and the apply's
-	 * post-extern `tx` uses ipsec_port_out_*; both must name the extern
-	 * port (2), or an ESP frame is never handed to the extern and never
-	 * recognized as returning from it. */
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p,
-		"ipsec_port_in_inbound", 0, 2);
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p,
-		"ipsec_port_in_outbound", 0, 2);
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p,
-		"ipsec_port_out_inbound", 0, 2);
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p,
-		"ipsec_port_out_outbound", 0, 2);
+	/*
+	 * Per-slice bring-up.  Every slice is a full, independent copy of the
+	 * PNA program: own ctl, own ipsec extern (on its own crypto QP and its
+	 * own IP_IN/IP_OUT rings), own classification/tables, own worker.  The
+	 * control plane (p4_sa_add / p4_sp_add / p4_sp_del / p4_spd_bind /
+	 * p4_spd_rebind) later programs EVERY slice identically, so packet
+	 * state is symmetric across replicas.
+	 */
+	for (s = 0; s < pr->n_inst; s++) {
+		char rin[96], rout[96];
 
-	/* Egress must be reachable, or no frame can leave the dataplane:
-	 * routing_table_0 (id 2) maps an outer/host dst (LPM) to a next_hop_id
-	 * (default next_hop_id 0), and next_hop_table_0 (id 3) maps that id to
-	 * next_hop_set(port_id).  next_hop_table_0's const default is `drop`,
-	 * so populate at least the id-0 hop (and a same-direction id-1 hop)
-	 * to the matching pipeline output port: id 0 = outer leg (port 0),
-	 * id 1 = inner leg (port 1). */
-	{
-		/* next_hop_set args: dst_mac(6) src_mac(6) ether_type(2) port_id(4). */
-		struct rte_swx_table_entry en;
-		int rid = p4_table_action_id(pr->inst[0].p, 3, 0);  /* next_hop_set */
-		uint8_t k0[4] = { 0, 0, 0, 0 }, k1[4] = { 1, 0, 0, 0 };
-		uint8_t ab[18];
-		if (rid < 0) {
-			P4_LOG("next_hop_set action id lookup failed");
+		pr->inst[s].priv = pr;
+		pr->inst[s].s = s;
+
+		pr->inst[s].ctl = rte_swx_ctl_pipeline_create(pr->inst[s].p);
+		if (!pr->inst[s].ctl) {
+			P4_LOG("slice %u ctl pipeline create failed", s);
+			return -EIO;
+		}
+
+		/* ipsec extern instance the spec's ipsec_enable/protect actions
+		 * resolve into; SA ids written to ipsec_hdr.sa_id are looked up
+		 * here.  It needs a configured cryptodev (param validation
+		 * requires one) and binds the slice's own crypto queue pair and
+		 * its own rings so two workers never share a structure. */
+		if (s == 0) {
+			snprintf(rin, sizeof(rin), "%s", "IP_IN");
+			snprintf(rout, sizeof(rout), "%s", "IP_OUT");
 		} else {
+			snprintf(rin, sizeof(rin), "IP_IN_%u", s);
+			snprintf(rout, sizeof(rout), "IP_OUT_%u", s);
+		}
+		rc = rte_swx_ipsec_create(&pr->inst[s].ipsec, "r2dp-ipsec",
+			&(struct rte_swx_ipsec_params){
+				.ring_in_name    = rin,
+				.ring_out_name   = rout,
+				.crypto_dev_name = rte_cryptodev_name_get(
+				    pr->cdev_id),
+				.crypto_dev_queue_pair_id = s,
+				.n_sa_max        = P4_SA_MAX,
+				/* burst sizes must be non-zero or the
+				 * extern never drains its input ring
+				 * (bsz all 0 -> read 0 frames).  Reference
+				 * ipsec.cli uses 32 32 32 32. */
+				.bsz = { 32, 32, 32, 32 },
+			  }, 0);
+		if (rc) {
+			P4_LOG("slice %u ipsec_create %d", s, rc);
+			return -EIO;
+		}
+
+		/* Program the classification regarrays the spec's parser/apply
+		 * read (they default to 0).  See the pre-loop comment block in
+		 * the original single-instance text: direction per port,
+		 * ipsec_port_* = the extern port (2). */
+		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
+			"direction", 0, 0);
+		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
+			"direction", 1, 1);
+		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
+			"ipsec_port_in_inbound", 0, 2);
+		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
+			"ipsec_port_in_outbound", 0, 2);
+		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
+			"ipsec_port_out_inbound", 0, 2);
+		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
+			"ipsec_port_out_outbound", 0, 2);
+
+		/* next_hop id0 -> outer leg (port 0), id1 -> inner (port 1). */
+		{
+			struct rte_swx_table_entry en;
+			int rid = p4_table_action_id(pr->inst[s].p, 3, 0);
+			uint8_t k0[4] = { 0, 0, 0, 0 }, k1[4] = { 1, 0, 0, 0 };
+			uint8_t ab[18];
+			if (rid < 0) {
+				P4_LOG("slice %u next_hop_set lookup failed", s);
+				return -EIO;
+			}
 			memset(&en, 0, sizeof(en));
 			memset(ab, 0, sizeof(ab));
-			/* ether_type = 0x0800 (IPv4) at offset 12. */
 			ab[12] = 0x08; ab[13] = 0x00;
 			en.action_id = (uint64_t)rid;
 			en.action_data = ab;
 			en.key = k0;
-			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
 				 "next_hop_table_0", &en))
-				P4_LOG("next_hop id0 add failed");
-			/* id1 -> inner leg (port 1): port_id at offset 14, written to
-			 * metadata output_port (HOST order, LE 1 = {1,0,0,0}). */
-			ab[14] = 0x01; ab[15] = 0x00; ab[16] = 0x00; ab[17] = 0x00;
+				P4_LOG("slice %u next_hop id0 add failed", s);
+			ab[14] = 0x01; ab[15] = 0x00;
+			ab[16] = 0x00; ab[17] = 0x00;
 			en.key = k1;
-			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
-				"next_hop_table_0", &en))
-				P4_LOG("next_hop id1 add failed");
-			(void)rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
-			P4_LOG("next_hop table populated (id0->outer, id1->inner)");
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
+				 "next_hop_table_0", &en))
+				P4_LOG("slice %u next_hop id1 add failed", s);
+			(void)rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
+			P4_LOG("slice %u next_hop (id0->outer, id1->inner)", s);
 		}
-	}
 
-	/* Clear-forward hops for non-IP / control-plane (ARP): preserve the frame
-	 * unchanged (next_hop_preserve) to inner (id 2) or outer (id 3) leg.
-	 * These are load-bearing: an ARP/control-plane frame that misses here
-	 * dies at next_hop_table's drop default, so a failed add must fail the
-	 * start (fail-closed), not just log. */
-	{
-		struct rte_swx_table_entry en;
-		int rid = p4_table_action_id(pr->inst[0].p, 3, 1);  /* next_hop_preserve */
-		uint8_t k2[4] = { 2, 0, 0, 0 }, k3[4] = { 3, 0, 0, 0 };
-		uint8_t ab[4];
-		if (rid < 0) {
-			P4_LOG("next_hop_preserve action id lookup failed");
-			return -EIO;
+		/* Clear-forward hops: id2 -> inner, id3 -> outer (preserve). */
+		{
+			struct rte_swx_table_entry en;
+			int rid = p4_table_action_id(pr->inst[s].p, 3, 1);
+			uint8_t k2[4] = { 2, 0, 0, 0 }, k3[4] = { 3, 0, 0, 0 };
+			uint8_t ab[4];
+			if (rid < 0) {
+				P4_LOG("slice %u preserve lookup failed", s);
+				return -EIO;
+			}
+			memset(&en, 0, sizeof(en));
+			memset(ab, 0, sizeof(ab));
+			en.action_id = (uint64_t)rid;
+			en.action_data = ab;
+			ab[0] = 0x01;
+			en.key = k2;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
+				"next_hop_table_0", &en)) {
+				P4_LOG("slice %u id2 preserve add failed", s);
+				return -EIO;
+			}
+			ab[0] = 0x00;
+			en.key = k3;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
+				"next_hop_table_0", &en)) {
+				P4_LOG("slice %u id3 preserve add failed", s);
+				return -EIO;
+			}
+			if (rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1)) {
+				P4_LOG("slice %u preserve commit failed", s);
+				return -EIO;
+			}
 		}
-		memset(&en, 0, sizeof(en));
-		memset(ab, 0, sizeof(ab));
-		en.action_id = (uint64_t)rid;
-		en.action_data = ab;
-		/* port_id at offset 0, HOST order (LE 1 = {1,0,0,0}). */
-		ab[0] = 0x01;   /* inner leg (port 1) */
-		en.key = k2;
-		if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
-			"next_hop_table_0", &en)) {
-			P4_LOG("next_hop id2 (preserve->inner) add failed");
-			return -EIO;
-		}
-		ab[0] = 0x00;   /* outer leg (port 0) */
-		en.key = k3;
-		if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
-			"next_hop_table_0", &en)) {
-			P4_LOG("next_hop id3 (preserve->outer) add failed");
-			return -EIO;
-		}
-		if (rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1)) {
-			P4_LOG("preserve-hop commit failed");
-			return -EIO;
-		}
-		P4_LOG("next_hop preserve hops populated (id2->inner, id3->outer)");
-	}
 
-	/* Decrypt egress: a frame the extern returns on IP_OUT is re-parsed and
-	 * routed by its INNER IPv4 dst (h.ipv4.dst_addr, a HEADER field, so the
-	 * LPM prefix is network byte order).  The default route sends every miss
-	 * to next_hop 0 -> outer leg, which is right for the encrypted outer
-	 * frame but would push a decrypted inner frame back out the wire.  Add
-	 * an LPM entry for the inner subnet -> next_hop 1 (-> inner leg). */
-	{
-		struct rte_swx_table_entry en;
-		int rid = p4_table_action_id(pr->inst[0].p, 2, 0);  /* next_hop_id_set */
-		uint8_t rkey[4] = { 0x0a, 0, 0, 0 };        /* 10.0.0.0/8 inner */
-		uint8_t rmask[4] = { 0xff, 0, 0, 0 };
-		uint8_t rdata[4] = { 1, 0, 0, 0 };          /* next_hop_id 1, meta */
-		if (rid < 0) {
-			P4_LOG("next_hop_id_set action id lookup failed");
-			return -EIO;
+		/* Decrypt egress 10/8 -> next_hop 1 (inner). See single-instance
+		 * comment: fail-closed, a missing entry is a plaintext leak on
+		 * the outer wire for decrypted 10/8 frames. */
+		{
+			struct rte_swx_table_entry en;
+			int rid = p4_table_action_id(pr->inst[s].p, 2, 0);
+			uint8_t rkey[4] = { 0x0a, 0, 0, 0 };
+			uint8_t rmask[4] = { 0xff, 0, 0, 0 };
+			uint8_t rdata[4] = { 1, 0, 0, 0 };
+			if (rid < 0) {
+				P4_LOG("slice %u next_hop_id_set lookup failed", s);
+				return -EIO;
+			}
+			memset(&en, 0, sizeof(en));
+			en.key = rkey;
+			en.key_mask = rmask;
+			en.action_id = (uint64_t)rid;
+			en.action_data = rdata;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
+				 "routing_table_0", &en)) {
+				P4_LOG("slice %u routing 10/8 add failed", s);
+				return -EIO;
+			}
+			if (rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1)) {
+				P4_LOG("slice %u routing 10/8 commit failed", s);
+				return -EIO;
+			}
 		}
-		memset(&en, 0, sizeof(en));
-		en.key = rkey;
-		en.key_mask = rmask;
-		en.action_id = (uint64_t)rid;
-		en.action_data = rdata;
-		/* Fail-closed: routing_table's default miss is next_hop 0 -> outer
-		 * leg.  A decrypted frame whose inner dst is NOT covered by any LPM
-		 * entry already goes outer (that default decides the miss).  The
-		 * 10/8 -> next_hop 1 entry here is what keeps a decrypted frame
-		 * whose inner dst IS in 10/8 on the inner leg instead of leaking it
-		 * back out the outer wire in the clear.  Absent this entry a
-		 * 10/8-destined decrypted frame egresses outer (plaintext leak), so
-		 * a failed add must not silently start a loop — fail the start. */
-		if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
-			 "routing_table_0", &en)) {
-			P4_LOG("routing 10/8 add failed");
-			return -EIO;
+
+		/* Grab this slice's ring handles (created in p4_build_from_spec)
+		 * so its worker can bridge eth <-> pipeline.  Slice 0 keeps the
+		 * historical unsigned names, slices >=1 the suffixed ones — must
+		 * match the iospec written in p4_build_from_spec. */
+		if (s == 0) {
+			pr->inst[s].in0  = rte_ring_lookup("R2DP_IN0");
+			pr->inst[s].in1  = rte_ring_lookup("R2DP_IN1");
+			pr->inst[s].out0 = rte_ring_lookup("R2DP_OUT0");
+			pr->inst[s].out1 = rte_ring_lookup("R2DP_OUT1");
+		} else {
+			char nm[96];
+			snprintf(nm, sizeof(nm), "R2DP_IN0_%u", s);
+			pr->inst[s].in0  = rte_ring_lookup(nm);
+			snprintf(nm, sizeof(nm), "R2DP_IN1_%u", s);
+			pr->inst[s].in1  = rte_ring_lookup(nm);
+			snprintf(nm, sizeof(nm), "R2DP_OUT0_%u", s);
+			pr->inst[s].out0 = rte_ring_lookup(nm);
+			snprintf(nm, sizeof(nm), "R2DP_OUT1_%u", s);
+			pr->inst[s].out1 = rte_ring_lookup(nm);
 		}
-		P4_LOG("routing 10/8 -> next_hop 1 (inner)");
-		if (rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1)) {
-			P4_LOG("routing 10/8 commit failed");
-			return -EIO;
+
+		/* Launch this slice's packet-path worker (or the self-injecting
+		 * bench worker when R2DP_P4_BENCH is set). */
+		atomic_store_explicit(&pr->inst[s].running, 1, __ATOMIC_RELAXED);
+		{
+			void *(*wk)(void *) = getenv("R2DP_P4_BENCH")
+					      ? p4_bench_worker : p4_worker;
+			if (pthread_create(&pr->inst[s].th, NULL, wk,
+					   &pr->inst[s]) != 0) {
+				P4_LOG("slice %u worker create failed", s);
+				atomic_store_explicit(&pr->inst[s].running, 0,
+						      __ATOMIC_RELAXED);
+				return -EIO;
+			}
 		}
+		pr->inst[s].th_started = 1;
 	}
 
 	/* Find + configure the two ethdev legs (tap/memif/vhost) and the mbuf
-	 * pool; a box with no such NIC runs control-only. */
+	 * pool; shared across slices.  A box with no such NIC runs
+	 * control-only.  Done after workers exist so the worker's packets
+	 * already have legs to drain to. */
 	rc = p4_io_init(pr);
 	if (rc)
 		return rc;
-
-	/* Grab the pipeline ring handles (created in p4_build_from_spec) so
-	 * the worker can bridge eth <-> pipeline. */
-	pr->inst[0].in0  = rte_ring_lookup("R2DP_IN0");
-	pr->inst[0].in1  = rte_ring_lookup("R2DP_IN1");
-	pr->inst[0].out0 = rte_ring_lookup("R2DP_OUT0");
-	pr->inst[0].out1 = rte_ring_lookup("R2DP_OUT1");
-
-	/* Launch the packet-path worker (or the self-injecting bench worker
-	 * when R2DP_P4_BENCH is set -- a tap-free dataplane measurement that
-	 * feeds the pipeline rings directly, no ethdev). */
-	atomic_store_explicit(&pr->inst[0].running, 1, __ATOMIC_RELAXED);
-	{
-		void *(*wk)(void *) =
-		    getenv("R2DP_P4_BENCH") ? p4_bench_worker : p4_worker;
-		if (pthread_create(&pr->inst[0].th, NULL, wk, pr) != 0) {
-			P4_LOG("worker create failed");
-			atomic_store_explicit(&pr->inst[0].running, 0, __ATOMIC_RELAXED);
-			return -EIO;
-		}
-	}
-	pr->inst[0].th_started = 1;
 
 	pr->started = 1;
 	return 0;
