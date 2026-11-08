@@ -1506,14 +1506,14 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		isin = (e->dir == R2DP_DIR_IN);
 		if (isin) {
 			/* remove the (dip,spi) -> ipsec_enable SAD entry.
-			 * Inbound SAD key fields are METADATA copies of
-			 * h.ipv4.dst_addr / h.esp.spi, matched in HOST byte
-			 * order (same as outbound_table_0; values are already
-			 * host uint32s). */
+			 * The key MUST be byte-identical to the one add installed
+			 * (host dip || host spi, as empirically proven by the live
+			 * inbound probe) or table_entry_delete no-ops and orphans
+			 * the row.  Same convention as outbound_table_0. */
 			memset(&ent, 0, sizeof(ent));
 			memset(key, 0, sizeof(key));
 			memcpy(&key[0], &dip, 4);
-			memcpy(&key[4], &sa->spi, 4);   /* h.esp.spi, host order */
+			memcpy(&key[4], &spi, 4);
 			ent.key = key;
 			{
 				unsigned s;
@@ -1733,20 +1733,25 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	}
 
 	/* inbound_table_0 entry: (ipv4.dst_addr, esp.spi)
-	 * -> ipsec_enable(sl_id).  KEY fields (dst_addr, spi) are metadata
-	 * copies matched in HOST order; the action data (sa_id -> the
-	 * h.ipsec_hdr.sa_id header field) is stored network byte order. */
+	 * -> ipsec_enable(sl_id).  EMPIRICALLY VERIFIED (live probe,
+	 * 2026-11-08): SWX matches these parse fields as HOST-order uint32
+	 * values, so the control-plane key must be `host dip || host spi`
+	 * (both already computed above via ntohl).  A network-order / raw-wire
+	 * key (memcpy of sa->dst.addr, sa->spi) MISSES every frame -- the
+	 * original bug was an inconsistent mix: host dip + network spi.
+	 * Action data (sa_id -> h.ipsec_hdr.sa_id) is stored network order. */
 	memset(&ent, 0, sizeof(ent));
 	/* The inbound (dip,spi) -> ipsec_enable(sa_id) entry is added to
-	 * every slice.  The key (dst_addr, spi metadata copies) is identical
-	 * across slices, but the action data carries that slice's own sa_id,
-	 * so each slice is programmed with its per-slice id. */
+	 * every slice.  The key (host dip, host spi) is identical across
+	 * slices, but the action data carries that slice's own sa_id, so each
+	 * slice is programmed with its per-slice id. */
 	for (unsigned s = 0; s < pr->n_inst; s++) {
 		uint32_t id_be = htonl(e->sl_id[s]);
 		memset(key, 0, sizeof(key));
-		/* match-field order from the spec: dst_addr then spi */
-		memcpy(&key[0], &dip, 4);
-		memcpy(&key[4], &sa->spi, 4);   /* h.esp.spi, host order */
+		/* match-field order from the spec: dst_addr then spi; host order
+		 * (ntohl'd dip and host SPI), as empirically required by SWX. */
+		memcpy(&key[0], &dip, 4);           /* host BE dst 0xC0000201 */
+		memcpy(&key[4], &spi, 4);           /* host BE spi (ntohl'd)   */
 		memcpy(data, &id_be, 4);
 		ent.key = key;
 		ent.action_id = (uint64_t)p4_table_action_id(pr->inst[s].p, 0, 0);
