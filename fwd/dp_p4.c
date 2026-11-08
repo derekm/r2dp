@@ -1434,6 +1434,7 @@ static int p4_start(struct fwd_dp *dp)
 			return -EIO;
 		}
 		pr->rx_started = 1;
+		P4_LOG("rx distributor started (%u slices, hash steer)", pr->n_inst);
 	}
 
 	pr->started = 1;
