@@ -57,5 +57,30 @@ scp -q /tmp/p4_live_inj.py "$H":/home/yescorp/r2dp-p4/liveinj.py
 run "cd $B && sudo -n python3 liveinj.py $FRAMES 2>&1"
 echo "=== crypto enq/deq (per slice) from periodic dump ==="
 run "sudo -n grep -iE 'crypto:|\| ipsec|pkt:' /tmp/livep.log | tail -6"
+
+echo "=== delete-proof per shard: sp-del then re-inject -> a6(PROTECT)->a7(BYPASS) on EVERY slice ==="
+run "cd /home/yescorp/r2dp-p4/build; \
+     sudo -n env R2DP_SOCK=/tmp/lp.sock ./r2dpctl /tmp/lp.sock sp-del dir=out \
+       src=10.0.0.1/32 dst=10.0.0.2/32 proto=udp \
+       tsrc=192.0.2.1 tdst=203.0.113.1; sleep 1"
+run "sudo -n grep -nE 'sp_del|outbound entry del|BIND removed|a6=|a7=' /tmp/livep.log | tail -8"
+
+# re-inject after delete so the per-slice outbound miss (a7/bypass) is counted
+cat > /tmp/p4_live_del.py <<PYEOF
+import socket, struct, time, sys
+LOG="/tmp/livep.log"; TOTAL=int(sys.argv[1])
+i=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3)); i.bind(("r2pi",0))
+ip=struct.pack("!BBHHHBBH4s4s",0x45,0,20+8,0,0,64,17,0,socket.inet_aton("10.0.0.1"),socket.inet_aton("10.0.0.2"))
+ud=struct.pack("!HHHH",1024,9,8,0)
+f=bytes.fromhex("0200010203040200000000010800")+ip+ud+bytes(16)
+for _ in range(TOTAL): i.send(f)
+time.sleep(2.0)
+d=open(LOG).read()
+print("a6/protect events in log after del:", d.count("a6="), " a7/bypass:", d.count("a7="))
+PYEOF
+scp -q /tmp/p4_live_del.py "$H":/home/yescorp/r2dp-p4/livedel.py
+run "cd /home/yescorp/r2dp-p4 && sudo -n python3 livedel.py 30000 2>&1"
+echo "=== post-delete per-slice action counters ==="
+run "sudo -n grep -E 'pkt:' /tmp/livep.log | tail -4"
 run "sudo -n pkill -9 -x r2dp-fwd"
 echo done
