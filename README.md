@@ -85,6 +85,19 @@ pipeline instance on the box; a multicore P4 layout (multiple pipeline
 instances straddling traffic by RSS/hash) is the path to scaling aggregate
 throughput.
 
+The tap-free P4 data plane sweeps packet size and crypto PMD (single
+instance; `R2DP_P4_BENCH_SIZE` sets the inner frame size, default 64B), all
+in `bench/curves_data.json` `p4.sweep`:
+
+| box / PMD | 64B | 512B | 1400B |
+|---|---|---|---|
+| .165 openssl | 0.99 Mpps | 0.86 Mpps | 0.66 Mpps |
+| .179 openssl | 1.45 Mpps | 1.26 Mpps | 1.01 Mpps |
+| .179 aesni_mb | 1.72 Mpps | 1.51 Mpps | 1.14 Mpps |
+
+AES-NI (`.179` only) is ~1.13–1.19× over openssl on the P4 extern; larger
+frames amortize the fixed per-packet SWX+ipsec cost.
+
 DPDK tap-free numbers below come from `bench/fwd_bench --json` runs captured
 in `bench/curves_data.json` (regenerate with `bench/curves.py plot`); both
 crypto PMDs default to **8 queue pairs**, so a cryptodev used for more than

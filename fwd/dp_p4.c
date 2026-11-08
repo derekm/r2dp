@@ -399,8 +399,10 @@ armed:
 					f[0]=0x02; f[5]=0x01;
 					f[6]=0x02; f[11]=0x02;
 					f[12]=0x08; f[13]=0x00;
-					/* IPv4 hdr @14: ver/ihl, total len
-					 * (be u16 @15), id, ttl 64, proto 17 udp */
+					/* IPv4 hdr @14: ver/ihl, tos,
+					 * total len (be u16 @16, i.e.
+					 * IP hdr offset 2-3), id, ttl
+					 * 64, proto 17 udp */
 					f[14]=0x45; f[15]=0x00;
 					f[16]=(uint8_t)(totlen>>8);
 					f[17]=(uint8_t)totlen;
