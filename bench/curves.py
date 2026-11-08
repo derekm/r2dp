@@ -50,23 +50,29 @@ def save_data(path, data):
 
 
 def parse_fwd_json(text):
-    """Parse one fwd_bench --json blob -> {'pmd','workers','size',enc,dec}.
-    Handles the multi-worker variant (each result row carries 'size').  The
-    single-block multi-worker form emits several objects one per line; read the
-    last 'results' block that has 'workers' and enc_mpps.  Return a list of
-    per-(size,workers) rows."""
-    import re
+    """Parse one or more concatenated fwd_bench --json blobs (one per run)
+    into a flat list of rows {'pmd','workers','size',
+    enc,dec,enc_cyc,dec_cyc}.  --json - yields one JSON object per run on
+    stdout; workers default to 1 on the single-worker path (the object omits
+    the field).  Rows carry the bench's own per-worker cycles/pkt and Mpps."""
+    import json as _json
+    dec = _json.JSONDecoder()
+    text = text[text.find("{"):]
     rows = []
-    # fwd_bench json is one object; grab the whole thing
-    obj = json.loads(text[text.index("{"):])
-    for r in obj.get("results", []):
-        rows.append({
-            "pmd": obj.get("pmd", "?"),
-            "workers": r.get("workers", obj.get("workers", 1)),
-            "size": r.get("size"),
-            "enc": r.get("enc_mpps"),
-            "dec": r.get("dec_mpps"),
-        })
+    while text.strip():
+        obj, end = dec.raw_decode(text)
+        text = text[end:].lstrip()
+        w = obj.get("workers", 1)
+        for r in obj.get("results", []):
+            rows.append({
+                "pmd": obj.get("pmd", "?"),
+                "workers": r.get("workers", w),
+                "size": r.get("size"),
+                "enc": r.get("enc_mpps"),
+                "dec": r.get("dec_mpps"),
+                "enc_cyc": r.get("enc_cyc_pkt"),
+                "dec_cyc": r.get("dec_cyc_pkt"),
+            })
     return rows
 
 
@@ -82,7 +88,7 @@ def collect_from_bin(data, args):
             break
     if src is None:
         src = {"box": box, "pmd": pmd, "size": size,
-               "hz": hz, "enc": {}, "dec": {}}
+               "hz": hz, "enc": {}, "dec": {}, "enc_cyc": {}, "dec_cyc": {}}
         data["dpdk"].append(src)
     src["size"], src["hz"] = size, hz
     for w in ws:
@@ -99,6 +105,10 @@ def collect_from_bin(data, args):
             if r["size"] == size:
                 src["enc"][str(w)] = float(r["enc"])
                 src["dec"][str(w)] = float(r["dec"])
+                if r["enc_cyc"]:
+                    src["enc_cyc"][str(w)] = float(r["enc_cyc"])
+                if r["dec_cyc"]:
+                    src["dec_cyc"][str(w)] = float(r["dec_cyc"])
         print(f"  W={w}: enc={src['enc'].get(str(w))} dec={src['dec'].get(str(w))} "
               f"{pmd} {box}")
     return data
@@ -112,11 +122,16 @@ def collect_from_file(data, args):
                 if s["box"] == args.box and s["pmd"] == args.pmd), None)
     fresh = src is None
     if fresh:
-        src = {"box": args.box, "pmd": args.pmd, "enc": {}, "dec": {}}
+        src = {"box": args.box, "pmd": args.pmd, "enc": {}, "dec": {},
+               "enc_cyc": {}, "dec_cyc": {}}
         data["dpdk"].append(src)
     for r in rows:
         src["enc"][str(r["workers"])] = r["enc"]
         src["dec"][str(r["workers"])] = r["dec"]
+        if r["enc_cyc"]:
+            src["enc_cyc"][str(r["workers"])] = r["enc_cyc"]
+        if r["dec_cyc"]:
+            src["dec_cyc"][str(r["workers"])] = r["dec_cyc"]
     if rows:
         src["size"] = rows[0]["size"]
     if args.hz:
@@ -149,26 +164,29 @@ def plot(data, out):
     ax.axhline(p4_tapfree, color="gray", ls=":", lw=1.5,
                label=f"P4 single instance (tap-free ~{p4_tapfree:.2f})")
     ax.axvspan(7.6, 12, color="green", alpha=0.07)
-    ax.text(8.1, ax.get_ylim()[1]*0.03,
+    ylo, yhi = ax.get_ylim()
+    ax.text(8.1, ylo + (yhi - ylo) * 0.06,
             "PMD sized past the 8-QP default (max_nb_queue_pairs) -> W>8 runs",
-            fontsize=8, color="green")
+            fontsize=8, color="green", va="bottom")
     ax.set_xlabel("packet workers (-n)")
     ax.set_ylabel("encrypt Mpps (tap-free, 64B)")
     ax.set_title("DPDK dataplane scaling - both boxes, both crypto PMDs (fwd_bench)")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper left")
 
-    # (b) cycles/pkt efficiency (64B enc)
+    # (b) efficiency: the bench's measured per-worker enc cyc/pkt (its own
+    # column), not aggregate Mpps turned into a fake cyc/pkt.
     ax = fig.add_subplot(gs[1, 0])
     for s in dpdk:
-        hz_i = float(s.get("hz", 3.19e9))
-        xs = sorted(int(k) for k in s["enc"])
-        ax.plot(xs, [hz_i/(s["enc"][str(x)]*1e6) for x in xs],
+        if not s.get("enc_cyc"):
+            continue  # collected before cyc/pkt was kept; nothing honest to plot
+        xs = sorted(int(k) for k in s["enc_cyc"])
+        ax.plot(xs, [s["enc_cyc"][str(x)] for x in xs],
                 styles.get(s["pmd"], "o-"),
                 label=f"{s['box']} {s['pmd']}", ms=6)
     ax.set_xlabel("packet workers (-n)")
-    ax.set_ylabel("cycles/pkt (64B encrypt, lower=better)")
-    ax.set_title("Dataplane efficiency")
+    ax.set_ylabel("enc cyc/pkt (per-worker, lower=better)")
+    ax.set_title("Per-worker efficiency (fwd_bench enc_cyc_pkt)")
     ax.grid(True, alpha=0.3)
     ax.legend()
 
@@ -186,7 +204,8 @@ def plot(data, out):
     colors = (["#4C72B0"] + ["#55A868"]*len(dpdk_tapfree) + ["#4C72B0", "#DD8452"])
     ax.bar(labels, vals, color=colors)
     for i, v in enumerate(vals):
-        ax.text(i, v, (f"{v:.2f}" if v > 1 else f"{v*1e3:.0f}K"),
+        # honest label: axis is Mpps, so a 1.00 value is "1.00", NOT "1000K"
+        ax.text(i, v, f"{v:.2f}" if v >= 1 else f"{v*1e3:.0f}K",
                 ha="center", va="bottom", fontsize=9)
     ax.set_ylabel("Mpps")
     ax.set_title("Tap-free dataplane vs real I/O via shared net_tap (.165, 64B)")

@@ -53,15 +53,21 @@ for x in "$W:$A_CPUS" "$B_W:$B_CPUS"; do
 done
 # PMD=aesni_mb|openssl (crypto PMD), HUGE=1: use hugepages (default --no-huge)
 PMD=${PMD:-aesni_mb}; MEM="--no-huge -m 1024"; [ "${HUGE:-0}" = 1 ] && MEM="-m 1024"
-EAL="$MEM --no-pci --no-telemetry --vdev=crypto_${PMD}0 --log-level=lib.*:error"
+# Cryptodev PMDs default to 8 queue pairs; size the device to each side's
+# worker count or -n above 8 is refused (no silent clamp in r2dp-fwd).
+EAL="--no-pci --no-telemetry --log-level=lib.*:error"
+CRYPTODEV_A="--vdev=crypto_${PMD}0,max_nb_queue_pairs=$W"
+CRYPTODEV_B="--vdev=crypto_${PMD}0,max_nb_queue_pairs=$B_W"
 if [ "${LOOP:-0}" != 1 ]; then
-"$FWD" -s "$D/a.sock" -n "$W" --lcores "$(lcores "$A_CPUS")" $EAL --file-prefix r2a$$ \
+"$FWD" -s "$D/a.sock" -n "$W" --lcores "$(lcores "$A_CPUS")" $MEM $EAL $CRYPTODEV_A \
+	--file-prefix r2a$$ \
 	--vdev=net_memif0,role=server,socket=$D/ab.sock \
 	--vdev=net_memif1,role=server,socket=$D/ai.sock >"$D/a.out" 2>&1 &
 PIDS="$PIDS $!"
 # B's outer memif is a client of A's: A's socket must exist first
 for _ in $(seq 100); do [ -S "$D/ab.sock" ] && [ -S "$D/a.sock" ] && break; sleep 0.1; done
-"$FWD" -s "$D/b.sock" -n "$B_W" --lcores "$(lcores "$B_CPUS")" $EAL --file-prefix r2b$$ \
+"$FWD" -s "$D/b.sock" -n "$B_W" --lcores "$(lcores "$B_CPUS")" $MEM $EAL $CRYPTODEV_B \
+	--file-prefix r2b$$ \
 	--vdev=net_memif0,role=client,socket=$D/ab.sock \
 	--vdev=net_memif1,role=server,socket=$D/bi.sock >"$D/b.out" 2>&1 &
 PIDS="$PIDS $!"

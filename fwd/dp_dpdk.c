@@ -913,10 +913,17 @@ crypto_init(struct dpdk_priv *d)
 	d->cdev_id = (uint8_t)id;
 	rte_cryptodev_info_get(d->cdev_id, &d->cdev_info);
 	if (d->cdev_info.max_nb_queue_pairs < d->nb_wk) {
-		fprintf(stderr, "r2dp-fwd: %s has %u queue pairs; -n %u clamped\n",
+		/* Fail closed rather than silently running fewer workers than
+		 * requested: a clamped -n looks like scaling but is not.  Raise the
+		 * device's queue pairs at creation, e.g.
+		 * --vdev='crypto_openssl0,max_nb_queue_pairs=12'. */
+		fprintf(stderr, "r2dp-fwd: %s only has %u queue pairs but -n %u was "
+		    "requested; add max_nb_queue_pairs=<n> to the --vdev so the "
+		    "device can serve %u queue pairs, or refuse to start with "
+		    "fewer (no silent clamp).\n",
 		    rte_cryptodev_name_get(d->cdev_id),
-		    d->cdev_info.max_nb_queue_pairs, d->nb_wk);
-		d->nb_wk = RTE_MAX(1u, d->cdev_info.max_nb_queue_pairs);
+		    d->cdev_info.max_nb_queue_pairs, d->nb_wk, d->nb_wk);
+		return -EINVAL;
 	}
 	memset(&cconf, 0, sizeof(cconf));
 	cconf.socket_id = SOCKET_ID_ANY;
@@ -1042,7 +1049,15 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		free(d);
 		return -ENOMEM;
 	}
-	(void)crypto_init(d);      /* none: ESP is dropped, IKE still flows */
+	ret = crypto_init(d);
+	/* -ENODEV: no crypto device found -- tolerate, ESP is dropped and IKE
+	 * still flows.  Any other failure (device present but too few queue
+	 * pairs for -n, configure/setup errors) must refuse to start rather than
+	 * silently drop ESP or under-provision workers. */
+	if (ret < 0 && ret != -ENODEV) {
+		free(d);
+		return ret;
+	}
 
 	{
 		struct rte_ipsec_sad_conf conf;

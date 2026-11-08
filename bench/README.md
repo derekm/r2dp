@@ -76,7 +76,8 @@ modprobe vfio-pci
 dpdk-devbind.py -b vfio-pci 0000:3b:00.0 0000:3b:00.1   # inner, outer
 # 4 workers on cores 1-5 of the NIC's NUMA node
 build-bench/fwd/r2dp-fwd -s /run/r2dp.sock -n 4 --lcores '0@0,1@1,2@2,3@3,4@4' \
-    -a 0000:3b:00.0 -a 0000:3b:00.1 --vdev=crypto_aesni_mb0
+    -a 0000:3b:00.0 -a 0000:3b:00.1 \
+    --vdev='crypto_aesni_mb0,max_nb_queue_pairs=4'
 ```
 
 With several workers each port gets one RX and one TX queue per worker;
