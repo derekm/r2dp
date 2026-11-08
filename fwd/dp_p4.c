@@ -348,8 +348,15 @@ static uint32_t p4_flow_slice(struct p4_priv *pr, const struct rte_mbuf *m)
 	{
 		const uint8_t *ip = d + 14;
 		uint8_t proto = ip[9];
-		uint32_t dst;
-		memcpy(&dst, ip + 16, 4);
+		/* IPv4 fragment flags/offset (bytes 6-8): offset (8-byte units) is
+		 * the low 13 bits; MF (more-fragments) is bit 14 of byte 6.
+		 * A NON-FIRST fragment carries NO transport header (no UDP dport,
+		 * no ESP header), so ports/SPI are unreadable there -- hash it on
+		 * the fragment-invariant (proto, src, dst) so every fragment of one
+		 * datagram stays on the same slice as the first. */
+		uint16_t frag = ((uint16_t)ip[6] << 8) | ip[7];
+		int mf =     (frag >> 13) & 1;   /* more-fragments */
+		uint16_t fo = frag & 0x1fff;     /* fragment offset (8-byte units) */
 		if (proto == 50) {
 			/* ESP: pin on the outer IP flow (src, dst) -- NOT
 			 * (dst + SPI).  Fragments arrive as separate outer
@@ -363,6 +370,27 @@ static uint32_t p4_flow_slice(struct p4_priv *pr, const struct rte_mbuf *m)
 			memcpy(bb, ip + 12, 4);          /* src */
 			memcpy(bb + 4, ip + 16, 4);      /* dst */
 			n = 8;
+		} else if (proto == 17 && fo == 0 && !mf && l >= 14 + 20 + 8 &&
+			   ip[22] == 0x11 && ip[23] == 0x94) {
+			/* ESP-in-UDP (RFC 3948): proto 17, unfragmented FIRST
+			 * frame, UDP dst port 4500 (0x1194).  The parser
+			 * (nat_demux) treats this as ESP when the first 32
+			 * bits after UDP are a non-zero SPI, so it carries
+			 * per-SA state in the extern -- hash it like ESP on
+			 * (src,dst) so the same SA's ESP-in-UDP and its
+			 * fragments stay on one slice. */
+			memcpy(bb, ip + 12, 4);          /* src */
+			memcpy(bb + 4, ip + 16, 4);      /* dst */
+			n = 8;
+		} else if (fo != 0 || mf) {
+			/* Non-first fragment (any proto): no transport header.  Hash on
+			 * (proto, src, dst) so all fragments of one datagram -- incl. a
+			 * fragmented ESP-in-UDP flow, whose first fragment hashes
+			 * (src,dst) above -- land on the same slice as the first. */
+			bb[0]=ip[12]; bb[1]=ip[13]; bb[2]=ip[14]; bb[3]=ip[15];
+			bb[4]=proto;
+			memcpy(bb + 5, ip + 16, 4);
+			n = 9;
 		} else if (l >= 14 + 20 + 8) {  /* 5-tuple incl. TCP/UDP */
 			/* src(4) proto(1) dst(4) sport(2) dport(2) = 13B */
 			bb[0]=ip[12]; bb[1]=ip[13]; bb[2]=ip[14]; bb[3]=ip[15];
@@ -431,6 +459,8 @@ static void *p4_io_worker(void *arg)
 		if (pr->outer_port >= 0) {
 			unsigned s;
 			for (s = 0; s < pr->n_inst; s++) {
+				if (!pr->inst[s].out0)
+					continue;   /* ring lookup failed at start */
 				struct rte_mbuf *pkts[P4_BURST_SZ];
 				uint16_t n = rte_ring_dequeue_burst(
 					pr->inst[s].out0, (void **)pkts,
@@ -438,7 +468,7 @@ static void *p4_io_worker(void *arg)
 				if (!n)
 					continue;
 				tx = rte_eth_tx_burst(pr->outer_port, 0,
-						      pkts, n);
+					      pkts, n);
 				pr->inst[s].c_out0 += tx;
 				for (k = tx; k < n; k++)
 					rte_pktmbuf_free(pkts[k]);
@@ -447,6 +477,8 @@ static void *p4_io_worker(void *arg)
 		if (pr->inner_port >= 0) {
 			unsigned s;
 			for (s = 0; s < pr->n_inst; s++) {
+				if (!pr->inst[s].out1)
+					continue;
 				struct rte_mbuf *pkts[P4_BURST_SZ];
 				uint16_t n = rte_ring_dequeue_burst(
 					pr->inst[s].out1, (void **)pkts,
@@ -1457,11 +1489,11 @@ static int p4_start(struct fwd_dp *dp)
 	 * ethdev RX queue a single consumer. */
 	if (!getenv("R2DP_P4_BENCH") && pr->outer_port >= 0) {
 		if (pthread_create(&pr->rx_th, NULL, p4_io_worker, pr) != 0) {
-			P4_LOG("rx distributor create failed");
+			P4_LOG("io worker create failed");
 			return -EIO;
 		}
 		pr->rx_started = 1;
-		P4_LOG("rx distributor started (%u slices, hash steer)", pr->n_inst);
+		P4_LOG("io worker started (%u slices, hash steer)", pr->n_inst);
 	}
 
 	pr->started = 1;
@@ -2300,8 +2332,24 @@ static void p4_stop(struct fwd_dp *dp)
 	struct p4_priv *pr = dp->priv;
 	/* Tear down every slice.  Always free whatever was allocated, even on a
 	 * partial start (the probe calls stop on failure).  `started` is not the
-	 * only guard. */
-	atomic_store_explicit(&pr->inst[0].running, 0, __ATOMIC_RELAXED);
+	 * only guard.
+	 *
+	 * ORDER: stop and join the PRODUCERS (slices) FIRST, then the io thread
+	 * last.  The io thread drains every slice's egress rings; if it exits
+	 * while slices 1..N-1 still enqueue, those mbufs are abandoned when the
+	 * pipeline is freed below.  So clear every slice's running, join them,
+	 * and only then stop+join the io thread (which exits once no slice runs). */
+	{
+		unsigned s;
+		for (s = 0; s < pr->n_inst; s++)
+			atomic_store_explicit(&pr->inst[s].running, 0, __ATOMIC_RELAXED);
+		for (s = 0; s < pr->n_inst; s++) {
+			if (pr->inst[s].th_started) {
+				pthread_join(pr->inst[s].th, NULL);
+				pr->inst[s].th_started = 0;
+			}
+		}
+	}
 	if (pr->rx_started) {
 		pthread_join(pr->rx_th, NULL);
 		pr->rx_started = 0;
@@ -2309,12 +2357,6 @@ static void p4_stop(struct fwd_dp *dp)
 	{
 		unsigned s;
 		for (s = 0; s < pr->n_inst; s++) {
-			atomic_store_explicit(&pr->inst[s].running, 0,
-					      __ATOMIC_RELAXED);
-			if (pr->inst[s].th_started) {
-				pthread_join(pr->inst[s].th, NULL);
-				pr->inst[s].th_started = 0;
-			}
 			if (pr->inst[s].ctl)
 				rte_swx_ctl_pipeline_free(pr->inst[s].ctl);
 			if (pr->inst[s].ipsec)

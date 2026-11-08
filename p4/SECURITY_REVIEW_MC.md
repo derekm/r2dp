@@ -258,6 +258,24 @@ per-slice best_cyc_pkt pps):**
   uint32s; the correct key is { ntohl(dip), ntohl(spi) } in BOTH fields.
   Live N=2 openssl: ib hit 0->380, crypto enq=deq 0->288 for 300 distinct
   ESP seqs (previously 0).  N=1 bench gate unchanged.
+- **VERIFIED (`XX`) fourth-round review `deleg_4f8cf2ac` (fragment
+   steering + teardown), re-proven live:**
+  - ESP-in-UDP (RFC 3948, proto 17 / UDP 4500, which the parser's
+    `nat_demux` treats as ESP) now hashes on the fragment-invariant outer
+    (src,dst) like proto-50 ESP, and ANY non-first fragment (fo!=0 or MF)
+    hashes on (proto, src, dst) -- so one SA's proto-50 ESP, its ESP-in-UDP,
+    and all their fragments stay on ONE slice (reassembly + per-SA replay
+    are single-owner).  Previously only proto==50 was special-cased, so a
+    4500 flow fell into the 5-tuple branch and its fragments could scatter.
+  - `p4_stop` now stops/joins the PRODUCERS (slices) first, then the io
+    thread last -- the io thread drains every slice's egress rings, so
+    joining it before slices 1..N-1 had stopped abandoned in-flight mbufs.
+  - io thread TX loop NULL-guards `out0`/`out1` ring ptrs.
+  - Log/comment renames: `io worker started` / "io worker create failed"
+    (was "rx distributor"), matching the p4_io_worker rename.
+  - Re-proven live on .165 N=2 (openssl, root tap): pre-delete
+    ob_hit=15855 a6=15855 crypto enq=deq=15840; post `sp-del` ob_miss=16526
+    a7=16526.  N=1 gate 2512 cyc, W=2 ~2659 each -- unchanged.
 - **VERIFIED (`be57676`) third-round review `deleg_ce36234f` (harness +
    atomicity), re-proven live:**
   - `bench/p4_live_proof.sh` is FIXED and now actually runs its injector
