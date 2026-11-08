@@ -423,11 +423,16 @@ mt_tunnels(struct dpdk_priv *a, struct dpdk_priv *b, unsigned nw)
 	return 0;
 }
 
+/* Human-readable benchmark table. When --json emits to stdout (json=="-"),
+ * this is set to stderr so stdout carries only the JSON document; otherwise
+ * it corrupts it. Default stdout so a normal run's table still prints. */
+static FILE *hout;   /* set in main: stdout normally, stderr under --json */
+
 static int
 mt_run(struct dpdk_priv *a, struct dpdk_priv *b, unsigned nw, const int *sizes,
     int nsz, int runs, double hz, FILE *jf, const char *pmdname)
 {
-	printf("  size workers  enc cyc/pkt  enc Mpps (sum)  dec cyc/pkt  "
+	fprintf(hout, "  size workers  enc cyc/pkt  enc Mpps (sum)  dec cyc/pkt  "
 	    "dec Mpps (sum)\n");
 	if (jf)
 		fprintf(jf, "{\"bench\":\"fwd_bench\",\"pmd\":\"%s\",\"workers\":%u,"
@@ -451,7 +456,7 @@ mt_run(struct dpdk_priv *a, struct dpdk_priv *b, unsigned nw, const int *sizes,
 			ce += mt_enc[w] / nw; cd += mt_dec[w] / nw;
 			me += hz / mt_enc[w] / 1e6; md += hz / mt_dec[w] / 1e6;
 		}
-		printf("  %4d %7u  %11.0f  %14.2f  %11.0f  %14.2f\n", sizes[z], nw,
+		fprintf(hout, "  %4d %7u  %11.0f  %14.2f  %11.0f  %14.2f\n", sizes[z], nw,
 		    ce, me, cd, md);
 		if (jf)
 			fprintf(jf, "%s\n {\"size\":%d,\"workers\":%u,"
@@ -514,6 +519,8 @@ main(int argc, char **argv)
 			return 2;
 		}
 	}
+	/* When JSON goes to stdout, keep stdout clean: human table to stderr. */
+	hout = json ? stderr : stdout;
 	if (nsz < 1 || ntun < 1 || runs < 1 || runs > MAXRUNS || nw < 1 ||
 	    nw > DP_MAX_WK ||
 	    (strcmp(pmd, "auto") && strcmp(pmd, "openssl") &&
@@ -564,7 +571,7 @@ main(int argc, char **argv)
 			dp_wk_init(b, (unsigned)w);
 		}
 		if (mt_tunnels(a, b, (unsigned)nw)) { puts("tunnel setup FAILED"); return 1; }
-		printf("fwd_bench: crypto_%s, %d workers, %d-packet bursts, %d "
+		fprintf(hout, "fwd_bench: crypto_%s, %d workers, %d-packet bursts, %d "
 		    "packets/worker, warmup + median of %d, TSC %.2f GHz\n",
 		    pmdname, nw, BURST, NPKT, runs, hz / 1e9);
 		if (json && !(jf = strcmp(json, "-") ? fopen(json, "w") : stdout)) {
@@ -590,10 +597,10 @@ main(int argc, char **argv)
 	    add_sp(b, 1, R2DP_DIR_IN, "10.2.0.0", "10.1.0.0", "192.0.2.1", "192.0.2.2")) {
 		puts("tunnel setup FAILED"); return 1;
 	}
-	printf("fwd_bench: crypto_%s, %d-packet bursts, %d packets, "
+	fprintf(hout, "fwd_bench: crypto_%s, %d-packet bursts, %d packets, "
 	    "warmup + median of %d, TSC %.2f GHz\n", pmdname, BURST, NPKT, runs,
 	    hz / 1e9);
-	printf("  size tunnels   enc cyc/pkt  enc Mpps   dec cyc/pkt  dec Mpps\n");
+	fprintf(hout, "  size tunnels   enc cyc/pkt  enc Mpps   dec cyc/pkt  dec Mpps\n");
 	for (int k = 0; k < ntun; k++) {
 		while (have < tunnels[k])
 			if (add_tunnel(a, b, have++)) { puts("tunnel setup FAILED"); return 1; }
@@ -601,7 +608,7 @@ main(int argc, char **argv)
 			if (measure(a, b, 0, (unsigned)sizes[z], runs, &enc[z][k], &dec[z][k])) {
 				puts("FAIL measure"); return 1;
 			}
-			printf("  %4d %7d   %11.0f  %8.2f   %11.0f  %8.2f\n",
+			fprintf(hout, "  %4d %7d   %11.0f  %8.2f   %11.0f  %8.2f\n",
 			    sizes[z], tunnels[k], enc[z][k], hz / enc[z][k] / 1e6,
 			    dec[z][k], hz / dec[z][k] / 1e6);
 			if (steer) {
@@ -609,7 +616,7 @@ main(int argc, char **argv)
 				if (measure_steer(a, b, (unsigned)sizes[z], runs, &si, &so)) {
 					puts("FAIL steer"); return 1;
 				}
-				printf("               steer: inner %.0f outer %.0f cyc/pkt\n",
+				fprintf(hout, "               steer: inner %.0f outer %.0f cyc/pkt\n",
 				    si, so);
 			}
 		}
@@ -621,14 +628,14 @@ main(int argc, char **argv)
 		for (int z = 0; z < nsz && t > 0; z++) {
 			double se = enc[z][t] / enc[z][0], sd = dec[z][t] / dec[z][0];
 			int ok = se <= ms && sd <= ms;
-			printf("%s %4dB scaling %d->%d tunnels: enc x%.2f dec x%.2f (max x%.2f)\n",
+			fprintf(hout, "%s %4dB scaling %d->%d tunnels: enc x%.2f dec x%.2f (max x%.2f)\n",
 			    ok ? "ok  " : "FAIL", sizes[z], tunnels[0], tunnels[t],
 			    se, sd, ms);
 			fails += !ok;
 		}
 		if (mc > 0) {
 			int ok = enc[0][0] <= mc && dec[0][0] <= mc;
-			printf("%s %dB, %d tunnel(s): enc %.0f dec %.0f cyc/pkt (max %.0f)\n",
+			fprintf(hout, "%s %dB, %d tunnel(s): enc %.0f dec %.0f cyc/pkt (max %.0f)\n",
 			    ok ? "ok  " : "FAIL", sizes[0], tunnels[0], enc[0][0],
 			    dec[0][0], mc);
 			fails += !ok;

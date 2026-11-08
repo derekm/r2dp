@@ -89,6 +89,17 @@ SWX pipeline instance on the box; a multicore P4 layout (multiple pipeline
 instances straddling traffic by RSS/hash) is the path to scaling aggregate
 throughput.
 
+DPDK scales past single instance: on the 12-core i7-8700 (`fwd_bench
+--workers N`), openssl reaches ~16 Mpps and aesni ~27 Mpps encrypt at 64B
+over 11 workers (`nw+1` lcores), given a cryptodev created with
+`max_nb_queue_pairs=<nw>` (both PMDs default to 8 queue pairs, which would
+silently cap the run at 8 workers) and `dp_max_wk` raised past the old
+DP_MAX_WK=8 ceiling.  `bench/curves.py` regenerates `bench/curves.png` from
+real `fwd_bench --json` runs: `plot` renders the committed
+`curves_data.json`; `collect --from-json` (or `--bin`) folds fresh runs into
+it, with DPDK tap-free plotted alongside P4 tap-free and the net_tap wall in
+the bottom-right panel.
+
 **Known open points (current state):**
 - `sa_set_hard_bytes` / `sa_set_hard_time` are unset (NULL) on the P4 backend,
   so byte/time hard-lifetime enforcement is control-side (ctl) only, not
