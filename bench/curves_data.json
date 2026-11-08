@@ -139,7 +139,7 @@
   "tapless_mpps": 1.0,
   "tap_mpps": 0.132,
   "dpdk_tap_mpps": 0.252,
-  "note": "P4 tap-free = R2DP_P4_BENCH single SWX instance. P4/DPDK net_tap = bench/p4_bench.sh shared I/O path (.165, 64B); the tap is the wall. DPDK series from bench/fwd_bench (both PMDs, both boxes, tap-free). P4 runs one SWX pipeline (single instance); the 'sweep' map below is per packet size x crypto PMD (tap-free). tapless_mpps is the historical .165 openssl 64B anchor (0.99 in sweep).",
+  "note": "P4 tap-free = R2DP_P4_BENCH single SWX instance. P4/DPDK net_tap = bench/p4_bench.sh shared I/O path (.165, 64B); the tap is the wall. DPDK series from bench/fwd_bench (both PMDs, both boxes, tap-free). P4 runs one SWX pipeline (single instance); the 'sweep' map below is per packet size x crypto PMD (tap-free). tapless_mpps is the historical .165 openssl 64B anchor (0.99 in sweep). P4 core sweep = aggregate Mpps (sum of per-slice tap-free pps) vs R2DP_P4_WORKERS; each slice a pinned pipeline replica with its own ipsec extern + pool.",
   "sweep": {
    ".179 (12-core)": {
     "openssl": {
@@ -185,6 +185,43 @@
       0.66,
       3794
      ]
+    }
+   }
+  },
+  "core_sweep": {
+   ".165 (4-core)": {
+    "openssl": {
+     "1": {
+      "mpps": 0.997591
+     },
+     "2": {
+      "mpps": 1.8842759636432684
+     },
+     "3": {
+      "mpps": 2.6126506406800023
+     },
+     "4": {
+      "mpps": 3.3444591255273384
+     }
+    }
+   },
+   ".179 (12-core)": {
+    "aesni_mb": {
+     "1": {
+      "mpps": 1.728024
+     },
+     "2": {
+      "mpps": 3.239642549675864
+     },
+     "4": {
+      "mpps": 4.85542528874277
+     },
+     "6": {
+      "mpps": 5.780509927966747
+     },
+     "8": {
+      "mpps": 6.6054901472557415
+     }
     }
    }
   }
