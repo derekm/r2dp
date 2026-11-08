@@ -187,7 +187,7 @@ per-slice best_cyc_pkt pps):**
   and `slice i OUT BIND installed` with the same selector; each shard's
   extern gets its own sa_id.
 
-**Status at this commit:**
+**Status at this commit (`d23eb26`):**
 - VERIFIED (bench path): N=1 regression, per-shard build/start/fan-out,
   one cryptodev N QPs, per-shard pipeline/extern/pool/rings, core pinning,
   N-worker bench, honest aggregate, no pool OOM under `-m 1024`.
@@ -205,11 +205,24 @@ per-slice best_cyc_pkt pps):**
   function (fixed xor-fold seed, no state/env), so same (flow, N) => same
   slice on every launch; checked deterministically for representative ESP +
   5-tuple flows across N=1..8.
-- Remaining for a full APPROVE (procedures, not missing code): live
-  replay/seq-integrity assertion (same-flow monotonic seq on the pinned
-  shard) -- the steering makes this possible by construction (per-SA
-  affinity) but an explicit multi-packet replay test is still worth running
-  in review.
+- **VERIFIED (independent review, `deleg_c61620f6`) fixes in `7ff16bc`:**
+  - outbound `SA_DEL` no longer falls through into the inbound cleanup
+    (previously deleted SA id 0 on every slice); the `return` is restored.
+  - fan-out is all-or-nothing on the schedule phase: `spd_bind` / `sp_del`
+    abort EVERY shard on the first schedule failure (no pending delete
+    left to commit later = no delayed bypass drop); `sp_add` already did.
+  - `R2DP_P4_WORKERS > R2DP_P4_MAX_INST (8)` now REFUSES (-EINVAL) rather
+    than silently clamping, so the plane is never under-provisioned vs.
+    what the operator asked for.
+- Remaining for a full APPROVE (procedures, not missing code):
+  - live replay/seq-integrity assertion (same-flow monotonic seq on the
+    pinned shard) -- steering makes this possible by construction (per-SA
+    affinity) but an explicit multi-packet replay test is still a reviewer
+    action.
+  - The bench W=1 "restates the historical figure" claim is a **bench**
+    gate; the live-path N=1 delete/affinity behavior was re-proven in
+    review (two outbound SAs, delete id 1 keeps id 0) but should be run
+    again after the 7ff16bc fixes.
 
 **Checks on the live path (memif/tap), not just bench:**
 - per-SA affinity: `p4_live_proof.sh` proves a flow steers to one shard
