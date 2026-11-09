@@ -242,16 +242,28 @@ per-slice best_cyc_pkt pps):**
 - REMOVED honest overclaims: the commit-phase of cross-slice fan-out is
   documented in `p4_spd_bind`/`p4_sp_del`/`p4_sp_add` as inherently
   per-pipeline (a slice whose commit already succeeded cannot be rolled
-  back in one-shot; the common failure is symmetric).  An explicit live
-  multi-packet replay test on the P4 INBOUND path is still NOT verified:
-  the harness frames now demonstrably hit the inbound SAD and reach crypto
-  (ib hit=380, crypto enq=deq=288) but no synthetic frame yet yields a
-  decrypting far-leg inner frame (out1 stayed 0 on BOTH the P4 and the
-  proven DPDK backend -- the P4 run used Ethernet-framed ESP while the DPDK
-  backend ingests bare IP, so the comparison is not a clean ICV discriminator
-  and the decrypt/egress + replay window were never exercised).  Replay-state
-  single-ownership is guaranteed by construction (per-slice extern +
-  steering) but the live demonstration remains a reviewer action.
+  back in one-shot; the common failure is symmetric).  Status of the live
+  decrypt + replay demonstration:
+  - **Inbound DECRYPT now demonstrated (`d76acb2`).** The extern
+    `ipsec_xform.spi` was being programmed in NETWORK order
+    (`sp.encap.esp.spi = sa->spi`), so `rte_ipsec_pkt_crypto_prepare`
+    could not match a session and every inbound frame stayed enq=0 even
+    after a correct SAD hit.  Fixed to HOST order (`ntohl(sa->spi)`),
+    mirroring exactly what the DPDK backend programs (`dp_gcm.c:79 ->
+    ntohl(rsa->spi)`) and what the SAD stores (`dpdk_sad.c`).  With the
+    fix, a framed-AES-GCM inbound stimulus decrypts and EGRESSES the inner
+    leg: `crypto enq=deq=288, ib hit 0->300, inner-out 0->288`.  The
+    far-leg inner frame is now real (verified, same stimulus on the real
+    peer path is pending).
+  - **Real independent-peer e2e on P4 is NOT yet verified.** The scapy
+    gateway on the same binary SAD-hits (`ib hit=15`) but `crypto enq=0`;
+    the synthetic stimulus that decrypts is not yet matched by the real
+    peer.  This remains a reviewer action.
+  - **Per-slice replay-window drop on P4 is NOT yet verified.** The stock
+    DPDK 24.11 extern hardcodes `replay_win_sz = 0` / `options.esn = 0`
+    (anti-replay off), so a live seq-drop cannot be claimed on unpatched
+    DPDK; a host `.so` patch is not a product fix.  This is a reviewer
+    action.
 - **VERIFIED (`191aaf2`) inbound SAD key byte order:** the (dip,spi) exact
   key was built as host dip + NETWORK spi, so no inbound frame ever matched
   (ib hit=0, crypto enq=0).  SWX exact-matches the parse fields as HOST
