@@ -1707,15 +1707,20 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		}
 		memcpy(sp.crypto.aead.key, blob, blen);
 		sp.crypto.aead.key_size = (uint32_t)blen;   /* key || salt */
-		/* The extern's ipsec_xform.spi must be HOST-order (matches what the
-		 * DPDK backend programs: dp_gcm.c "spi = ntohl(rsa->spi)", and the
-		 * SAD lookup in dpdk_sad.c).  ctl hands sa->spi as network order
-		 * (htonl at parse), so decrypt needs ntohl to find the matching SA in
-		 * rte_ipsec_pkt_crypto_prepare; the raw network-order value made the
-		 * byte-swapped SPI fail to match in rte_ipsec for the synthetic
-		 * framed decrypt path (enq=0).  The real-peer e2e still shows ib=15 /
-		 * crypto enq=0 even on this fixed binary -- that residual is a
-		 * separate RX/steering defect, not this SPI byte order. */
+		/* The extern's ipsec_xform.spi must be HOST-order.  rte_swx_ipsec
+		 * copies sp.encap.esp.spi straight into ipsec_xform.spi (no swap),
+		 * and rte_ipsec stores it as sa->spi = rte_cpu_to_be_32(xform.spi)
+		 * (lib/ipsec/sa.c) -- host order in, network order on the wire.
+		 * This mirrors the DPDK backend (dp_gcm.c "spi = ntohl(rsa->spi)",
+		 * dpdk_sad.c).  ctl hands sa->spi as network order (htonl at parse),
+		 * so the raw value would be byte-swapped on the wire and in the GCM
+		 * AAD (aead_gcm_aad_fill uses sa->spi): a mismatched AAD fails ICV in
+		 * rte_ipsec_pkt_process after enqueue (enq and deq both move, inner
+		 * egress stays 0).  ntohl makes the wire SPI + AAD correct.  NOTE:
+		 * this is NOT the cause of the real-peer crypto enq=0 -- DPDK picks
+		 * the SA by sa_id (meta), not by packet SPI, so a swapped SPI would
+		 * still prepare and enqueue.  The real-peer ib=15 / crypto enq=0
+		 * residual is a separate, unexplained defect. */
 		sp.encap.esp.spi = ntohl(sa->spi);
 		sp.encap.tunnel_mode = (sa->mode == R2DP_MODE_TUNNEL);
 		sp.encap.tunnel_ipv4 = 1;
