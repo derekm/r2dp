@@ -261,7 +261,12 @@ per-slice best_cyc_pkt pps):**
     `crypto enq=deq=288, ib hit 0->300, inner-out 0->288`.  The far-leg
     inner frame is now real (verified, same stimulus on the real peer
     path is pending).  The real-peer `ib=15 / crypto enq=0` residual is a
-    separate, unexplained defect, not this SPI byte order.
+    separate, unexplained defect, not this SPI byte order.  Verified
+    live (2026-11-09): a clear frame on the inner leg hitting the OUTBOUND
+    PROTECT SA installed with spi=0x2000 egresses outer ESP with wire SPI
+    bytes `00 00 20 00` (tcpdump decodes `ESP(spi=0x00002000)`), with
+    `ob_hit=300, a6=300, crypto enq=deq=288, out0=288` -- the ntohl fix
+    also produces the correct outbound wire SPI, not a double-swap.
   - **Real independent-peer e2e on P4 is NOT yet verified.** The scapy
     gateway on the same binary SAD-hits (`ib hit=15`) but `crypto enq=0`;
     the synthetic stimulus that decrypts is not yet matched by the real
