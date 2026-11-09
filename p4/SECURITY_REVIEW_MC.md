@@ -270,7 +270,7 @@ per-slice best_cyc_pkt pps):**
   - **Real independent-peer e2e on P4 is NOT yet verified.** The scapy
     gateway on the same binary SAD-hits (`ib hit=15`) but `crypto enq=0`;
     the synthetic stimulus that decrypts is not yet matched by the real
-    peer.  Two independent blockers remain:
+    peer.  Two independent blockers, one now fixed:
     - (a) **Real-peer `crypto enq=0` despite `ib hit / a0` moving** on the
       same binary that decrypts replayed synthetic *and* the captured
       real-peer bytes.  Session isolation (not re-run by review): the
@@ -293,27 +293,22 @@ per-slice best_cyc_pkt pps):**
       `ipsec_port_out_inbound` was 2 in the live peer's process and why
       `crypto enq` stayed 0 (prepare failing vs cryptodev vs SA session).
       N=1 reproduces it, so it is not slicing.
-    - (b) **`next_hop_set` installs all-zero MACs.**  `fwd/dp_p4.c`
-      `p4_start` programs `next_hop_table_0` action data by zeroing `ab[]`
-      and setting only `ether_type` (0x0800) and `port_id` -- the
-      `next_hop_set(dst_addr, src_addr, ether_type, port_id)` action's
-      `dst_addr`/`src_addr` field are both left `00:00:00:00:00:00`.
-      Every processed frame (including a decrypted inner frame) egresses
-      with a zero L2 destination.  An AF_PACKET sniff/peer (outer leg)
-      sees it regardless, but the INNER host (real kernel 10.2.0.2 on the
-      inner tap) drops a frame dstd to `00:00:00:00:00:00`, so the ICMP
-      reply can never return -- the real-peer round trip cannot pass even
-      after decrypt is fixed.  Fix direction, corrected per review: the
-      inner egress MUST NOT be a learned peer MAC -- the kernel will not
-      transmit until it has accepted a unicast frame, so learning cannot
-      bootstrap the inner leg.  The inner hop's dst/src should be
-      `rte_eth_macaddr_get(inner_port)` read at `p4_start`
-      (`dp_dpdk.c:281-294` sets inner dst+src to the tap's own MAC;
-      `nh_learn` is outer IKE/ESP only, `dp_dpdk.c:164-196`).  The outer
-      hop uses the learned peer MAC.  Also note id0/id1 install/commit are
-      log-only (`dp_p4.c:1360-1369`) and a failed `next_hop` install is a
-      silent drop, not a zero-MAC frame -- a preserve/`10/8` lookup will
-      not surface as a MAC bug.
+    - (b) **`next_hop_set` installs all-zero MACs -- FIXED (`8cfc4b6`).**
+      `p4_start` had programmed `next_hop_table_0` id0/id1 with zeroed
+      `ab[]` except ether_type/port, so both hop dst/src were
+      `00:00:00:00:00:00`.  An AF_PACKET sniff/peer (outer leg) sees a
+      frame regardless, but the INNER host (real kernel on the inner tap)
+      drops a frame dstd to `00:00:00:00:00:00`, so the ICMP reply could
+      never return.  Fix (`8cfc4b6`): read `rte_eth_macaddr_get(inner_port)`
+      in `p4_io_init` and rewrite the id1 (inner) next-hop entry dst+src to
+      that MAC for every slice after io_init discovers the legs.  This
+      mirrors `dp_dpdk.c` `our_inner_mac` and the DPDK reference note that
+      a broadcast dst makes `tcp_v4_rcv` drop before counting InSegs.  It
+      is a prerequisite for any inner reply regardless of blocker (a); it
+      does not by itself explain `crypto enq=0`.  Outer hop still uses the
+      learned peer MAC.  Note: id0/id1 install/commit being log-only is
+      closed by the per-slice commit here; a preserve/10/8 lookup failure
+      still surfaces as a silent drop, not a MAC bug.
   - **Per-slice replay-window drop on P4 is NOT yet verified.** The stock
     DPDK 24.11 extern hardcodes `replay_win_sz = 0` / `options.esn = 0`
     (anti-replay off), so a live seq-drop cannot be claimed on unpatched
