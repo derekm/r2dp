@@ -1,0 +1,96 @@
+diff --git a/lib/pipeline/rte_swx_ipsec.c b/lib/pipeline/rte_swx_ipsec.c
+index 17a9d2b..11b87e9 100644
+--- a/lib/pipeline/rte_swx_ipsec.c
++++ b/lib/pipeline/rte_swx_ipsec.c
+@@ -718,11 +718,91 @@ rte_swx_ipsec_post_crypto(struct rte_swx_ipsec *ipsec)
+ 	}
+ }
+ 
++/* Submit any crypto ops still parked in the batching buffer
++ * (ipsec->in.cops[], count ipsec->in.n_cops) to the crypto device.
++ * ipsec_crypto_enqueue only flushes a buffer that is FULL; a partial
++ * batch (a lone live peer packet) must be pushed out explicitly or it is
++ * never decrypted.  Batching to bsz.crypto_wr is a throughput
++ * optimization, not a correctness gate -- a drained buffer must go out
++ * every run.  Failed ops are freed; success adds to n_pkts_crypto so
++ * post_crypto can reap the results. */
++static inline void
++ipsec_crypto_enqueue_flush(struct rte_swx_ipsec *ipsec)
++{
++	struct rte_crypto_op **cops = ipsec->in.cops;
++	uint32_t n = ipsec->in.n_cops, i;
++
++	if (!n)
++		return;
++
++	{
++		uint16_t n_ok;
++
++		n_ok = rte_cryptodev_enqueue_burst(ipsec->dev_id, ipsec->qp_id,
++						   cops, n);
++		ipsec->n_pkts_crypto += n_ok;
++
++		for (i = n_ok; i < n; i++) {
++			struct rte_crypto_op *cop = cops[i];
++			struct rte_mbuf *m = cop->sym->m_src;
++
++			rte_pktmbuf_free(m);
++		}
++	}
++
++	/* Buffer drained. */
++	ipsec->in.n_cops = 0;
++}
++
++/* Push any decrypted packets still parked in the output batching buffer
++ * (ipsec->out.pkts[], count ipsec->out.n_pkts) out to the IP_OUT ring.
++ * ipsec_ring_enqueue only pushes a FULL bsz.ring_wr batch to ring_out; a
++ * partial batch (a lone live peer packet) would sit in out.pkts forever
++ * and never reach the pipeline for inner egress.  Same batching-vs-correctness
++ * flaw as ipsec_crypto_enqueue; flushing every run makes drained traffic
++ * actually leave. */
++static inline void
++ipsec_ring_enqueue_flush(struct rte_swx_ipsec *ipsec)
++{
++	struct rte_mbuf **src = ipsec->out.pkts;
++	uint32_t n_src = ipsec->out.n_pkts, i;
++
++	if (!n_src)
++		return;
++
++	{
++		uint32_t n_ok;
++
++		n_ok = rte_ring_sp_enqueue_burst(ipsec->ring_out, (void **)src,
++						 n_src, NULL);
++
++		for (i = n_ok; i < n_src; i++) {
++			struct rte_mbuf *m = src[i];
++
++			rte_pktmbuf_free(m);
++		}
++	}
++
++	/* Buffer drained. */
++	ipsec->out.n_pkts = 0;
++}
++
+ void
+ rte_swx_ipsec_run(struct rte_swx_ipsec *ipsec)
+ {
+ 	rte_swx_ipsec_pre_crypto(ipsec);
++	/* See ipsec_crypto_enqueue_flush: SWX batches crypto ops to a full
++	 * bsz.crypto_wr before submitting them to the crypto device, so a
++	 * sparse live peer (one packet per round trip) would otherwise have
++	 * its op parked in in.cops[] forever and never be decrypted.  Flush
++	 * any leftover partial batch every run. */
++	ipsec_crypto_enqueue_flush(ipsec);
+ 	rte_swx_ipsec_post_crypto(ipsec);
++	/* Same batching flaw on the way out: post_crypto -> ipsec_ring_enqueue
++	 * only pushes a FULL bsz.ring_wr batch of decrypted packets to IP_OUT.
++	 * A lone frame would sit in ipsec->out.pkts[] and never be routed to
++	 * the inner leg.  Flush it so decrypted traffic egresses. */
++	ipsec_ring_enqueue_flush(ipsec);
+ }
+ 
+ /**

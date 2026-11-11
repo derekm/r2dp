@@ -18,6 +18,20 @@ by the Limit 4 implementation in `p4/r2dp.p4` + `fwd/dp_p4.c` (`a8aedd2`).
 - `0002-p4c-spd-prefix-sample.patch` — p4c `backends/dpdk/examples/spd_prefix.p4`
   (a real prefix/ANY SPD, not the exact-only crypto demo) + a `README.md`
   wildcard-key-layout note.
+- `0003-rte_swx_ipsec-batching-flush.patch` — DPDK `rte_swx_ipsec.c`: the
+  SWX ipsec extern batches crypto ops to a full `bsz` before submitting and
+  batches decrypted packets to a full ring before pushing to `IP_OUT`.  A
+  sparse live peer (one packet per round trip) never fills either, so its
+  packet sat parked in `in.cops[]`/`out.pkts[]` forever and was **never
+  decrypted / never egressed** regardless of how correct the pipeline and
+  SAD were.  This flushes both partial buffers at the end of every
+  `rte_swx_ipsec_run`.  Same root cause as the pipeline output-port writer
+  (flush in `fwd/dp_p4.c`): SWX batching is a throughput optimization, not
+  a correctness gate, and the r2dp forwarder runs `pipeline_run` +
+  `ipsec_run` on a live packet path where a single frame is the common case.
+  Verified on `.165`: after this patch the real scapy peer passes all 15
+  positive round trips on the P4 backend (previously `crypto enq=0` at peer
+  cadence).
 
 ## Submission route (upstream)
 
