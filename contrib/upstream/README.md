@@ -32,6 +32,24 @@ by the Limit 4 implementation in `p4/r2dp.p4` + `fwd/dp_p4.c` (`a8aedd2`).
   Verified on `.165`: after this patch the real scapy peer passes all 15
   positive round trips on the P4 backend (previously `crypto enq=0` at peer
   cadence).
+- `0004-rte_swx_ipsec-natt.patch` — DPDK `rte_swx_ipsec.c` + `rte_swx_ipsec.h`:
+  RFC 3948 ESP-in-UDP (NAT-T) for the SWX ipsec extern.  0003 and 0004
+  together are the full DPDK extern patch series (0004 applies on top of
+  0003; both verified by `git apply --check` against pristine + the live P4
+  harness).  NAT-T changes: (1) add `udp_encap` + `udp.sport/dport` to
+  `rte_swx_ipsec_sa_params` and plumb them into `ipsec_xform_get`; (2) set
+  the tunnel IPv4 outer `next_proto_id` to UDP (17) when `udp_encap` is set
+  (was hardcoded ESP/50, so the UDP ports were misread as the ESP SPI on
+  the wire); (3) inbound `pre_crypto` folds the 8-byte UDP wrapper out
+  (memmove + `rte_pktmbuf_adj`, rewrite outer proto to ESP, shrink
+  total_length) exactly like the DPDK backend `dpdk_esp.c`, since `esp_inb`
+  locates ESP at l2+l3 and does not strip UDP itself; (4) `rte_swx_ipsec_sa_add`
+  builds an inbound NAT-T SA with `udp_encap` cleared (so rte_ipsec does not
+  also strip) while outbound keeps it (so rte_ipsec inserts the UDP/4500
+  wrapper).  Verified on `.165` P4 backend: 3 NAT-T round trips, egress
+  framing (UDP 4500->4500, SPI right after), keepalive, IKE and
+  post-IKE health all pass; the DPDK backend passes the whole harness as a
+  control.
 
 ## Submission route (upstream)
 

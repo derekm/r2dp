@@ -293,14 +293,21 @@ per-slice best_cyc_pkt pps):**
     `contrib/upstream/0003-*.patch`), not something the pipeline/SAD could
     work around.  N=1 reproduces it no longer relevant — the fix is
     cadence-independent.
-  - **Replay-window and NAT-T phases on P4 remain separate, honestly-open:**
-    `fwd_e2e.sh` window + NAT-T still fail on P4.  window fails because
-    stock DPDK 24.11 extern hardcodes `replay_win_sz=0`/`esn=0`
-    (anti-replay off); a replay/out-of-window seq still gets a reply.  A
-    host `.so` patch is not the product fix (reviewer action, unchanged).
-    NAT-T ESP-in-UDP round trips fail on P4 and are not yet root-caused.
-    These are NOT regressions from the flush; the same forwarder passes
-    the whole DPDK-backend harness.
+  - **Replay-window phase on P4 remains open; NAT-T is largely closed.**
+    `fwd_e2e.sh` window still fails on P4: stock DPDK 24.11 extern
+    hardcodes `replay_win_sz=0`/`esn=0` (anti-replay off), so a
+    replay/out-of-window seq still gets a reply.  A host `.so` patch is not
+    the product fix (reviewer action, unchanged).  **NAT-T now passes on
+    P4** (`0003`+`0004-rte_swx_ipsec-natt.patch`): 3 ESP-in-UDP round
+    trips, egress framing (UDP 4500->4500, SPI right after UDP), keepalive,
+    IKE and post-IKE health all pass.  One NAT-T check remains a known,
+    documented limitation (not a security leak -- SA keys are identical):
+    `plain ESP to a NAT-T SA -> no reply` still fails because refusing by
+    freeing a mid-burst mbuf corrupted the shared dequeue burst (the RFC
+    3948 s3.1 strictness refuses only when the SA's framing differs from
+    the wire; the DPDK backend refuses it, P4 does not yet).  These are NOT
+    regressions from the flush or NAT-T work; the DPDK backend passes the
+    whole harness as a control.
   - **(b) `next_hop_set` installs all-zero MACs -- FIXED (`8cfc4b6`).**
     `p4_start` had programmed `next_hop_table_0` id0/id1 with zeroed
     `ab[]` except ether_type/port, so both hop dst/src were

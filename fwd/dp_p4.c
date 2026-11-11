@@ -1785,6 +1785,29 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		sp.encap.esp.spi = ntohl(sa->spi);
 		sp.encap.tunnel_mode = (sa->mode == R2DP_MODE_TUNNEL);
 		sp.encap.tunnel_ipv4 = 1;
+		/* RFC 3948 ESP-in-UDP (NAT-T): carry the ctl SA's natt params to
+		 * the extern.  udp_encap is set for BOTH directions so the
+		 * extern/xform build the NAT-T headers.  How udp_encap is
+		 * used per direction differs (mirroring rte_ipsec + dpdk_esp.c):
+		 * - OUTBOUND: rte_ipsec inserts the UDP/4500 wrapper into
+		 *   sa->hdr (esp_outb) and tunnel_ipv4_header_set sets the outer
+		 *   proto to UDP.
+		 * - INBOUND: the .p4 parser has already preserved the
+		 *   ESP-in-UDP wrapper, and the extern's pre_crypto folds the
+		 *   8-byte UDP header out itself before rte_ipsec (keyed on the
+		 *   outer proto == UDP; the inbound xform is built udp_encap=0
+		 *   via the extern sa_add copy, so esp_inb does not also strip).
+		 * natt_sport/dport are network order from ctl; the extern takes
+		 * host-order ports (rte_cpu_to_be_16 in sa.c). */
+		if (sa->natt_type == R2DP_NATT_ESPINUDP) {
+			sp.encap.udp_encap = 1;
+			sp.encap.udp.sport = ntohs(sa->natt_sport);
+			sp.encap.udp.dport = ntohs(sa->natt_dport);
+			if (!sp.encap.udp.sport)
+				sp.encap.udp.sport = 4500;
+			if (!sp.encap.udp.dport)
+				sp.encap.udp.dport = 4500;
+		}
 		if (sa->src.family == R2DP_AF_INET4)
 			memcpy(&sp.encap.tunnel.ipv4.src_addr,
 			       sa->src.addr, sizeof(struct in_addr));

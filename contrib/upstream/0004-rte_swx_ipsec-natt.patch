@@ -1,0 +1,227 @@
+diff --git a/lib/pipeline/rte_swx_ipsec.c b/lib/pipeline/rte_swx_ipsec.c
+index 17a9d2b..79100cc 100644
+--- a/lib/pipeline/rte_swx_ipsec.c
++++ b/lib/pipeline/rte_swx_ipsec.c
+@@ -11,6 +11,7 @@
+ #include <rte_common.h>
+ #include <rte_random.h>
+ #include <rte_ip.h>
++#include <rte_udp.h>
+ #include <rte_tailq.h>
+ #include <rte_eal_memconfig.h>
+ #include <rte_ring.h>
+@@ -581,14 +582,40 @@ rte_swx_ipsec_pre_crypto(struct rte_swx_ipsec *ipsec)
+ 		m->data_len -= META_LENGTH;
+ 		m->pkt_len -= META_LENGTH;
+ 
++		/* Get the SA. */
++		ipsec->in.sa[i] = ipsec_sa_get(ipsec, sa_id);
++
+ 		/* Set the fields required by the IPsec library. */
+ 		m->l2_len = 0;
+ 		m->l3_len = (ipv4_hdr->version_ihl >> 4 == 4) ?
+ 			sizeof(struct rte_ipv4_hdr) :
+ 			sizeof(struct rte_ipv6_hdr);
+ 
+-		/* Get the SA. */
+-		ipsec->in.sa[i] = ipsec_sa_get(ipsec, sa_id);
++		/* Inbound RFC 3948 ESP-in-UDP (NAT-T): the .p4 parser classifies
++		 * the frame as ESP but leaves the 8-byte UDP/4500 header on the
++		 * wire between the outer IPv4 header and ESP, and the outer IPv4
++		 * proto is 17 (UDP).  rte_ipsec's inbound esp_inb locates ESP at
++		 * l2_len+l3_len and does NOT strip an intervening UDP header, so
++		 * on the DECRYPT leg we fold the UDP header out exactly like the
++		 * DPDK backend (dpdk_esp.c): when the outer proto is UDP, slide
++		 * the outer IPv4 header up over the 8 UDP bytes, drop them from
++		 * the front, rewrite the outer proto to ESP and shrink
++		 * total_length, keeping l3_len = outer-IP size so ESP lands at
++		 * l2+l3.  The inbound SA is built udp_encap=0 in ipsec_sa_add, so
++		 * rte_ipsec does not also strip; here the parser already preserved
++		 * the wrapper and we only need it folded out. */
++		if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
++			uint8_t *base = rte_pktmbuf_mtod(m, uint8_t *);
++			uint32_t ihl = m->l3_len;
++
++			memmove(base + sizeof(struct rte_udp_hdr), base, ihl);
++			(void)rte_pktmbuf_adj(m, sizeof(struct rte_udp_hdr));
++			ipv4_hdr = rte_pktmbuf_mtod(m, struct rte_ipv4_hdr *);
++			ipv4_hdr->next_proto_id = IPPROTO_ESP;
++			ipv4_hdr->total_length = rte_cpu_to_be_16((uint16_t)
++				(rte_be_to_cpu_16(ipv4_hdr->total_length) -
++				 sizeof(struct rte_udp_hdr)));
++		}
+ 	}
+ 
+ 	/* Group packets that share the same SA. */
+@@ -718,11 +745,91 @@ rte_swx_ipsec_post_crypto(struct rte_swx_ipsec *ipsec)
+ 	}
+ }
+ 
++/* Submit any crypto ops still parked in the batching buffer
++ * (ipsec->in.cops[], count ipsec->in.n_cops) to the crypto device.
++ * ipsec_crypto_enqueue only flushes a buffer that is FULL; a partial
++ * batch (a lone live peer packet) must be pushed out explicitly or it is
++ * never decrypted.  Batching to bsz.crypto_wr is a throughput
++ * optimization, not a correctness gate -- a drained buffer must go out
++ * every run.  Failed ops are freed; success adds to n_pkts_crypto so
++ * post_crypto can reap the results. */
++static inline void
++ipsec_crypto_enqueue_flush(struct rte_swx_ipsec *ipsec)
++{
++	struct rte_crypto_op **cops = ipsec->in.cops;
++	uint32_t n = ipsec->in.n_cops, i;
++
++	if (!n)
++		return;
++
++	{
++		uint16_t n_ok;
++
++		n_ok = rte_cryptodev_enqueue_burst(ipsec->dev_id, ipsec->qp_id,
++						   cops, n);
++		ipsec->n_pkts_crypto += n_ok;
++
++		for (i = n_ok; i < n; i++) {
++			struct rte_crypto_op *cop = cops[i];
++			struct rte_mbuf *m = cop->sym->m_src;
++
++			rte_pktmbuf_free(m);
++		}
++	}
++
++	/* Buffer drained. */
++	ipsec->in.n_cops = 0;
++}
++
++/* Push any decrypted packets still parked in the output batching buffer
++ * (ipsec->out.pkts[], count ipsec->out.n_pkts) out to the IP_OUT ring.
++ * ipsec_ring_enqueue only pushes a FULL bsz.ring_wr batch to ring_out; a
++ * partial batch (a lone live peer packet) would sit in out.pkts forever
++ * and never reach the pipeline for inner egress.  Same batching-vs-correctness
++ * flaw as ipsec_crypto_enqueue; flushing every run makes drained traffic
++ * actually leave. */
++static inline void
++ipsec_ring_enqueue_flush(struct rte_swx_ipsec *ipsec)
++{
++	struct rte_mbuf **src = ipsec->out.pkts;
++	uint32_t n_src = ipsec->out.n_pkts, i;
++
++	if (!n_src)
++		return;
++
++	{
++		uint32_t n_ok;
++
++		n_ok = rte_ring_sp_enqueue_burst(ipsec->ring_out, (void **)src,
++						 n_src, NULL);
++
++		for (i = n_ok; i < n_src; i++) {
++			struct rte_mbuf *m = src[i];
++
++			rte_pktmbuf_free(m);
++		}
++	}
++
++	/* Buffer drained. */
++	ipsec->out.n_pkts = 0;
++}
++
+ void
+ rte_swx_ipsec_run(struct rte_swx_ipsec *ipsec)
+ {
+ 	rte_swx_ipsec_pre_crypto(ipsec);
++	/* See ipsec_crypto_enqueue_flush: SWX batches crypto ops to a full
++	 * bsz.crypto_wr before submitting them to the crypto device, so a
++	 * sparse live peer (one packet per round trip) would otherwise have
++	 * its op parked in in.cops[] forever and never be decrypted.  Flush
++	 * any leftover partial batch every run. */
++	ipsec_crypto_enqueue_flush(ipsec);
+ 	rte_swx_ipsec_post_crypto(ipsec);
++	/* Same batching flaw on the way out: post_crypto -> ipsec_ring_enqueue
++	 * only pushes a FULL bsz.ring_wr batch of decrypted packets to IP_OUT.
++	 * A lone frame would sit in ipsec->out.pkts[] and never be routed to
++	 * the inner leg.  Flush it so decrypted traffic egresses. */
++	ipsec_ring_enqueue_flush(ipsec);
+ }
+ 
+ /**
+@@ -1369,7 +1476,13 @@ tunnel_ipv4_header_set(struct rte_ipv4_hdr *h, struct rte_swx_ipsec_sa_params *p
+ 		.packet_id = 0,
+ 		.fragment_offset = 0,
+ 		.time_to_live = 64,
+-		.next_proto_id = IPPROTO_ESP,
++		/* The outer IPv4 proto is ESP when carrying ESP directly, but
++		 * RFC 3948 ESP-in-UDP (NAT-T) wraps ESP in UDP/4500, so the
++		 * outer proto must be UDP (17), not ESP (50).  rte_ipsec's
++		 * sa.c inserts the UDP header after this IPv4 hdr when
++		 * options.udp_encap is set; the outer proto has to match or a
++		 * receiver/tcpdump reads the UDP ports as the ESP SPI. */
++		.next_proto_id = p->encap.udp_encap ? IPPROTO_UDP : IPPROTO_ESP,
+ 		.hdr_checksum = 0, /* Cannot be pre-computed. */
+ 		.src_addr = p->encap.tunnel.ipv4.src_addr.s_addr,
+ 		.dst_addr = p->encap.tunnel.ipv4.dst_addr.s_addr,
+@@ -1596,8 +1709,14 @@ ipsec_xform_get(struct rte_swx_ipsec_sa_params *p,
+ 
+ 	ipsec_xform->esn.value = 0;
+ 
+-	ipsec_xform->udp.dport = 0;
+-	ipsec_xform->udp.sport = 0;
++	/* RFC 3948 ESP-in-UDP (NAT-T) encapsulation.  The extern public API
++	 * carries udp_encap + ports in p->encap.udp; rte_ipsec's esp_outb
++	 * inserts the UDP header (sa.c gate on options.udp_encap) on encrypt
++	 * and checks/strips it on decrypt.  Default the ports to 4500 so a
++	 * caller that only sets udp_encap still frames correctly. */
++	ipsec_xform->options.udp_encap = p->encap.udp_encap;
++	ipsec_xform->udp.dport = p->encap.udp.dport ? p->encap.udp.dport : 4500;
++	ipsec_xform->udp.sport = p->encap.udp.sport ? p->encap.udp.sport : 4500;
+ }
+ 
+ static int
+@@ -1785,7 +1904,18 @@ rte_swx_ipsec_sa_add(struct rte_swx_ipsec *ipsec,
+ 	/* Acquire the SA resources. */
+ 	sa = ipsec_sa_get(ipsec, sa_id);
+ 
+-	status = ipsec_session_create(ipsec, sa_params, &sa->s);
++	/* Inbound NAT-T: pass a COPY with udp_encap cleared so rte_ipsec
++	 * inbound builds a plain-ESP SA (no UDP handling), matching the
++	 * manual strip that pre_crypto performs -- otherwise rte_ipsec
++	 * inbound would also expect/strip a UDP header and double-handle it.
++	 * (Outbound keeps udp_encap set so rte_ipsec inserts the UDP/4500
++	 * wrapper into the tunnel header.) */
++	{
++		struct rte_swx_ipsec_sa_params p = *sa_params;
++		if (!sa_params->encrypt)
++			p.encap.udp_encap = 0;
++		status = ipsec_session_create(ipsec, &p, &sa->s);
++	}
+ 	if (status) {
+ 		/* Free the allocated SADB entry. */
+ 		ipsec->sa_free_id[ipsec->n_sa_free_id] = sa_id;
+diff --git a/lib/pipeline/rte_swx_ipsec.h b/lib/pipeline/rte_swx_ipsec.h
+index 6cff180..b2e2186 100644
+--- a/lib/pipeline/rte_swx_ipsec.h
++++ b/lib/pipeline/rte_swx_ipsec.h
+@@ -255,6 +255,23 @@ struct rte_swx_ipsec_sa_encap_params {
+ 			struct rte_ipv6_addr dst_addr;
+ 		} ipv6;
+ 	} tunnel;
++
++	/** RFC 3948 ESP-in-UDP (NAT-T) encapsulation.  Non-zero marks the
++	 * SA as ESP-in-UDP: outbound, rte_ipsec inserts a UDP header (NAT-T)
++	 * into the tunnel (esp_outb) and the outer proto is set to UDP;
++	 * inbound, the r2dp extern's pre_crypto folds the 8-byte UDP header
++	 * out itself before rte_ipsec and builds the inbound SA with
++	 * udp_encap cleared (see rte_swx_ipsec.c).  The ports default to
++	 * 4500 when not set. */
++	int udp_encap;
++
++	struct {
++		/** UDP source port (host order; default 4500). */
++		uint16_t sport;
++
++		/** UDP destination port (host order; default 4500). */
++		uint16_t dport;
++	} udp;
+ };
+ 
+ /** IPsec Security Association (SA) parameters. */
