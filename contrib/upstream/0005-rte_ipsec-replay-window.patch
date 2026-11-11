@@ -1,0 +1,43 @@
+diff --git a/lib/ipsec/ipsec_sqn.h b/lib/ipsec/ipsec_sqn.h
+index 984a9dd..89ef966 100644
+--- a/lib/ipsec/ipsec_sqn.h
++++ b/lib/ipsec/ipsec_sqn.h
+@@ -150,7 +150,8 @@ static inline int32_t
+ esn_inb_update_sqn(struct replay_sqn *rsn, const struct rte_ipsec_sa *sa,
+ 	uint64_t sqn)
+ {
+-	uint32_t bit, bucket, last_bucket, new_bucket, diff, i;
++	uint32_t bucket, last_bucket, new_bucket, diff, i;
++	uint64_t bit;
+ 
+ 	/* handle ESN */
+ 	if (IS_ESN(sa))
+diff --git a/lib/pipeline/rte_swx_ipsec.c b/lib/pipeline/rte_swx_ipsec.c
+index 79100cc..8d0c89e 100644
+--- a/lib/pipeline/rte_swx_ipsec.c
++++ b/lib/pipeline/rte_swx_ipsec.c
+@@ -1705,7 +1705,7 @@ ipsec_xform_get(struct rte_swx_ipsec_sa_params *p,
+ 	ipsec_xform->life.packets_hard_limit = 0;
+ 	ipsec_xform->life.bytes_hard_limit = 0;
+ 
+-	ipsec_xform->replay_win_sz = 0;
++	ipsec_xform->replay_win_sz = p->replay_win_sz;
+ 
+ 	ipsec_xform->esn.value = 0;
+ 
+diff --git a/lib/pipeline/rte_swx_ipsec.h b/lib/pipeline/rte_swx_ipsec.h
+index b2e2186..c88c718 100644
+--- a/lib/pipeline/rte_swx_ipsec.h
++++ b/lib/pipeline/rte_swx_ipsec.h
+@@ -300,6 +300,11 @@ struct rte_swx_ipsec_sa_params {
+ 
+ 	/** Packet encasulation parameters. */
+ 	struct rte_swx_ipsec_sa_encap_params encap;
++
++	/** Anti-replay window size in packets (RFC 4303 s3.4.3); 0 = disabled.
++	 *  Passed to rte_ipsec, which enforces a sliding window in
++	 *  esp_inb_pkt_process.  Matches the r2dp ctl SA wsize/replay_win. */
++	uint32_t replay_win_sz;
+ };
+ 
+ /**

@@ -55,6 +55,20 @@ if [ "$BACKEND" = kernel ]; then
 	ip link set r2o up; ip link set r2ok up
 	ip addr add 192.0.2.1/24 dev r2ok
 	"$FWD" -s "$D/fwd.sock" --dp kernel --dp-cleanup -v >"$D/fwd.out" 2>&1 &
+elif [ "$BACKEND" = p4 ]; then
+	# P4/SWX multicore data plane: N slices (R2DP_P4_WORKERS), the same
+	# net_tap legs and OpenSSL cryptodev as the DPDK harness, plus the P4
+	# spec + scratch dir.  The peer and the SA/SP install are IDENTICAL to
+	# the DPDK run, so a pass means the P4 engine interoperates with an
+	# independent implementation exactly like DPDK does.
+	W=${FWD_WORKERS:-2}
+	P4SPEC=${R2DP_P4_SPEC:-/opt/r2dp/p4/r2dp.out}
+	P4SCRATCH=${R2DP_P4_SCRATCH:-$D/p4scratch}
+	mkdir -p "$P4SCRATCH"
+	env R2DP_P4_WORKERS=$W R2DP_P4_SPEC=$P4SPEC R2DP_P4_SCRATCH=$P4SCRATCH \
+		"$FWD" -s "$D/fwd.sock" --dp p4 --no-huge -m 1024 --no-pci --no-telemetry \
+		--file-prefix "r2e2e$$" --vdev=net_tap0,iface=r2o --vdev=net_tap1,iface=r2i \
+		--vdev=crypto_openssl0,max_nb_queue_pairs=$W >"$D/fwd.out" 2>&1 &
 else
 	# FWD_WORKERS=n: n packet workers, each polling its own RX queue
 	W=${FWD_WORKERS:-1}
@@ -80,13 +94,20 @@ if [ "$BACKEND" = dpdk ]; then
 	ip route add 10.1.0.0/24 via 10.2.0.1 dev r2i
 	ip route add 10.3.0.0/24 via 10.2.0.1 dev r2i
 	ip neigh replace 10.2.0.1 lladdr 02:00:00:00:00:99 dev r2i nud permanent
-else
+elif [ "$BACKEND" = kernel ]; then
 	grep -q "kernel XFRM dataplane ready" "$D/fwd.out" || { cat "$D/fwd.out"; fail "XFRM data plane did not come up"; }
 	ip addr add 10.2.0.2/32 dev lo
 	ip route add 10.1.0.0/24 via 192.0.2.2 dev r2ok src 10.2.0.2
 	ip neigh replace 192.0.2.2 lladdr $PMAC dev r2ok nud permanent
 	ip route add 10.3.0.0/24 via 192.0.2.3 dev r2ok src 10.2.0.2
 	ip neigh replace 192.0.2.3 lladdr $PMAC dev r2ok nud permanent
+else
+	# p4: dataplane came up iff the io worker started and the sockets served.
+	grep -q "io worker started" "$D/fwd.out" || { cat "$D/fwd.out"; fail "P4 data plane did not come up"; }
+	ip addr add 10.2.0.2/24 dev r2i
+	ip route add 10.1.0.0/24 via 10.2.0.1 dev r2i
+	ip route add 10.3.0.0/24 via 10.2.0.1 dev r2i
+	ip neigh replace 10.2.0.1 lladdr 02:00:00:00:00:99 dev r2i nud permanent
 fi
 # (not /sys/class/net: under unshare -n without a sysfs remount it shows
 # the parent namespace)

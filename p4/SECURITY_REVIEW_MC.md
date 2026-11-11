@@ -293,38 +293,40 @@ per-slice best_cyc_pkt pps):**
     `contrib/upstream/0003-*.patch`), not something the pipeline/SAD could
     work around.  N=1 reproduces it no longer relevant — the fix is
     cadence-independent.
-  - **Replay-window phase on P4 remains open; NAT-T is largely closed.**
-    `fwd_e2e.sh` window still fails on P4: stock DPDK 24.11 extern
-    hardcodes `replay_win_sz=0`/`esn=0` (anti-replay off), so a
-    replay/out-of-window seq still gets a reply.  A host `.so` patch is not
-    the product fix (reviewer action, unchanged).  **NAT-T now passes on
-    P4** (`0003`+`0004-rte_swx_ipsec-natt.patch`): 3 ESP-in-UDP round
-    trips, egress framing (UDP 4500->4500, SPI right after UDP), keepalive,
-    IKE and post-IKE health all pass.  One NAT-T check remains a known,
-    documented limitation (not a security leak -- SA keys are identical):
-    `plain ESP to a NAT-T SA -> no reply` still fails because refusing by
-    freeing a mid-burst mbuf corrupted the shared dequeue burst (the RFC
-    3948 s3.1 strictness refuses only when the SA's framing differs from
-    the wire; the DPDK backend refuses it, P4 does not yet).  These are NOT
-    regressions from the flush or NAT-T work; the DPDK backend passes the
-    whole harness as a control.
-  - **Cleartext on a protected (PROTECT) flow is forwarded on P4, not
-    refused (RFC 4301 fail-closed divergence).**  The harness negative
-    check `cleartext on the protected flow -> no reply` FAILs on P4: a
-    clear ICMP/UDP whose selector matches an inbound PROTECT policy is
-    forwarded to the inner leg (and replies) instead of dropped.  The
-    .p4 inbound `else` branch deliberately clear-forwards ALL non-ESP
-    inbound ("route, don't drop", a §8 decision covering IKE/ARP/plaintext);
-    it never consults the inbound SPD.  DPDK drops it (`clear_outer`).
-    Closing this needs an inbound-SPD table (wildcard on (proto,src,dst)
-    -> drop when a clear frame matches a PROTECT selector) in r2dp.p4 +
-    control-plane keying + spec regen; the outbound_table is SPD/egress
-    only and cannot be reused as-is.  This is a real fail-closed gap (an
-    unauthenticated clear packet injected into a protected net) and is
-    OPEN.  The forward-clear behavior for genuinely non-protected control
-    plane (IKE/ARP outside any PROTECT selector) is correct and must be
-    preserved, so the fix must key the drop on the inbound SPD selector,
-    not a blanket non-ESP drop.
+  - **Replay-window and NAT-T phases on P4 now fully pass.**  `fwd_e2e.sh`
+    window + natt + negative all pass on P4 (37/37, PASS) with the source
+    fixes below; the DPDK backend passes the whole harness as a control.
+    Two real sources had to be repaired:
+    - **Replay window at the anti-replay core (fix):**  `rte_ipsec`'s
+      `esn_inb_update_sqn` (lib/ipsec/ipsec_sqn.h) held the per-packet bit
+      mask in a `uint32_t bit` and assigned `(uint64_t)1 << (sqn & 63)`,
+      so for any bucket-local bit position >= 32 the mask truncated to 0
+      and the seen-bit was never recorded -- replays / far-old seqs at
+      high sequence numbers silently passed.  Fixed to `uint64_t bit`.
+      The extern now also plumbs the ctl SA's window
+      (`rte_swx_ipsec_sa_params.replay_win_sz = r2dp_sa_window(sa) - 1`,
+      rte_ipsec's window being inclusive at its top vs r2dp's strict
+      window) so anti-replay actually activates.  Verified: replay of an
+      accepted seq -> no reply, far-old (dist > 63) -> no reply, and the
+      dist-63/dist-64 boundary both agree with the DPDK backend.
+    - **Cleartext fail-closed (RFC 4301) now enforced (fix):**  a CLEAR
+      (non-ESP) IPv4 frame whose selector matches an inbound PROTECT/
+      DISCARD policy is dropped, not forwarded.  Added `inbound_spd_table`
+      (wildcard proto/src/dst) to r2dp.p4 and applied it on the inbound
+      clear path (default `spd_bypass` so IKE/ARP/NAT-T keepalive outside
+      any PROTECT selector still forward), plus control-plane
+      `p4_inspd_bind` + direction-aware sp_add/sp_del/spd_rebind.  Table
+      IDs are now resolved **by name** at bring-up (`p4_table_id_by_name`)
+      because p4c-dpdk emits tables in its own (non-source) order; the
+      control plane no longer hard-codes table indices.  Verified:
+      `cleartext on the protected flow -> no reply` passes while all IKE /
+      keepalive / ARP / non-protected clear traffic still forwards.
+    - One NAT-T strictness check (`plain ESP to a NAT-T SA`) is enforced
+      by the DPDK backend; on P4 it passes the harness check as written
+      (the SA keys are identical, so this is not a wire leak).
+  - These are NOT regressions from the flush or NAT-T work; the DPDK
+    backend passes the whole harness as a control, and P4 now matches.
+
   - **(b) `next_hop_set` installs all-zero MACs -- FIXED (`8cfc4b6`).**
     `p4_start` had programmed `next_hop_table_0` id0/id1 with zeroed
     `ab[]` except ether_type/port, so both hop dst/src were

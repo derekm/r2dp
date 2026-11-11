@@ -289,6 +289,35 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
         const default_action = drop;
     }
 
+    /* Inbound SPD (RFC 4301 fail-closed): a CLEAR (non-ESP) inbound IPv4
+     * frame whose selector matches an inbound PROTECT policy must be dropped,
+     * not clear-forwarded -- otherwise unauthenticated cleartext matching a
+     * protected inner flow would leak into the inner net.  Keyed on the inner
+     * selector (proto, src, dst) exactly like outbound_table (same
+     * p4_spd_key_image gap-aware layout in fwd/dp_p4.c).  Rows are
+     * programmed from IN policies (sp-add slid=* dir=in): PROTECT/DISCARD ->
+     * ipsec_require (drop), BYPASS -> spd_bypass (clear-forward).  IKE /
+     * ARP / NAT-T keepalive, which carry tunnel-endpoint or non-IP
+     * addresses that do not match an inner PROTECT selector, are unaffected
+     * and still clear-forward (default spd_bypass).
+     *
+     * Declared AFTER next_hop_table so the runtime table IDs assigned by
+     * p4c-dpdk/SWX keep the control plane's hard-coded table indices stable
+     * (inbound=0, outbound=1, routing=2, next_hop=3, inbound_spd=4); the
+     * control plane programs it as table 4. */
+    action ipsec_require() {
+        drop_packet();
+    }
+    table inbound_spd_table {
+        key = {
+            hdrs.ipv4.protocol : ternary;
+            hdrs.ipv4.src_addr : ternary;
+            hdrs.ipv4.dst_addr : ternary;
+        }
+        actions = { ipsec_require; spd_bypass; drop; }
+        const default_action = spd_bypass;
+    }
+
     apply {
         if (inbound(meta)) {
             ipsec_status status;
@@ -308,17 +337,26 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
                     // else: ipsec extern consumes the frame (decrypt).
                 } else {
                     /* Non-ESP inbound (IKE/plaintext/UDP/ARP): forward clear,
-                     * never drop.  IPv4 (IKE etc.) routes by destination IP
-                     * (10/8 -> inner in this lab; the routing LPM decides the
-                     * leg, so an IKE dst outside 10/8 egresses outer) -- this
-                     * is "route, don't drop", NOT a forced-inner guarantee.
-                     * non-IP (ARP) -> next_hop id 2 = next_hop_preserve(inner),
-                     * which keeps the original L2. */
-                    if (hdrs.ipv4.isValid())
-                        routing_table.apply();
-                    else
+                     * never drop -- EXCEPT RFC 4301 fail-closed: a CLEAR
+                     * frame whose selector matches an INBOUND PROTECT policy
+                     * (inbound_spd_table) is dropped, never forwarded into a
+                     * protected inner net.  spd_bypass / the wildcard default
+                     * (IKE, ARP, control, non-protected traffic) clear-forward
+                     * as before.  IPv4 routes by destination IP (10/8 -> inner
+                     * in this lab; the routing LPM decides the leg, so an IKE
+                     * dst outside 10/8 egresses outer) -- \"route, don't drop\",
+                     * NOT a forced-inner guarantee.  non-IP (ARP) -> next_hop
+                     * id 2 = next_hop_preserve(inner), keeps the original L2. */
+                    if (hdrs.ipv4.isValid()) {
+                        inbound_spd_table.apply();
+                        if (meta.bypass == 1) {
+                            routing_table.apply();
+                            next_hop_table.apply();
+                        }   /* ipsec_require matched: drop_packet, no route */
+                    } else {
                         meta.next_hop_id = 2;
-                    next_hop_table.apply();
+                        next_hop_table.apply();
+                    }
                 }
             } else {
                 // Post-decrypt: the plaintext inner exits on the inner net.
