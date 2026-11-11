@@ -308,6 +308,23 @@ per-slice best_cyc_pkt pps):**
     the wire; the DPDK backend refuses it, P4 does not yet).  These are NOT
     regressions from the flush or NAT-T work; the DPDK backend passes the
     whole harness as a control.
+  - **Cleartext on a protected (PROTECT) flow is forwarded on P4, not
+    refused (RFC 4301 fail-closed divergence).**  The harness negative
+    check `cleartext on the protected flow -> no reply` FAILs on P4: a
+    clear ICMP/UDP whose selector matches an inbound PROTECT policy is
+    forwarded to the inner leg (and replies) instead of dropped.  The
+    .p4 inbound `else` branch deliberately clear-forwards ALL non-ESP
+    inbound ("route, don't drop", a §8 decision covering IKE/ARP/plaintext);
+    it never consults the inbound SPD.  DPDK drops it (`clear_outer`).
+    Closing this needs an inbound-SPD table (wildcard on (proto,src,dst)
+    -> drop when a clear frame matches a PROTECT selector) in r2dp.p4 +
+    control-plane keying + spec regen; the outbound_table is SPD/egress
+    only and cannot be reused as-is.  This is a real fail-closed gap (an
+    unauthenticated clear packet injected into a protected net) and is
+    OPEN.  The forward-clear behavior for genuinely non-protected control
+    plane (IKE/ARP outside any PROTECT selector) is correct and must be
+    preserved, so the fix must key the drop on the inbound SPD selector,
+    not a blanket non-ESP drop.
   - **(b) `next_hop_set` installs all-zero MACs -- FIXED (`8cfc4b6`).**
     `p4_start` had programmed `next_hop_table_0` id0/id1 with zeroed
     `ab[]` except ether_type/port, so both hop dst/src were
