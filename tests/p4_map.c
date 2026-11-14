@@ -50,6 +50,10 @@ main(void)
 	CHECK(p4_sp_supported(0, 500) == -EOPNOTSUPP &&
 	    p4_sp_supported(4500, 0) == -EOPNOTSUPP,
 	    "port-qualified selector refused, never widened to all ports");
+	CHECK(p4_lft_supported(0, 0) == 0, "infinite byte lifetime accepted");
+	CHECK(p4_lft_supported(1 << 20, 0) == -EOPNOTSUPP &&
+	    p4_lft_supported(0, 1 << 20) == -EOPNOTSUPP,
+	    "finite hard/soft byte lifetime refused, never left unenforced");
 	nwr = 0; fail_at = ~0u;
 	{
 		unsigned bad = 99;

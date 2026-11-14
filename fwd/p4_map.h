@@ -60,6 +60,16 @@ p4_sp_supported(uint16_t sport, uint16_t dport)
 	return (sport || dport) ? -EOPNOTSUPP : 0;
 }
 
+/* The extern keeps no per-SA byte counter (p4_sa_bytes reports none), so
+ * ctl's soft/hard byte expiry never fires for this backend.  A finite
+ * byte lifetime is refused rather than acknowledged as an infinite SA
+ * (P4 review P8).  Time lifetimes are enforced by ctl's expiry loop. */
+static inline int
+p4_lft_supported(uint64_t hard_bytes, uint64_t soft_bytes)
+{
+	return (hard_bytes || soft_bytes) ? -EOPNOTSUPP : 0;
+}
+
 /* The classification regarrays the spec's parser/apply read: direction
  * per input port (0 outer, 1 inner) and the extern's port (2) for each
  * leg.  They default to 0, so a lost write misclassifies traffic; every

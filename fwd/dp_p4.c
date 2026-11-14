@@ -1732,6 +1732,15 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			       P4_HAVE_NATT);
 			return r;
 		}
+		r = p4_lft_supported(sa->lft_hard_bytes, sa->lft_soft_bytes);
+		if (r < 0) {
+			P4_LOG("SA spi=0x%08x refused: byte lifetime (hard=%llu "
+			       "soft=%llu) has no counter in this backend",
+			       ntohl(sa->spi),
+			       (unsigned long long)sa->lft_hard_bytes,
+			       (unsigned long long)sa->lft_soft_bytes);
+			return r;
+		}
 	}
 
 	/* Host-order key from the wire (matches dpdk_sad.c conventions). */
@@ -2695,6 +2704,20 @@ static int64_t p4_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 	return -1;    /* SWX per-SA byte counters exposed when available */
 }
 
+/* A lifetime-only UPDATE must not turn on a byte limit this backend
+ * cannot count (P8): refuse a nonzero one, accept clearing it. */
+static int p4_sa_set_hard_bytes(struct fwd_dp *dp, uint32_t spi,
+    uint32_t dip, uint64_t bytes)
+{
+	(void)dp; (void)dip;
+	if (p4_lft_supported(bytes, 0) < 0) {
+		P4_LOG("SA spi=0x%08x: hard byte lifetime %llu refused (no "
+		       "counter in this backend)", spi, (unsigned long long)bytes);
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
 static void p4_stop(struct fwd_dp *dp)
 {
 	struct p4_priv *pr = dp->priv;
@@ -2809,7 +2832,7 @@ int fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	p4_ops.caps    = p4_caps;
 	p4_ops.sa_add  = p4_sa_add;
 	p4_ops.sa_bytes = p4_sa_bytes;
-	p4_ops.sa_set_hard_bytes = NULL;
+	p4_ops.sa_set_hard_bytes = p4_sa_set_hard_bytes;
 	p4_ops.sa_set_hard_time  = NULL;
 	p4_ops.sp_add  = p4_sp_add;
 	p4_ops.sp_del  = p4_sp_del;
