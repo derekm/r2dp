@@ -259,21 +259,28 @@ per-slice best_cyc_pkt pps):**
     gateway on the same binary SAD-hits (`ib hit=15`) but `crypto enq=0`;
     the synthetic stimulus that decrypts is not yet matched by the real
     peer.  Two independent blockers remain:
-    - (a) **Real-peer frames never reach the extern input ring** on the
+    - (a) **Real-peer `crypto enq=0` despite `ib hit / a0` moving** on the
       same binary that decrypts replayed synthetic *and* the captured
       real-peer bytes.  Session isolation (not re-run by review): the
       exact captured real-peer ESP frame, replayed over raw `AF_PACKET`
       into the same forwarder (same binary/spec/SA/K1) decrypts
       (`crypto enq=288`, `inner-out/out1=288`); key, SPI, the 4-SA/4-SP
       config, launch flags, netns, MAC and an AsyncSniffer socket were
-      each ruled out by A/B.  Yet the live scapy peer of the same bytes
-      still shows `crypto enq=0` with a pre-ipsec probe showing IP_IN
-      never receives a frame.  The discriminator is therefore the RX /
-      steering boundary between the live peer send path and the replayed
-      raw send -- NOT the frame bytes / key / SPI / sequence / timing.
-      N=1 reproduces it, so it is not slicing.  If this isolation is not
-      independently reproduced, treat it as unverified rather than
-      re-chasing frame bytes.
+      each reported ruled out by A/B.  CAVEAT on that isolation, per a
+      later independent review: on this spec an `inbound_table_0`
+      action-0 (`a0`) hit is `ipsec_enable`, which validates
+      `h.ipsec_hdr` and routes via `ipsec_port_out_inbound` at
+      `LABEL_END_1` -- so an `a0` hit in the same process means the frame
+      WAS tx'd to whatever `ipsec_port_out_inbound` held (2), and the
+      pre-ipsec `IP_IN` reading was an instantaneous `rte_ring_count`
+      (0 after the extern drains), not a cumulative enqueue.  `crypto
+      enq=0` is `rte_cryptodev_stats_get` (prepare/cryptodev result), not
+      proof the ring was never written.  The "never reaches IP_IN" half
+      of the isolation is therefore NOT established; treat it as
+      unverified.  The concrete unresolved question is whether
+      `ipsec_port_out_inbound` was 2 in the live peer's process and why
+      `crypto enq` stayed 0 (prepare failing vs cryptodev vs SA session).
+      N=1 reproduces it, so it is not slicing.
     - (b) **`next_hop_set` installs all-zero MACs.**  `fwd/dp_p4.c`
       `p4_start` programs `next_hop_table_0` action data by zeroing `ab[]`
       and setting only `ether_type` (0x0800) and `port_id` -- the
