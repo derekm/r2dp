@@ -56,13 +56,13 @@ dp_port_init(struct dpdk_priv *d, uint16_t port, unsigned ntxq)
 	if (ret < 0)
 		return port_fail(port, "configure", -1, ret);
 	for (uint16_t q = 0; q < nrxq; q++) {
-		ret = rte_eth_rx_queue_setup(port, q, 1024,
+		ret = rte_eth_rx_queue_setup(port, q, DP_RX_DESC,
 		    rte_eth_dev_socket_id(port), NULL, d->pool);
 		if (ret < 0)
 			return port_fail(port, "rx setup", q, ret);
 	}
 	for (uint16_t q = 0; q < (uint16_t)ntxq; q++) {
-		ret = rte_eth_tx_queue_setup(port, q, 1024,
+		ret = rte_eth_tx_queue_setup(port, q, DP_TX_DESC,
 		    rte_eth_dev_socket_id(port), NULL);
 		if (ret < 0)
 			return port_fail(port, "tx setup", q, ret);

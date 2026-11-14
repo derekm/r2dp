@@ -900,7 +900,7 @@ crypto_init(struct dpdk_priv *d)
 	cconf.socket_id = SOCKET_ID_ANY;
 	cconf.nb_queue_pairs = (uint16_t)d->nb_wk;
 	memset(&qconf, 0, sizeof(qconf));
-	qconf.nb_descriptors = 2048;
+	qconf.nb_descriptors = DP_QP_DESC;
 	if (rte_cryptodev_configure(d->cdev_id, &cconf) < 0) {
 		fprintf(stderr, "r2dp-fwd: cryptodev configure failed\n");
 		return -EIO;
@@ -1025,19 +1025,11 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	*argc -= ret;
 	*argv += ret;
 
-	d->pool = rte_pktmbuf_pool_create("r2dp_pool", MEMPOOL_SIZE, MEMPOOL_CACHE,
-	    0, RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
-	if (!d->pool) {
-		fprintf(stderr, "r2dp-fwd: mbuf pool failed: %s\n", rte_strerror(rte_errno));
-		free(d);
-		return -ENOMEM;
-	}
 	ret = crypto_init(d);
 	/* -ENODEV: no crypto device -- tolerated, ESP is dropped and IKE still
 	 * flows.  A device that is present but cannot be set up for -n
 	 * workers refuses the dataplane instead (CRYPTOQ CQ2). */
 	if (ret < 0 && ret != -ENODEV) {
-		rte_mempool_free(d->pool);
 		free(d);
 		return ret;
 	}
@@ -1049,7 +1041,6 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		if (!d->sad) {
 			fprintf(stderr, "r2dp-fwd: sad create failed: %s\n",
 			    rte_strerror(rte_errno));
-			rte_mempool_free(d->pool);
 			free(d);
 			return -ENOMEM;
 		}
@@ -1069,6 +1060,22 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		fprintf(stderr, "r2dp-fwd: -n %u clamped to %u (port tx queues)\n",
 		    d->nb_wk, maxw);
 		d->nb_wk = maxw;
+	}
+	/* mbuf pool sized from the final worker and port counts (INIT I1):
+	 * a fixed pool is consumed by RX descriptors alone at -n 8 */
+	{
+		unsigned nports = 1 + (d->inner_port >= 0);
+		unsigned nmb = dp_mbuf_pool_size(nports, d->nb_wk, rte_lcore_count());
+
+		d->pool = rte_pktmbuf_pool_create("r2dp_pool", nmb, MEMPOOL_CACHE,
+		    0, RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
+		if (!d->pool) {
+			fprintf(stderr, "r2dp-fwd: mbuf pool of %u failed: %s\n",
+			    nmb, rte_strerror(rte_errno));
+			return -ENOMEM;
+		}
+		fprintf(stderr, "r2dp-fwd: mbuf pool %u (%u port(s), %u worker(s))\n",
+		    nmb, nports, d->nb_wk);
 	}
 
 	dp->priv = d;

@@ -61,6 +61,27 @@
 #define DP_MAX_SESS_POOLS 2048u
 #define DP_RING_SZ    1024  /* cross-post ring, per direction, per worker */
 #define BURST_SZ      128
+#define DP_RX_DESC    1024  /* RX descriptors per queue (each holds an mbuf) */
+#define DP_TX_DESC    1024  /* TX descriptors per queue */
+#define DP_QP_DESC    2048u /* crypto queue-pair descriptors */
+
+/* mbufs the data plane can retain at once: every RX descriptor armed,
+ * every TX descriptor and cross-post ring full, every crypto QP full plus
+ * the in-burst arrays, and every lcore's cache -- plus headroom so RX
+ * refill never starves under worst-case retention (INIT I1).  Never below
+ * the historic MEMPOOL_SIZE. */
+static inline unsigned
+dp_mbuf_pool_size(unsigned nports, unsigned nb_wk, unsigned nlcores)
+{
+	uint64_t n = (uint64_t)nports * nb_wk * (DP_RX_DESC + DP_TX_DESC) +
+	    (uint64_t)nb_wk * 2 * DP_RING_SZ +
+	    (uint64_t)nb_wk * (DP_QP_DESC + 4 * BURST_SZ) +
+	    (uint64_t)nlcores * MEMPOOL_CACHE + 4096;
+
+	if (n < MEMPOOL_SIZE)
+		n = MEMPOOL_SIZE;
+	return n > UINT32_MAX ? UINT32_MAX : (unsigned)n;
+}
 #define TAP_IF_DEFAULT "r2dp-tap"
 
 #define NATT_PORT 4500             /* RFC 3948 ESP-in-UDP / IKE float port */

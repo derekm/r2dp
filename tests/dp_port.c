@@ -21,6 +21,26 @@ main(void)
 	int seeds[2] = { 0, EPERM };
 
 	setvbuf(stdout, NULL, _IONBF, 0);
+	/* INIT I1: the pool covers worst-case retention for every -n */
+	{
+		int ok = 1;
+
+		for (unsigned p = 1; p <= 2; p++)
+			for (unsigned n = 1; n <= 8; n++) {
+				unsigned lc = n + 1;
+				uint64_t need = (uint64_t)p * n * (DP_RX_DESC + DP_TX_DESC) +
+				    (uint64_t)n * 2 * DP_RING_SZ +
+				    (uint64_t)n * (DP_QP_DESC + 4 * BURST_SZ) +
+				    (uint64_t)lc * MEMPOOL_CACHE;
+
+				if (dp_mbuf_pool_size(p, n, lc) <= need ||
+				    dp_mbuf_pool_size(p, n, lc) < MEMPOOL_SIZE)
+					ok = 0;
+			}
+		CHECK(ok, "mbuf pool exceeds worst-case retention for 1..8 workers, 1..2 ports");
+		CHECK(dp_mbuf_pool_size(2, 8, 9) > 2u * 8 * DP_RX_DESC,
+		    "-n 8, two ports: RX arming alone no longer drains the pool");
+	}
 	if (rte_eal_init(8, ea) < 0 ||
 	    rte_eth_dev_get_port_by_name("net_null0", &port) != 0) {
 		if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
