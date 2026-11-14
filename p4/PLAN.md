@@ -186,7 +186,10 @@ crypto layer even though the P4 `status` branch is unwritten.
   NON-INCREMENTALLY with a full rebuild on commit (`rte_swx_ctl.c`
   `table_rollfwd0` duplicates entries+pending_add+pending_modify1 and calls
   `table->ops.create`; DPDK "support non-incremental table updates", 21.05+,
-  in v24.11).  `p4-dpdk-target`'s pipe_mgr drives the same path for
+  in v24.11).  This is the same `!ops.add` rebuild path the tree already
+  used for `routing_table_0`'s `10/8` LPM entry (`fwd/dp_p4.c`), which was
+  proven earlier — the SPD wildcard table is the identical mechanism on
+  three fields.  `p4-dpdk-target`'s pipe_mgr drives the same path for
   P4Runtime ternary/TCAM entry add.  ACL key layout (the hard part, proven
   on-box): the ACL does NOT pack the key contiguously — `table_params_get`
   builds `key_mask0` from real IPv4 header bit offsets, so the key image is
