@@ -47,6 +47,47 @@ jobs:
       - name: Test under sanitizers
         run: meson test -C build-asan --print-errorlogs
 
+
+  # COMMITS C2: the P4/SWX backend, reproducibly from this repo.  First
+  # against stock DPDK (reduced features: SAs needing a replay window or
+  # NAT-T are refused), then against the pinned DPDK 24.11 + extern series
+  # that contrib/upstream/build-dpdk-p4.sh builds (cached on its inputs),
+  # where p4_smoke runs the backend.
+  p4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build meson pkg-config libdpdk-dev \
+            libssl-dev libnuma-dev python3-pyelftools
+      - name: P4 against stock DPDK (-Werror)
+        run: |
+          meson setup build-p4stock --buildtype=debugoptimized \
+            -Denable_dpdk=enabled -Denable_p4=enabled -Dwerror=true
+          meson compile -C build-p4stock
+          R2DP_REQUIRE_DPDK=1 meson test -C build-p4stock --print-errorlogs
+      - name: Cache pinned patched DPDK
+        id: dpdkp4
+        uses: actions/cache@v4
+        with:
+          path: ~/dpdk-p4
+          key: dpdk-p4-${{ runner.os }}-${{ hashFiles('contrib/upstream/build-dpdk-p4.sh', 'contrib/upstream/*.patch') }}
+      - name: Build pinned patched DPDK
+        if: steps.dpdkp4.outputs.cache-hit != 'true'
+        run: contrib/upstream/build-dpdk-p4.sh ~/dpdk-p4
+      - name: P4 against the patched DPDK (-Werror, p4_smoke must run)
+        run: |
+          PKG_CONFIG_PATH=$HOME/dpdk-p4/lib/pkgconfig meson setup build-p4 \
+            --buildtype=debugoptimized -Denable_dpdk=enabled -Denable_p4=enabled -Dwerror=true
+          meson compile -C build-p4
+          LD_LIBRARY_PATH=$HOME/dpdk-p4/lib R2DP_REQUIRE_DPDK=1 \
+            meson test -C build-p4 --print-errorlogs
+          LD_LIBRARY_PATH=$HOME/dpdk-p4/lib R2DP_REQUIRE_DPDK=1 \
+            meson test -C build-p4 p4_smoke -v | tee p4_smoke.log
+          ! grep -q SKIP p4_smoke.log
+
   # D11: the data plane (fwd/dp_dpdk.c, dp_gcm.c) and its known-answer test are
   # only compiled when DPDK is enabled, so the control-only builds above leave
   # the whole forwarding path CI-invisible.  This lane builds with libdpdk-dev
