@@ -125,13 +125,36 @@ nh_put(struct r2dp_nh_tab *t, uint32_t ip, uint64_t m)
 	return 1;
 }
 
+static inline uint32_t *
+nh_obucket(struct r2dp_nh_tab *t, uint32_t ip)
+{
+	return &t->outstanding[(ip * 2654435761u) >> 22];   /* 1024 */
+}
+
+static inline int
+nh_has_outstanding(struct r2dp_nh_tab *t, uint32_t ip)
+{
+	return __atomic_load_n(nh_obucket(t, ip), __ATOMIC_ACQUIRE) != 0;
+}
+
+/* One queued learn for ip is resolved (applied, superseded or dropped). */
+static inline void
+nh_resolved(struct r2dp_nh_tab *t, uint32_t ip)
+{
+	__atomic_fetch_sub(nh_obucket(t, ip), 1, __ATOMIC_RELEASE);
+}
+
 static int
 nh_enqueue(struct r2dp_nh_tab *t, uint32_t ip, uint64_t m)
 {
 	struct r2dp_nh_req q = { .ip = ip, .mac = m };
 
+	/* count it before it is visible, so a later learn of this peer
+	 * sees it and queues behind it rather than writing past it */
+	__atomic_fetch_add(nh_obucket(t, ip), 1, __ATOMIC_ACQ_REL);
 	if (rte_ring_mp_enqueue_elem(t->req, &q, sizeof(q)) == 0)
 		return 4;
+	nh_resolved(t, ip);
 	__atomic_fetch_add(&t->n_q_drop, 1, __ATOMIC_RELAXED);
 	return -1;
 }
@@ -146,6 +169,10 @@ r2dp_nh_learn(struct r2dp_nh_tab *t, uint32_t ip, const uint8_t mac[6])
 
 	if (!h)
 		return -1;
+	/* An older learn of this peer is still queued: queue behind it, or
+	 * it would later overwrite this newer observation (NH-2). */
+	if (nh_has_outstanding(t, ip))
+		return nh_enqueue(t, ip, m);
 	/* the common case -- a known peer, same MAC -- touches no lock */
 	if (rte_hash_lookup_data(h, &ip, &data) >= 0 &&
 	    (uint64_t)(uintptr_t)data == m)
@@ -177,6 +204,7 @@ r2dp_nh_del(struct r2dp_nh_tab *t, uint32_t ip)
 	for (uint32_t i = 0; i < t->npend; i++)
 		if (t->pend[i].ip == ip) {
 			t->pend[i] = t->pend[--t->npend];
+			nh_resolved(t, ip);
 			ret = 1;
 			break;
 		}
@@ -240,17 +268,22 @@ r2dp_nh_maint(struct r2dp_nh_tab *t)
 			uint32_t i;
 			if (t->wanted && !t->wanted(t->wanted_arg, q[j].ip)) {
 				t->n_unwanted++;
+				nh_resolved(t, q[j].ip);
 				continue;
 			}
 			for (i = 0; i < t->npend && t->pend[i].ip != q[j].ip; i++)
 				;
-			if (i < t->npend)
+			if (i < t->npend) {
+				/* ring order is learn order: newer wins */
 				t->pend[i].mac = q[j].mac;
-			else if (t->npend < R2DP_NH_PEND_MAX)
-				t->pend[t->npend++] = q[j];
-			else
+				nh_resolved(t, q[j].ip);
+			} else if (t->npend < R2DP_NH_PEND_MAX)
+				t->pend[t->npend++] = q[j];   /* stays counted */
+			else {
+				nh_resolved(t, q[j].ip);
 				__atomic_fetch_add(&t->n_q_drop, 1,
 				    __ATOMIC_RELAXED);
+			}
 		}
 	for (int pass = 0; pass < 2; pass++) {
 		if (t->want_grow) {
@@ -268,10 +301,12 @@ r2dp_nh_maint(struct r2dp_nh_tab *t)
 		for (uint32_t i = 0; i < t->npend; )
 			if (t->wanted && !t->wanted(t->wanted_arg, t->pend[i].ip)) {
 				t->n_unwanted++;
+				nh_resolved(t, t->pend[i].ip);
 				t->pend[i] = t->pend[--t->npend];
-			} else if (nh_put(t, t->pend[i].ip, t->pend[i].mac) >= 0)
+			} else if (nh_put(t, t->pend[i].ip, t->pend[i].mac) >= 0) {
+				nh_resolved(t, t->pend[i].ip);
 				t->pend[i] = t->pend[--t->npend];
-			else
+			} else
 				i++;
 		if (!t->npend || old)
 			break;

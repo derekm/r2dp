@@ -121,6 +121,78 @@ basic(void)
 	r2dp_nh_free(&t);
 }
 
+/* NH-2: a learn deferred to the queue (lock busy) must never overwrite a
+ * newer observation of the same peer, direct or same-MAC. */
+static unsigned
+obucket_sum(const struct r2dp_nh_tab *t)
+{
+	unsigned s = 0;
+	for (unsigned i = 0; i < R2DP_NH_OBUCKETS; i++)
+		s += t->outstanding[i];
+	return s;
+}
+
+static void
+ordering(void)
+{
+	struct r2dp_nh_tab t;
+	const uint8_t A[6] = { 0x02, 0, 0, 0, 0, 0xa };
+	const uint8_t B[6] = { 0x02, 0, 0, 0, 0, 0xb };
+	const uint8_t C[6] = { 0x02, 0, 0, 0, 0, 0xc };
+	uint8_t mo[6];
+	int r;
+
+	if (r2dp_nh_init(&t, "nh_order", 0, NULL, SOCKET_ID_ANY)) {
+		CHECK(0, "table init"); return;
+	}
+	/* trace 1: queued A, then B while the lock is free */
+	rte_spinlock_lock(&t.lock);
+	r = r2dp_nh_learn(&t, 9, A);
+	rte_spinlock_unlock(&t.lock);
+	CHECK(r == 4, "learn while the writer lock is held is queued");
+	CHECK(r2dp_nh_learn(&t, 9, B) == 4,
+	    "a newer learn queues behind the older queued one");
+	r2dp_nh_maint(&t);
+	r2dp_nh_maint(&t);
+	CHECK(r2dp_nh_lookup(&t, 9, mo) && !memcmp(mo, B, 6),
+	    "queued older MAC does not overwrite the newer one");
+	CHECK(obucket_sum(&t) == 0, "every queued learn resolved");
+	CHECK(r2dp_nh_learn(&t, 9, B) == 0, "same-MAC fast path back once drained");
+
+	/* trace 2: installed B, queued A, then same-MAC B again */
+	rte_spinlock_lock(&t.lock);
+	r = r2dp_nh_learn(&t, 9, A);
+	rte_spinlock_unlock(&t.lock);
+	CHECK(r == 4 && r2dp_nh_learn(&t, 9, B) == 4,
+	    "same-MAC observation behind a queued change is queued too");
+	r2dp_nh_maint(&t);
+	CHECK(r2dp_nh_lookup(&t, 9, mo) && !memcmp(mo, B, 6),
+	    "newest observation (same MAC) wins over the queued change");
+
+	/* several changes queued, the last one wins; another peer unaffected */
+	CHECK(r2dp_nh_learn(&t, 10, C) == 1, "unrelated peer learned directly");
+	rte_spinlock_lock(&t.lock);
+	r2dp_nh_learn(&t, 9, A);
+	r2dp_nh_learn(&t, 9, C);
+	rte_spinlock_unlock(&t.lock);
+	r2dp_nh_learn(&t, 9, A);
+	r2dp_nh_learn(&t, 9, B);
+	r2dp_nh_maint(&t);
+	CHECK(r2dp_nh_lookup(&t, 9, mo) && !memcmp(mo, B, 6) &&
+	    r2dp_nh_lookup(&t, 10, mo) && !memcmp(mo, C, 6) &&
+	    obucket_sum(&t) == 0, "last of several queued changes wins");
+
+	/* delete with a learn still queued: counter not leaked */
+	rte_spinlock_lock(&t.lock);
+	r2dp_nh_learn(&t, 11, A);
+	rte_spinlock_unlock(&t.lock);
+	r2dp_nh_maint(&t);   /* installs 11 */
+	r2dp_nh_del(&t, 11);
+	CHECK(obucket_sum(&t) == 0 && !r2dp_nh_lookup(&t, 11, mo),
+	    "delete leaves no outstanding count behind");
+	r2dp_nh_free(&t);
+}
+
 static void
 many(unsigned n)
 {
@@ -326,6 +398,7 @@ main(void)
 		puts("FAIL rcu"); return 1;
 	}
 	basic();
+	ordering();
 	many(65);
 	many(1000);
 	grow_alloc_failure();

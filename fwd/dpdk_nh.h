@@ -30,6 +30,11 @@
  *     is retried on every pass (stats: pending, grow_fail).  If even the
  *     ring/pending list is full the learn is refused and counted (q_drop);
  *     the peer's next IKE/ESP frame offers it again.
+ *   - Ordering: while a learn of a peer is still queued (its bucket in
+ *     `outstanding` is nonzero), every later learn of that peer -- even a
+ *     same-MAC one -- is queued behind it, and the queue applies them in
+ *     order, so a deferred older MAC never overwrites a newer one.  Learns
+ *     racing on two lcores have no defined order either way.
  *   - Deleted key slots are recycled only after a grace period
  *     (rte_hash_rcu_qsbr_add, defer-queue mode, on the forwarder's QSBR).
  */
@@ -49,6 +54,7 @@
 #define R2DP_NH_MAX_CAP      (1u << 24)  /* growth stops here */
 #define R2DP_NH_PEND_MAX     4096u       /* learns parked for the next pass */
 #define R2DP_NH_RING_SZ      4096u
+#define R2DP_NH_OBUCKETS     1024u       /* outstanding-learn buckets */
 
 struct r2dp_nh_req {
 	uint32_t ip;
@@ -81,6 +87,12 @@ struct r2dp_nh_tab {
 	int               (*wanted)(void *arg, uint32_t ip);
 	void               *wanted_arg;
 	uint64_t            n_unwanted;   /* queued learns dropped by wanted() */
+	/* Queued learns not yet resolved, by hash bucket of the peer.  While
+	 * a peer's bucket is nonzero its learns (even same-MAC) go through
+	 * the queue behind the older ones, so a deferred observation can
+	 * never overwrite a newer direct one (NH-2).  Producers increment
+	 * before enqueue; the maintenance side decrements as it resolves. */
+	uint32_t            outstanding[R2DP_NH_OBUCKETS];
 	/* test hook: fail this many growth attempts as if out of memory */
 	uint32_t            inject_grow_fail;
 };
