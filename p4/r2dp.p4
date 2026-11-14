@@ -13,8 +13,9 @@
 // ARP, plaintext) are NOT dropped — they forward clear (IPv4 routes by dst,
 // non-IP ARP is forced inner/outer via next_hop_preserve ids 2/3).  UDP/4500
 // is demuxed on the RFC 3948 zero marker (non-ESP keepalive/IKE forwarded
-// clear; a non-zero SPI is ESP-in-UDP).  SAD/SPD are still exact
-// (src,dst,proto) only, and the inbound miss action is `drop`, which is NOT
+// clear; a non-zero SPI is ESP-in-UDP).  SAD is exact (ipv4.dst_addr, spi);
+// SPD is exact (src_addr, dst_addr, protocol) — both still exact-only — and
+// the inbound miss action is `drop`, which is NOT
 // the DPDK backend's DR_NO_SA_IN counter — those remain as known scoped
 // limits, not full parity.  Do not reintroduce the pre-§8 IKE/ARP drops or
 // the blanket "every UDP/4500 is ESP" parse.
