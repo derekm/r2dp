@@ -86,7 +86,7 @@ main(int argc, char **argv)
 	int n;
 	struct rte_eth_conf conf;
 	struct rte_mbuf *tx;
-	uint16_t sent, received = 0;
+	uint16_t sent;
 
 	n = rte_eal_init(argc, argv);
 	if (n < 0) { fprintf(stderr, "EAL init failed\n"); return 1; }
@@ -111,9 +111,12 @@ main(int argc, char **argv)
 	/* wait for memif link-up on both legs */
 	for (int i = 0; i < 100; i++) {
 		struct rte_eth_link l0, l1;
-		rte_eth_link_get_nowait(0, &l0);
-		rte_eth_link_get_nowait(1, &l1);
-		if (l0.link_status && l1.link_status)
+
+		memset(&l0, 0, sizeof(l0));
+		memset(&l1, 0, sizeof(l1));
+		if (rte_eth_link_get_nowait(0, &l0) == 0 &&
+		    rte_eth_link_get_nowait(1, &l1) == 0 &&
+		    l0.link_status && l1.link_status)
 			break;
 		rte_delay_ms(100);
 	}
