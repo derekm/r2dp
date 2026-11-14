@@ -29,6 +29,10 @@ jobs:
         run: |
           bash ci/ci_all_branches.sh
 
+      - name: Guard self-test (each guard passes clean, fails on a fixture)
+        run: |
+          bash ci/guard-selftest.sh
+
       - name: No-backup/scratch-cruft regression guard
         run: |
           bash ci/no-cruft-guard.sh
