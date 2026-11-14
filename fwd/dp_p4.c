@@ -145,7 +145,7 @@ struct p4_inst {
 	int th_started;
 	atomic_int running;
 
-	/* RX/egress packet counters (set by the slice worker, SIGUSR1 dump). */
+	/* RX/egress packet counters (set by the I/O thread, read by SIGUSR1 dump). */
 	unsigned long c_outer, c_inner, c_out0, c_out1;
 };
 
@@ -162,8 +162,9 @@ struct p4_priv {
 	/* I/O legs: outer = ciphertext/wire side, inner = plaintext side.
 	 * Each maps an ethdev port to a pipeline input ring and an output
 	 * ring (see the iospec / port_in_* names).  Shared across slices: the
-	 * RX thread hashes each frame to one slice's input rings (per-flow
-	 * affinity), the slice's TX writes the leg. */
+	 * single I/O thread hashes each RX frame to one slice's input rings
+	 * (per-flow affinity) and drains every slice's egress to TX -- so each
+	 * ethdev queue has ONE consumer (RX) and ONE producer (TX). */
 	int outer_port, inner_port;
 	struct rte_mempool *pool;
 
@@ -308,12 +309,14 @@ static void *p4_worker(void *arg)
  * state (CSP replay window, SA crypto) lives on a single core.
  *
  * Affinity keys:
- *  - ESP (proto 50): outer IPv4 dst + SPI.  SA is pinned by (dst,spi), so
- *    all fragments/REPLAY of one SA go to the same slice (replay window is
- *    per-SA, in the extern).  SPI read from the ESP header.
+ *  - ESP (proto 50): outer IPv4 src + dst.  Do NOT pin on SPI: only the
+ *    FIRST fragment carries the ESP header/SPI, so a (dst, spi) hash would
+ *    scatter one SA's fragments across slices.  src+dst is fragment-invariant
+ *    and keeps an entire SA (incl. all its fragments) on one slice, so the
+ *    extern's per-SA state (CSP replay window, SA crypto) stays on one core.
  *  - Everything else: (proto, src, dst, sport, dport) 5-tuple.
  * Returns 0..n_inst-1; must be stable across relaunch (fixed seed = xor
- * fold, no randomness).
+ * fold, no randomness).  For n_inst<=1 returns slice 0 without hashing.
  */
 static uint32_t p4_xor(const uint8_t *p, size_t n)
 {
@@ -1421,8 +1424,9 @@ static int p4_start(struct fwd_dp *dp)
 
 		/* Launch this slice's packet-path worker (or the self-injecting
 		 * bench worker when R2DP_P4_BENCH is set).  In the live path the
-		 * per-slice worker only runs pipeline+extern+TX; RX is owned by the
-		 * single distributor thread started after p4_io_init below. */
+		 * per-slice worker only runs pipeline+extern; the single I/O thread
+		 * owns both ethdev RX and TX.  In bench mode workers self-inject, so
+		 * the I/O thread is not started. */
 		atomic_store_explicit(&pr->inst[s].running, 1, __ATOMIC_RELAXED);
 		{
 			void *(*wk)(void *) = getenv("R2DP_P4_BENCH")
@@ -1523,7 +1527,14 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 					if (rc) {
 						/* keep the slot live: the dataplane still owns
 						 * the (dip,spi)->SA binding (ctl drops its entry
-						 * only on success, dp.h/ctl.c contract). */
+						 * only on success, dp.h/ctl.c contract).
+						 * Slices 0..s-1 already have the delete
+						 * SCHEDULED; abort() them or a later successful
+						 * commit publishes the SAD drop while ctl still
+						 * owns the SA (inbound miss = drop = blackhole). */
+						for (unsigned t = 0; t < s; t++)
+							rte_swx_ctl_pipeline_abort(
+								pr->inst[t].ctl);
 						P4_LOG("slice %u inbound entry del %d", s, rc);
 						return rc;
 					}
@@ -1585,8 +1596,9 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		}
 		/* Inbound delete: the (dip,spi) table delete is already scheduled.
 		 * Apply it BEFORE tearing down the crypto SA / slot: with
-		 * abort_on_fail=1 a failed commit rolls the delete back, and ctl
-		 * keeps the SA on error, so the dataplane must still own it. */
+		 * abort_on_fail=1 a failed commit rolls that slice's delete back,
+		 * and ctl keeps the SA on error, so the dataplane must still own
+		 * it. */
 		{
 			unsigned s;
 			for (s = 0; s < pr->n_inst; s++) {
@@ -1594,6 +1606,19 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 				if (rc) {
 					P4_LOG("slice %u inbound sa del commit %d; keeping SA",
 					       s, rc);
+					/* Slices s+1..n-1 still have the delete
+					 * SCHEDULED.  abort() them or a later
+					 * successful commit anywhere publishes the
+					 * drop while ctl still owns the SA (inbound
+					 * miss = drop = blackhole, but ctl's retry
+					 * would then find the row gone).  Slices
+					 * 0..s-1 already committed cannot be rolled
+					 * back; ctl keeps the SA, so those slices
+					 * keep the (now orphaned) SAD row until a
+					 * retry commits. */
+					for (unsigned t = s + 1; t < pr->n_inst; t++)
+						rte_swx_ctl_pipeline_abort(
+							pr->inst[t].ctl);
 					return rc;
 				}
 			}
@@ -2070,8 +2095,18 @@ static int p4_spd_rebind(struct p4_priv *pr)
 	}
 	for (unsigned s = 0; s < pr->n_inst; s++) {
 		int crc = rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
-		if (crc)
+		if (crc) {
+			/* Slices s+1..n-1 still have the rebind SCHEDULED
+			 * (p4_spd_bind does not commit).  A later successful
+			 * commit anywhere would publish it and change the SPD
+			 * after ctl's SA op already failed/rolled back.  Abort
+			 * the uncommitted slices so the exclusion is not
+			 * published late.  Slices 0..s-1 already committed cannot
+			 * be undone. */
+			for (unsigned t = s + 1; t < pr->n_inst; t++)
+				rte_swx_ctl_pipeline_abort(pr->inst[t].ctl);
 			return crc;
+		}
 	}
 	return 0;
 }

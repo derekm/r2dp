@@ -192,15 +192,20 @@ per-slice best_cyc_pkt pps):**
   one cryptodev N QPs, per-shard pipeline/extern/pool/rings, core pinning,
   N-worker bench, honest aggregate, no pool OOM under `-m 1024`.
 - **VERIFIED (live path):** Section 5 RX steering implemented + live-proven.
-  A single `p4_rx_worker` distributor hashes each frame to a slice (ESP ->
-  outer dst+SPI for per-SA replay affinity; else 5-tuple), one RX thread =
-  single ethdev consumer.  Live-proven on `.165` N=2 (openssl, root tap):
-  both shards `SA add ok` + `OUT BIND installed`; `crypto enq=deq>0` (real
-  ESP); `a6(PROTECT)>0` out0 egress on the forwarding shard.
-- **VERIFIED delete-proof-per-shard (live, N=2).** After `sp-del` +
-  re-inject: before `a6=24467 a7=0`; after `a6=24467 a7=15192 ob_miss=15192`
-  -- the outbound row was removed on every shard and new frames fall to the
-  bypass default, matching the shared mirror.  `p4_live_proof.sh` runs this.
+  A single `p4_io_worker` (renamed from `p4_rx_worker`) owns BOTH ethdev legs:
+  it distributes RX by hashing each frame to a slice (ESP -> outer IP src+dst
+  -- fragment-invariant, NOT dst+SPI which would scatter an SA's fragments;
+  else 5-tuple) and does all TX.  One thread = single ethdev consumer AND
+  single producer (no TX data race).  Live-proven on `.165` N=2 (openssl,
+  root tap): both shards `SA add ok` + `OUT BIND installed`; `crypto
+  enq=deq>0` (real ESP); `a6(PROTECT)>0` out0 egress on the forwarding shard.
+- **Delete-proof (live, N=2; harness re-added as `SPDEL=1`).** After
+  `sp-del` + re-inject: before `a6=24467 a7=0`; after `a6=24467 a7=15192
+  ob_miss=15192` -- the outbound row was removed on the forwarding shard and
+  new frames fall to the bypass default.  Caveat (review `deleg_14119f51`):
+  the OTHER shard was idle (`in_rx~14`), so this demonstrated ONE shard's
+  delete only; `bench/p4_live_proof.sh SPDEL=1` re-runs it.  Not claimed
+  per-every-shard.
 - **VERIFIED hash stability across relaunch.** `p4_flow_slice` is a pure
   function (fixed xor-fold seed, no state/env), so same (flow, N) => same
   slice on every launch; checked deterministically for representative ESP +
@@ -253,6 +258,23 @@ per-slice best_cyc_pkt pps):**
   uint32s; the correct key is { ntohl(dip), ntohl(spi) } in BOTH fields.
   Live N=2 openssl: ib hit 0->380, crypto enq=deq 0->288 for 300 distinct
   ESP seqs (previously 0).  N=1 bench gate unchanged.
+- **VERIFIED (`1dd9700`) third-round review `deleg_ce36234f` (harness +
+   atomicity), re-proven live:**
+  - `bench/p4_live_proof.sh` is FIXED and now actually runs its injector
+    (writes and runs the SAME /tmp/liveinj.py path), records the real
+    forwarder via socket-keyed `sudo pgrep` (never sudo's `$!`), kills it
+    as root, propagates ssh exit status so a failed step fails the run, and
+    re-adds the `sp-del` + re-inject as `SPDEL=1`.  Live re-proven on .165
+    N=2: pre-delete in_rx=18406 ob_hit=18394 a6=18394 crypto enq=deq=18368;
+    post `sp-del` a7(BYPASS)=17762 ob_miss=17762 -- outbound FORWARDING shard
+    row removed, new frames fall to bypass.  (Caveat stands: the OTHER shard
+    was idle in this one-flow test; delete proven on the forwarding shard.)
+  - Inbound `SA_DEL` now aborts uncommitted slices on BOTH schedule-phase and
+    commit-phase failure (no pending SAD delete published by a later commit
+    while ctl still owns the SA).
+  - `p4_spd_rebind` aborts uncommitted slices on a mid-loop commit failure.
+  - `p4_flow_slice` header/comment + doc now say (src,dst), matching the
+    fragment-invariant body (stale (dst,SPI) references removed).
 - Remaining for a full APPROVE (procedures, not missing code):
   - live replay/seq-integrity assertion (same-flow monotonic seq on the
     pinned shard) -- steering makes this possible by construction (per-SA
@@ -266,10 +288,12 @@ per-slice best_cyc_pkt pps):**
 **Checks on the live path (memif/tap), not just bench:**
 - per-SA affinity: `p4_live_proof.sh` proves a flow steers to one shard
   (N=2, one-flow case) with crypto enq/deq on that extern.
-- delete proof per shard: proven live (a6->a7 on every shard) above.
-- replay/seq integrity: steering pins the flow to one shard by (dst,spi)
-  so replay state is single-owner; an explicit multi-packet replay test is
-  the remaining reviewer assertion.
+- delete proof: proven live on the forwarding shard (a6->a7 above); the
+  other shard was idle, so `bench/p4_live_proof.sh SPDEL=1` re-injects to
+  confirm.  Not claimed per-every-shard until that re-run.
+- replay/seq integrity: steering pins the flow to one shard by outer
+  (src,dst) so replay state is single-owner; an explicit multi-packet replay
+  test is the remaining reviewer assertion.
 
 ---
 
