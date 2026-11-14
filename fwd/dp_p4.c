@@ -82,6 +82,13 @@
 #define R2DP_SWX_SRC "/usr/src/dpdk"
 #endif
 
+/* Max P4 pipeline slices (cores) this binary can run.  Compiled in so the
+ * per-slice arrays are fixed (no malloc'd VLA of icky structs); default 8.
+ * R2DP_P4_WORKERS at runtime selects how many are actually started. */
+#ifndef R2DP_P4_MAX_INST
+#define R2DP_P4_MAX_INST 8
+#endif
+
 #define P4_LOG(fmt, ...) \
 	fprintf(stderr, "r2dp-fwd: p4: " fmt "\n", ##__VA_ARGS__)
 
@@ -92,7 +99,10 @@ struct p4_sa {
 	uint32_t spi;        /* host order */
 	uint32_t sip;        /* host order tunnel src */
 	uint32_t dip;        /* host order tunnel dst */
-	uint32_t sl_id;      /* sa_index == ipsec_hdr.sa_id the action writes */
+	uint32_t sl_id[R2DP_P4_MAX_INST]; /* per-slice cryptodev SA id: each
+					  * slice's ipsec extern allocates its
+					  * own SA id, so a logical SA maps to
+					  * one id per slice */
 	uint64_t gen;        /* install generation (higher = newer) */
 	int in_use;
 	uint8_t proto;
@@ -109,10 +119,34 @@ struct p4_pol {
 	uint32_t bound_sl_id;            /* bound egress crypto id; UINT32_MAX */
 };
 
-struct p4_priv {
+/* A P4 data-plane "slice" (NIC pipeline stage): one complete copy of the PNA
+ * program -- its own rte_swx_pipeline, its own ctl handle, its own ipsec
+ * extern (own cryptodev queue pair), and its own bounded rings.  A slice is
+ * single-owner (rte_swx_* is not threaded), exactly like one P4 pipeline
+ * stage on a NIC.  N slices run on N cores; R2DP_P4_WORKERS sets N (default 1
+ * = the historical single-pipeline layout, byte-for-byte). */
+struct p4_inst {
 	struct rte_swx_pipeline *p;
 	struct rte_swx_ctl_pipeline *ctl;
 	struct rte_swx_ipsec *ipsec;
+	uint8_t cdev_qp;                 /* this slice's cryptodev queue pair */
+
+	/* Bounded rings bridging the ethdev legs to this slice's pipeline
+	 * (names are per-slice-suffixed: R2DP_IN0_<i>, IP_IN_<i>, ...). */
+	struct rte_ring *in0, *in1, *out0, *out1;
+
+	/* Slice run worker. */
+	pthread_t th;
+	int th_started;
+	atomic_int running;
+
+	/* RX/egress packet counters (set by the slice worker, SIGUSR1 dump). */
+	unsigned long c_outer, c_inner, c_out0, c_out1;
+};
+
+struct p4_priv {
+	uint32_t n_inst;                     /* number of slices (>=1) */
+	struct p4_inst inst[R2DP_P4_MAX_INST];
 	struct p4_sa sad[P4_SA_MAX];
 	struct p4_pol spd[P4_SP_MAX];
 	uint64_t gen;                       /* next p4_sa install generation */
@@ -122,22 +156,15 @@ struct p4_priv {
 
 	/* I/O legs: outer = ciphertext/wire side, inner = plaintext side.
 	 * Each maps an ethdev port to a pipeline input ring and an output
-	 * ring (see the iospec / port_in_* names). */
+	 * ring (see the iospec / port_in_* names).  Shared across slices: the
+	 * RX thread hashes each frame to one slice's input rings (per-flow
+	 * affinity), the slice's TX writes the leg. */
 	int outer_port, inner_port;
 	struct rte_mempool *pool;
-	struct rte_ring *in0, *in1, *out0, *out1;
 
 	/* Cached table key layout from table_info (bytes, big-endian order). */
 	uint32_t inbound_key_size;
 	uint32_t outbound_key_size;
-
-	/* Pipeline run worker (brings up the SWX datapath). */
-	pthread_t th;
-	int th_started;
-	atomic_int running;
-
-	/* RX/egress packet counters (set by p4_worker, dumped on SIGUSR1). */
-	unsigned long c_outer, c_inner, c_out0, c_out1;
 
 	int started;
 	int wake_fd;
@@ -170,53 +197,53 @@ static void *p4_worker(void *arg)
 	struct p4_priv *pr = arg;
 	uint64_t last_dump = 0;
 
-	while (atomic_load_explicit(&pr->running, __ATOMIC_RELAXED)) {
+	while (atomic_load_explicit(&pr->inst[0].running, __ATOMIC_RELAXED)) {
 		/* Bridge RX: outer -> in0, inner -> in1. */
-		if (pr->outer_port >= 0 && pr->in0 && pr->pool) {
+		if (pr->outer_port >= 0 && pr->inst[0].in0 && pr->pool) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
 			uint16_t n = rte_eth_rx_burst(pr->outer_port, 0,
 						      pkts, P4_BURST_SZ);
 			if (n) {
-				pr->c_outer += n;
-				rte_ring_enqueue_bulk(pr->in0, (void **)pkts,
+				pr->inst[0].c_outer += n;
+				rte_ring_enqueue_bulk(pr->inst[0].in0, (void **)pkts,
 						      n, NULL);
 			}
 		}
-		if (pr->inner_port >= 0 && pr->in1 && pr->pool) {
+		if (pr->inner_port >= 0 && pr->inst[0].in1 && pr->pool) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
 			uint16_t n = rte_eth_rx_burst(pr->inner_port, 0,
 						      pkts, P4_BURST_SZ);
 			if (n) {
-				pr->c_inner += n;
-				rte_ring_enqueue_bulk(pr->in1, (void **)pkts,
+				pr->inst[0].c_inner += n;
+				rte_ring_enqueue_bulk(pr->inst[0].in1, (void **)pkts,
 						      n, NULL);
 			}
 		}
 
 		/* Run the pipeline + ipsec extern. */
-		if (pr->p)
-			rte_swx_pipeline_run(pr->p, P4_RUN_QUANTA);
-		if (pr->ipsec)
-			rte_swx_ipsec_run(pr->ipsec);
+		if (pr->inst[0].p)
+			rte_swx_pipeline_run(pr->inst[0].p, P4_RUN_QUANTA);
+		if (pr->inst[0].ipsec)
+			rte_swx_ipsec_run(pr->inst[0].ipsec);
 
 		/* Bridge TX: out0 -> outer, out1 -> inner. */
-		if (pr->outer_port >= 0 && pr->out0) {
+		if (pr->outer_port >= 0 && pr->inst[0].out0) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
-			uint16_t n = rte_ring_dequeue_burst(pr->out0,
+			uint16_t n = rte_ring_dequeue_burst(pr->inst[0].out0,
 							    (void **)pkts,
 							    P4_BURST_SZ, NULL);
 			if (n) {
-				pr->c_out0 += n;
+				pr->inst[0].c_out0 += n;
 				rte_eth_tx_burst(pr->outer_port, 0, pkts, n);
 			}
 		}
-		if (pr->inner_port >= 0 && pr->out1) {
+		if (pr->inner_port >= 0 && pr->inst[0].out1) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
-			uint16_t n = rte_ring_dequeue_burst(pr->out1,
+			uint16_t n = rte_ring_dequeue_burst(pr->inst[0].out1,
 							    (void **)pkts,
 							    P4_BURST_SZ, NULL);
 			if (n) {
-				pr->c_out1 += n;
+				pr->inst[0].c_out1 += n;
 				rte_eth_tx_burst(pr->inner_port, 0, pkts, n);
 			}
 		}
@@ -226,10 +253,10 @@ static void *p4_worker(void *arg)
 		if (fwd_stats_req)
 			p4_stats_on_req(pr);
 		if (rte_get_tsc_cycles() - last_dump > rte_get_tsc_hz()) {
-			uint32_t q0 = rte_ring_count(pr->in0);
-			uint32_t q1 = rte_ring_count(pr->in1);
-			uint32_t qo0 = rte_ring_count(pr->out0);
-			uint32_t qo1 = rte_ring_count(pr->out1);
+			uint32_t q0 = rte_ring_count(pr->inst[0].in0);
+			uint32_t q1 = rte_ring_count(pr->inst[0].in1);
+			uint32_t qo0 = rte_ring_count(pr->inst[0].out0);
+			uint32_t qo1 = rte_ring_count(pr->inst[0].out1);
 			struct rte_swx_table_stats ts1;
 			static uint64_t act1[16];
 			struct rte_ring *ipin = rte_ring_lookup("IP_IN");
@@ -250,7 +277,7 @@ static void *p4_worker(void *arg)
 				static uint64_t iba[16];
 				memset(&ibs, 0, sizeof(ibs));
 				ibs.n_pkts_action = iba;
-				if (rte_swx_ctl_pipeline_table_stats_read(pr->p,
+				if (rte_swx_ctl_pipeline_table_stats_read(pr->inst[0].p,
 					 "inbound_table_0", &ibs) == 0)
 					P4_LOG("ib: hit=%llu miss=%llu a0=%llu a1=%llu",
 					       (unsigned long long)ibs.n_pkts_hit,
@@ -258,15 +285,15 @@ static void *p4_worker(void *arg)
 					       (unsigned long long)iba[0],
 					       (unsigned long long)iba[1]);
 			}
-			if (rte_swx_ctl_pipeline_table_stats_read(pr->p,
+			if (rte_swx_ctl_pipeline_table_stats_read(pr->inst[0].p,
 				 "outbound_table_0", &ts1) == 0)
 				P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
 				       "| rings in0=%u in1=%u out0r=%u out1r=%u "
 				       "| ipsec ipin=%u ipout=%u "
 				       "| ob_hit=%llu ob_miss=%llu "
 				       "| act a5=%llu a6=%llu a7=%llu",
-				       pr->c_outer, pr->c_inner, pr->c_out0,
-				       pr->c_out1, q0, q1, qo0, qo1, qi, qo,
+				       pr->inst[0].c_outer, pr->inst[0].c_inner, pr->inst[0].c_out0,
+				       pr->inst[0].c_out1, q0, q1, qo0, qo1, qi, qo,
 				       (unsigned long long)ts1.n_pkts_hit,
 				       (unsigned long long)ts1.n_pkts_miss,
 				       (unsigned long long)act1[5],
@@ -275,8 +302,8 @@ static void *p4_worker(void *arg)
 			else
 				P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
 				       "| rings in0=%u in1=%u out0r=%u out1r=%u",
-				       pr->c_outer, pr->c_inner, pr->c_out0,
-				       pr->c_out1, q0, q1, qo0, qo1);
+				       pr->inst[0].c_outer, pr->inst[0].c_inner, pr->inst[0].c_out0,
+				       pr->inst[0].c_out1, q0, q1, qo0, qo1);
 			last_dump = rte_get_tsc_cycles();
 		}
 	}
@@ -320,7 +347,7 @@ static void *p4_bench_worker(void *arg)
 	struct p4_priv *pr = arg;
 	unsigned waited = 0;
 
-	while (atomic_load_explicit(&pr->running, __ATOMIC_RELAXED) &&
+	while (atomic_load_explicit(&pr->inst[0].running, __ATOMIC_RELAXED) &&
 	       waited++ < P4_BENCH_WAIT_HZ * 2) {
 		for (int i = 0; i < P4_SP_MAX; i++) {
 			struct p4_pol *q = &pr->spd[i];
@@ -369,7 +396,7 @@ armed:
 			{
 				void *pkts[P4_BURST_SZ];
 				uint16_t r;
-				while ((r = rte_ring_dequeue_burst(pr->out0,
+				while ((r = rte_ring_dequeue_burst(pr->inst[0].out0,
 								      pkts,
 								      P4_BURST_SZ,
 								      NULL))) {
@@ -423,20 +450,20 @@ armed:
 				if (!n)
 					break;
 				/* feed the pipeline's inner leg */
-				enq = rte_ring_enqueue_burst(pr->in1,
+				enq = rte_ring_enqueue_burst(pr->inst[0].in1,
 							     (void **)mk,
 							     n, NULL);
 				/* free any not enqueued (ring full) */
 				for (int k = enq; k < n; k++)
 					rte_pktmbuf_free(mk[k]);
 				/* run data plane */
-				rte_swx_pipeline_run(pr->p, P4_RUN_QUANTA);
-				rte_swx_ipsec_run(pr->ipsec);
+				rte_swx_pipeline_run(pr->inst[0].p, P4_RUN_QUANTA);
+				rte_swx_ipsec_run(pr->inst[0].ipsec);
 				/* drain egress (ESP to the outer leg) */
 				{
 					struct rte_mbuf *rx[P4_BURST_SZ];
 					uint16_t r =
-					    rte_ring_dequeue_burst(pr->out0,
+					    rte_ring_dequeue_burst(pr->inst[0].out0,
 								   (void **)rx,
 								   P4_BURST_SZ,
 								   NULL);
@@ -474,11 +501,16 @@ armed:
 static void
 p4_stats_dump(struct p4_priv *p, FILE *f)
 {
-	unsigned long nrx, ntx, ndrop;
-	unsigned sa_n = 0, sp_n = 0, i;
+	unsigned long nrx = 0, ntx = 0, ndrop;
+	unsigned sa_n = 0, sp_n = 0, i, s;
 
-	nrx = p->c_outer + p->c_inner;
-	ntx = p->c_out0 + p->c_out1;
+	/* Aggregate packet counters across all slices (a multicore forwarder
+	 * reports the whole, not slice 0).  SAD/SPD mirror is shared, so count
+	 * it once. */
+	for (s = 0; s < p->n_inst; s++) {
+		nrx += p->inst[s].c_outer + p->inst[s].c_inner;
+		ntx += p->inst[s].c_out0 + p->inst[s].c_out1;
+	}
 	ndrop = (nrx > ntx) ? (nrx - ntx) : 0;
 	for (i = 0; i < P4_SA_MAX; i++)
 		sa_n += !!p->sad[i].in_use;
@@ -742,22 +774,29 @@ static int p4_crypto_init(struct p4_priv *pr)
 	pr->cdev_id = id;
 	memset(&cconf, 0, sizeof(cconf));
 	cconf.socket_id = SOCKET_ID_ANY;
-	cconf.nb_queue_pairs = 1;
+	cconf.nb_queue_pairs = (uint16_t)pr->n_inst;
 	memset(&qconf, 0, sizeof(qconf));
 	qconf.nb_descriptors = 2048;
 	if (rte_cryptodev_configure(id, &cconf) < 0) {
-		P4_LOG("cryptodev configure failed");
+		P4_LOG("cryptodev configure failed (%u qp)", pr->n_inst);
 		return -EIO;
 	}
-	if (rte_cryptodev_queue_pair_setup(id, 0, &qconf, SOCKET_ID_ANY) < 0) {
-		P4_LOG("cryptodev qp0 setup failed");
-		return -EIO;
+	{
+		/* one queue pair per slice */
+		unsigned s;
+		for (s = 0; s < pr->n_inst; s++)
+			if (rte_cryptodev_queue_pair_setup(id, s, &qconf,
+							   SOCKET_ID_ANY) < 0) {
+				P4_LOG("cryptodev qp%u setup failed", s);
+				return -EIO;
+			}
 	}
 	if (rte_cryptodev_start(id) < 0) {
 		P4_LOG("cryptodev start failed");
 		return -EIO;
 	}
-	P4_LOG("crypto %s ready", rte_cryptodev_name_get(id));
+	P4_LOG("crypto %s ready (%u qp)", rte_cryptodev_name_get(id),
+	       pr->n_inst);
 	return 0;
 }
 
@@ -791,14 +830,26 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 	int rc;
 
 	/* The iospec ring ports and the ipsec extern's rings must pre-exist. */
-	{   const char *ring_names[] = { "R2DP_IN0", "R2DP_IN1", "R2DP_OUT0",
-					"R2DP_OUT1", "IP_IN", "IP_OUT", NULL };
-	    int i;
-	    for (i = 0; ring_names[i]; i++) {
-		int rr = p4_ring(ring_names[i]);
-		if (rr) { P4_LOG("ring %s: %s", ring_names[i],
-				strerror(-rr)); return rr; }
-	    }
+	{
+		const char *ring_names[] = { "R2DP_IN0", "R2DP_IN1", "R2DP_OUT0",
+					     "R2DP_OUT1", "IP_IN", "IP_OUT", NULL };
+		int i;
+		unsigned s;
+		for (s = 0; s < pr->n_inst; s++) {
+			for (i = 0; ring_names[i]; i++) {
+				char nm[80];
+				int rr;
+				if (s == 0)
+					snprintf(nm, sizeof(nm), "%s",
+						 ring_names[i]);
+				else
+					snprintf(nm, sizeof(nm), "%s_%u",
+						 ring_names[i], s);
+				rr = p4_ring(nm);
+				if (rr) { P4_LOG("ring %s: %s", nm,
+						strerror(-rr)); return rr; }
+			}
+		}
 	}
 
 	/* Codegen .c/.so land in a WRITABLE scratch dir (the spec itself may
@@ -899,20 +950,65 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 		return -EIO;
 	}
 
+	/*
+	 * Build one pipeline per slice.  The codegen C is compiled ONCE to a
+	 * shared .so (all slices run the identical PNA program) and that .so is
+	 * instantiated once per slice.  Slice 0 keeps the historical unsigned
+	 * ring names (R2DP_IN0, IP_IN, ...) so N=1 is byte-identical; slices
+	 * >=1 get a numeric suffix (R2DP_IN0_1, IP_IN_1, ...) so no two
+	 * pipelines share a ring (rte_swx_* is single-owner; a shared ring
+	 * across two workers is a data race).  The per-slice iospec is written
+	 * to the scratch dir before each build_from_lib.
+	 */
 	{
-		FILE *io_f = fopen(pr->iospec_path, "r");
-		if (!io_f) {
-			P4_LOG("iospec %s: %s", pr->iospec_path,
-			       strerror(errno));
-			return -errno;
+		unsigned s;
+		for (s = 0; s < pr->n_inst; s++) {
+			char io_path[PATH_MAX + 32];
+			char rn[80];
+			FILE *io_f, *ir;
+			snprintf(io_path, sizeof(io_path), "%s/%s_%u.io",
+				 tmp, base, s);
+			io_f = fopen(io_path, "w");
+			if (!io_f) {
+				P4_LOG("iospec %s: %s", io_path,
+				       strerror(errno));
+				return -errno;
+			}
+#define P4_IO_RING(pref, n) do { \
+	if (s == 0) snprintf(rn, sizeof(rn), "%s", pref); \
+	else        snprintf(rn, sizeof(rn), "%s_%u", pref, s); \
+	fprintf(io_f, "port in  %d ring %s bsz 32\n", n, rn); \
+	if (s) (void)0; \
+} while (0)
+#define P4_IO_RING_OUT(pref, o) do { \
+	if (s == 0) snprintf(rn, sizeof(rn), "%s", pref); \
+	else        snprintf(rn, sizeof(rn), "%s_%u", pref, s); \
+	fprintf(io_f, "port out %d ring %s bsz 32\n", o, rn); \
+} while (0)
+			P4_IO_RING("R2DP_IN0", 0);
+			P4_IO_RING("R2DP_IN1", 1);
+			P4_IO_RING_OUT("R2DP_OUT0", 0);
+			P4_IO_RING_OUT("R2DP_OUT1", 1);
+			P4_IO_RING("IP_OUT", 2);
+			P4_IO_RING_OUT("IP_IN", 2);
+#undef P4_IO_RING
+#undef P4_IO_RING_OUT
+			fclose(io_f);
+			ir = fopen(io_path, "r");
+			if (!ir) {
+				P4_LOG("iospec %s: %s", io_path,
+				       strerror(errno));
+				return -errno;
+			}
+			rc = rte_swx_pipeline_build_from_lib(&pr->inst[s].p,
+							   "r2dp", code_so,
+							   ir, 0);
+			fclose(ir);
+			if (rc) {
+				P4_LOG("slice %u build_from_lib %d", s, rc);
+				return -EIO;
+			}
 		}
-		rc = rte_swx_pipeline_build_from_lib(&pr->p, "r2dp", code_so,
-						   io_f, 0);
-		fclose(io_f);
-	}
-	if (rc) {
-		P4_LOG("build_from_lib %d", rc);
-		return -EIO;
 	}
 	return 0;
 }
@@ -930,20 +1026,20 @@ static int p4_start(struct fwd_dp *dp)
 	if (rc)
 		return rc;
 
-	pr->ctl = rte_swx_ctl_pipeline_create(pr->p);
-	if (!pr->ctl) {
+	pr->inst[0].ctl = rte_swx_ctl_pipeline_create(pr->inst[0].p);
+	if (!pr->inst[0].ctl) {
 		P4_LOG("ctl pipeline create failed");
 		return -EIO;
 	}
 
 	/* Cache table key sizes (0 = inbound SAD, 1 = outbound SPD; order
 	 * matches the spec -- see header notes). */
-	rc = p4_table_key_size(pr->p, 0, &pr->inbound_key_size);
+	rc = p4_table_key_size(pr->inst[0].p, 0, &pr->inbound_key_size);
 	if (rc) {
 		P4_LOG("inbound table info %d", rc);
 		return -EIO;
 	}
-	rc = p4_table_key_size(pr->p, 1, &pr->outbound_key_size);
+	rc = p4_table_key_size(pr->inst[0].p, 1, &pr->outbound_key_size);
 	if (rc) {
 		P4_LOG("outbound table info %d", rc);
 		return -EIO;
@@ -957,7 +1053,7 @@ static int p4_start(struct fwd_dp *dp)
 	rc = p4_crypto_init(pr);
 	if (rc)
 		return rc;
-	rc = rte_swx_ipsec_create(&pr->ipsec, "r2dp-ipsec",
+	rc = rte_swx_ipsec_create(&pr->inst[0].ipsec, "r2dp-ipsec",
 				  &(struct rte_swx_ipsec_params){
 					.ring_in_name    = "IP_IN",
 					.ring_out_name   = "IP_OUT",
@@ -984,8 +1080,8 @@ static int p4_start(struct fwd_dp *dp)
 	 * ipsec extern's own return rings, IP_IN/IP_OUT, are the from_ipsec
 	 * ports).  Set direction per port and leave ipsec_port_in_* at their
 	 * extern rings' identity (see PLAN §8 / spec apply). */
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->p, "direction", 0, 0);
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->p, "direction", 1, 1);
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p, "direction", 0, 0);
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p, "direction", 1, 1);
 	/* ipsec extern port wiring.  The iospec binds port in 2 = IP_OUT (the
 	 * extern's return ring) and port out 2 = IP_IN (the extern's consume
 	 * ring), matching the DPDK ipsec.spec/ipsec.io reference.  The parser's
@@ -993,13 +1089,13 @@ static int p4_start(struct fwd_dp *dp)
 	 * post-extern `tx` uses ipsec_port_out_*; both must name the extern
 	 * port (2), or an ESP frame is never handed to the extern and never
 	 * recognized as returning from it. */
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p,
 		"ipsec_port_in_inbound", 0, 2);
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p,
 		"ipsec_port_in_outbound", 0, 2);
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p,
 		"ipsec_port_out_inbound", 0, 2);
-	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[0].p,
 		"ipsec_port_out_outbound", 0, 2);
 
 	/* Egress must be reachable, or no frame can leave the dataplane:
@@ -1012,7 +1108,7 @@ static int p4_start(struct fwd_dp *dp)
 	{
 		/* next_hop_set args: dst_mac(6) src_mac(6) ether_type(2) port_id(4). */
 		struct rte_swx_table_entry en;
-		int rid = p4_table_action_id(pr->p, 3, 0);  /* next_hop_set */
+		int rid = p4_table_action_id(pr->inst[0].p, 3, 0);  /* next_hop_set */
 		uint8_t k0[4] = { 0, 0, 0, 0 }, k1[4] = { 1, 0, 0, 0 };
 		uint8_t ab[18];
 		if (rid < 0) {
@@ -1025,17 +1121,17 @@ static int p4_start(struct fwd_dp *dp)
 			en.action_id = (uint64_t)rid;
 			en.action_data = ab;
 			en.key = k0;
-			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
 				 "next_hop_table_0", &en))
 				P4_LOG("next_hop id0 add failed");
 			/* id1 -> inner leg (port 1): port_id at offset 14, written to
 			 * metadata output_port (HOST order, LE 1 = {1,0,0,0}). */
 			ab[14] = 0x01; ab[15] = 0x00; ab[16] = 0x00; ab[17] = 0x00;
 			en.key = k1;
-			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
 				"next_hop_table_0", &en))
 				P4_LOG("next_hop id1 add failed");
-			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+			(void)rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
 			P4_LOG("next_hop table populated (id0->outer, id1->inner)");
 		}
 	}
@@ -1047,7 +1143,7 @@ static int p4_start(struct fwd_dp *dp)
 	 * start (fail-closed), not just log. */
 	{
 		struct rte_swx_table_entry en;
-		int rid = p4_table_action_id(pr->p, 3, 1);  /* next_hop_preserve */
+		int rid = p4_table_action_id(pr->inst[0].p, 3, 1);  /* next_hop_preserve */
 		uint8_t k2[4] = { 2, 0, 0, 0 }, k3[4] = { 3, 0, 0, 0 };
 		uint8_t ab[4];
 		if (rid < 0) {
@@ -1061,19 +1157,19 @@ static int p4_start(struct fwd_dp *dp)
 		/* port_id at offset 0, HOST order (LE 1 = {1,0,0,0}). */
 		ab[0] = 0x01;   /* inner leg (port 1) */
 		en.key = k2;
-		if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+		if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
 			"next_hop_table_0", &en)) {
 			P4_LOG("next_hop id2 (preserve->inner) add failed");
 			return -EIO;
 		}
 		ab[0] = 0x00;   /* outer leg (port 0) */
 		en.key = k3;
-		if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+		if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
 			"next_hop_table_0", &en)) {
 			P4_LOG("next_hop id3 (preserve->outer) add failed");
 			return -EIO;
 		}
-		if (rte_swx_ctl_pipeline_commit(pr->ctl, 1)) {
+		if (rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1)) {
 			P4_LOG("preserve-hop commit failed");
 			return -EIO;
 		}
@@ -1088,7 +1184,7 @@ static int p4_start(struct fwd_dp *dp)
 	 * an LPM entry for the inner subnet -> next_hop 1 (-> inner leg). */
 	{
 		struct rte_swx_table_entry en;
-		int rid = p4_table_action_id(pr->p, 2, 0);  /* next_hop_id_set */
+		int rid = p4_table_action_id(pr->inst[0].p, 2, 0);  /* next_hop_id_set */
 		uint8_t rkey[4] = { 0x0a, 0, 0, 0 };        /* 10.0.0.0/8 inner */
 		uint8_t rmask[4] = { 0xff, 0, 0, 0 };
 		uint8_t rdata[4] = { 1, 0, 0, 0 };          /* next_hop_id 1, meta */
@@ -1109,13 +1205,13 @@ static int p4_start(struct fwd_dp *dp)
 		 * back out the outer wire in the clear.  Absent this entry a
 		 * 10/8-destined decrypted frame egresses outer (plaintext leak), so
 		 * a failed add must not silently start a loop — fail the start. */
-		if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+		if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
 			 "routing_table_0", &en)) {
 			P4_LOG("routing 10/8 add failed");
 			return -EIO;
 		}
 		P4_LOG("routing 10/8 -> next_hop 1 (inner)");
-		if (rte_swx_ctl_pipeline_commit(pr->ctl, 1)) {
+		if (rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1)) {
 			P4_LOG("routing 10/8 commit failed");
 			return -EIO;
 		}
@@ -1129,25 +1225,25 @@ static int p4_start(struct fwd_dp *dp)
 
 	/* Grab the pipeline ring handles (created in p4_build_from_spec) so
 	 * the worker can bridge eth <-> pipeline. */
-	pr->in0  = rte_ring_lookup("R2DP_IN0");
-	pr->in1  = rte_ring_lookup("R2DP_IN1");
-	pr->out0 = rte_ring_lookup("R2DP_OUT0");
-	pr->out1 = rte_ring_lookup("R2DP_OUT1");
+	pr->inst[0].in0  = rte_ring_lookup("R2DP_IN0");
+	pr->inst[0].in1  = rte_ring_lookup("R2DP_IN1");
+	pr->inst[0].out0 = rte_ring_lookup("R2DP_OUT0");
+	pr->inst[0].out1 = rte_ring_lookup("R2DP_OUT1");
 
 	/* Launch the packet-path worker (or the self-injecting bench worker
 	 * when R2DP_P4_BENCH is set -- a tap-free dataplane measurement that
 	 * feeds the pipeline rings directly, no ethdev). */
-	atomic_store_explicit(&pr->running, 1, __ATOMIC_RELAXED);
+	atomic_store_explicit(&pr->inst[0].running, 1, __ATOMIC_RELAXED);
 	{
 		void *(*wk)(void *) =
 		    getenv("R2DP_P4_BENCH") ? p4_bench_worker : p4_worker;
-		if (pthread_create(&pr->th, NULL, wk, pr) != 0) {
+		if (pthread_create(&pr->inst[0].th, NULL, wk, pr) != 0) {
 			P4_LOG("worker create failed");
-			atomic_store_explicit(&pr->running, 0, __ATOMIC_RELAXED);
+			atomic_store_explicit(&pr->inst[0].running, 0, __ATOMIC_RELAXED);
 			return -EIO;
 		}
 	}
-	pr->th_started = 1;
+	pr->inst[0].th_started = 1;
 
 	pr->started = 1;
 	return 0;
@@ -1203,7 +1299,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			memcpy(&key[0], &dip, 4);
 			memcpy(&key[4], &sa->spi, 4);   /* h.esp.spi, host order */
 			ent.key = key;
-			rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl,
+			rc = rte_swx_ctl_pipeline_table_entry_delete(pr->inst[0].ctl,
 					"inbound_table_0", &ent);
 			if (rc) {
 				/* keep the slot live: the dataplane still owns
@@ -1226,24 +1322,24 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 				e->in_use = 1;   /* keep the live SA for ctl's retry */
 				return rc;
 			}
-			if (pr->ipsec)
-				rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
-			e->sl_id = 0;
-			return rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+			if (pr->inst[0].ipsec)
+				rte_swx_ipsec_sa_delete(pr->inst[0].ipsec, e->sl_id[0]);
+			e->sl_id[0] = 0;
+			return rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
 		}
 		/* Inbound delete: the (dip,spi) table delete is already scheduled.
 		 * Apply it BEFORE tearing down the crypto SA / slot: with
 		 * abort_on_fail=1 a failed commit rolls the delete back, and ctl
 		 * keeps the SA on error, so the dataplane must still own it. */
-		rc = rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+		rc = rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
 		if (rc) {
 			P4_LOG("inbound sa del commit %d; keeping SA", rc);
 			return rc;
 		}
-		if (pr->ipsec)
-			rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
+		if (pr->inst[0].ipsec)
+			rte_swx_ipsec_sa_delete(pr->inst[0].ipsec, e->sl_id[0]);
 		e->in_use = 0;
-		e->sl_id = 0;
+		e->sl_id[0] = 0;
 		return 0;
 	}
 
@@ -1257,7 +1353,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		e->spi = spi;
 		e->proto = sa->proto;
 		e->dir = inbound ? R2DP_DIR_IN : R2DP_DIR_OUT;
-		e->sl_id = (uint32_t)i;      /* stable per-install id */
+		e->sl_id[0] = (uint32_t)i;      /* stable per-install id */
 		e->gen = ++pr->gen;
 		e->in_use = 1;
 		new_slot = 1;
@@ -1265,7 +1361,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		/* UPDATE (rekey) of a live SA: remember the pre-rekey crypto id so a
 		 * later failure can restore it, and bump gen so SPD rebind takes the
 		 * new SA. */
-		orig_sl_id = e->sl_id;
+		orig_sl_id = e->sl_id[0];
 		e->gen = ++pr->gen;
 	}
 
@@ -1281,7 +1377,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		if (blen > RTE_SWX_IPSEC_KEY_SIZE_MAX) {
 			if (new_slot) {
 				e->in_use = 0;
-				e->sl_id = 0;
+				e->sl_id[0] = 0;
 			}
 			return -E2BIG;
 		}
@@ -1296,18 +1392,18 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		if (sa->dst.family == R2DP_AF_INET4)
 			memcpy(&sp.encap.tunnel.ipv4.dst_addr,
 			       sa->dst.addr, sizeof(struct in_addr));
-		rc = rte_swx_ipsec_sa_add(pr->ipsec, &sp, &sa_id);
+		rc = rte_swx_ipsec_sa_add(pr->inst[0].ipsec, &sp, &sa_id);
 		if (rc) {
 			P4_LOG("ipsec sa_add %d", rc);
 			if (new_slot) {
 				/* only a fresh slot is ours to free; do not
 				 * clobber a pre-existing live SA on rekey */
 				e->in_use = 0;
-				e->sl_id = 0;
+				e->sl_id[0] = 0;
 			}
 			return rc;
 		}
-		e->sl_id = sa_id;   /* the id the action must write */
+		e->sl_id[0] = sa_id;   /* the id the action must write */
 		P4_LOG("ipsec SA add ok id=%u spi=%08x mode=%d", sa_id,
 		       sa->spi, sa->mode);
 	}
@@ -1323,20 +1419,20 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		 * ctl's keep-on-error contract and a retry stay consistent. */
 		rc = p4_spd_rebind(pr);
 		if (rc) {
-			if (pr->ipsec)
-				rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
+			if (pr->inst[0].ipsec)
+				rte_swx_ipsec_sa_delete(pr->inst[0].ipsec, e->sl_id[0]);
 			if (new_slot) {
 				e->in_use = 0;
-				e->sl_id = 0;
+				e->sl_id[0] = 0;
 			} else {
 				/* rekey: restore the pre-rekey crypto id (still
 				 * live in the extern); the new one is deleted
 				 * above. */
-				e->sl_id = orig_sl_id;
+				e->sl_id[0] = orig_sl_id;
 			}
 			return rc;
 		}
-		return rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+		return rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
 	}
 
 	/* inbound_table_0 entry: (ipv4.dst_addr, esp.spi)
@@ -1346,16 +1442,16 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	memset(&ent, 0, sizeof(ent));
 	memset(key, 0, sizeof(key));
 	{
-		uint32_t id_be = htonl(e->sl_id);
+		uint32_t id_be = htonl(e->sl_id[0]);
 		/* match-field order from the spec: dst_addr then spi */
 		memcpy(&key[0], &dip, 4);
 		memcpy(&key[4], &sa->spi, 4);   /* h.esp.spi, host order */
 		memcpy(data, &id_be, 4);
 	}
 	ent.key = key;
-	ent.action_id = (uint64_t)p4_table_action_id(pr->p, 0, 0); /* ipsec_enable */
+	ent.action_id = (uint64_t)p4_table_action_id(pr->inst[0].p, 0, 0); /* ipsec_enable */
 	ent.action_data = data;
-	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "inbound_table_0",
+	rc = rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl, "inbound_table_0",
 						  &ent);
 	if (rc) {
 		/* Roll back the crypto SA and the local slot: a second install
@@ -1365,20 +1461,20 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		 * deleted out from under it. */
 		P4_LOG("inbound entry add %d", rc);
 		if (new_slot) {
-			if (pr->ipsec)
-				rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
+			if (pr->inst[0].ipsec)
+				rte_swx_ipsec_sa_delete(pr->inst[0].ipsec, e->sl_id[0]);
 			e->in_use = 0;
-			e->sl_id = 0;
+			e->sl_id[0] = 0;
 		} else {
 			/* rekey: delete the NEW crypto SA and restore the
 			 * pre-rekey id, which is still the live binding. */
-			if (pr->ipsec)
-				rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
-			e->sl_id = orig_sl_id;
+			if (pr->inst[0].ipsec)
+				rte_swx_ipsec_sa_delete(pr->inst[0].ipsec, e->sl_id[0]);
+			e->sl_id[0] = orig_sl_id;
 		}
 		return rc;
 	}
-	return rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+	return rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
 }
 
 /* ---- SPD policy mirror ---- */
@@ -1539,27 +1635,27 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 	switch (sp->action) {
 	case R2DP_ACT_DISCARD:
 		p->bound_sl_id = UINT32_MAX;
-		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 2);
+		ent.action_id = (uint64_t)p4_table_action_id(pr->inst[0].p, 1, 2);
 		break;
 	case R2DP_ACT_PROTECT:
 		ea = p4_spd_sa_lookup(pr, sp);
-		p->bound_sl_id = ea ? ea->sl_id : UINT32_MAX;
+		p->bound_sl_id = ea ? ea->sl_id[0] : UINT32_MAX;
 		if (ea) {
-			uint32_t id_be = htonl(ea->sl_id);
+			uint32_t id_be = htonl(ea->sl_id[0]);
 			memcpy(data, &id_be, 4);
-			ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 0);
+			ent.action_id = (uint64_t)p4_table_action_id(pr->inst[0].p, 1, 0);
 			ent.action_data = data;
-			P4_LOG("OUT PROTECT bind sa_id=%u", ea->sl_id);
+			P4_LOG("OUT PROTECT bind sa_id=%u", ea->sl_id[0]);
 		} else {
 			/* unbound OUT PROTECT: FAIL CLOSED (spd_discard), never
 			 * bypass.  A later SA_ADD upgrades it to ipsec_protect. */
-			ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 2);
+			ent.action_id = (uint64_t)p4_table_action_id(pr->inst[0].p, 1, 2);
 			P4_LOG("OUT PROTECT unbound -> DISCARD");
 		}
 		break;
 	default:                       /* BYPASS */
 		p->bound_sl_id = UINT32_MAX;
-		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 1);
+		ent.action_id = (uint64_t)p4_table_action_id(pr->inst[0].p, 1, 1);
 		break;
 	}
 
@@ -1570,13 +1666,13 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 	 * backends/versions, but it is not the executing re-bind path.  Do NOT
 	 * delete first unconditionally: a delete+failed-add would commit the
 	 * deletion and leave the selector at the default. */
-	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "outbound_table_0",
+	rc = rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl, "outbound_table_0",
 						  &ent);
 	if (rc == -EEXIST) {
-		(void)rte_swx_ctl_pipeline_table_entry_delete(pr->ctl,
+		(void)rte_swx_ctl_pipeline_table_entry_delete(pr->inst[0].ctl,
 							      "outbound_table_0",
 							      &ent);
-		rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+		rc = rte_swx_ctl_pipeline_table_entry_add(pr->inst[0].ctl,
 							  "outbound_table_0",
 							  &ent);
 		if (rc) {
@@ -1584,7 +1680,7 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 			 * would drop this selector to the (bypass) default.
 			 * Abort so the previous entry (e.g. the unbound DISCARD
 			 * or a prior protect) is not silently removed. */
-			rte_swx_ctl_pipeline_abort(pr->ctl);
+			rte_swx_ctl_pipeline_abort(pr->inst[0].ctl);
 		}
 	}
 	if (rc)
@@ -1621,10 +1717,10 @@ static int p4_spd_rebind(struct p4_priv *pr)
 		 * delete whose paired add failed would otherwise be committed by
 		 * a later success, dropping the selector to the (bypass) default
 		 * -- the exact fail-open this path is meant to prevent. */
-		rte_swx_ctl_pipeline_abort(pr->ctl);
+		rte_swx_ctl_pipeline_abort(pr->inst[0].ctl);
 		return rerr;
 	}
-	return rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+	return rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
 }
 
 static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
@@ -1657,7 +1753,7 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 	ent.key = key;
 	ent.key_mask = mask;
 	ent.key_priority = p4_spd_prio(&p->sp);
-	rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl, "outbound_table_0",
+	rc = rte_swx_ctl_pipeline_table_entry_delete(pr->inst[0].ctl, "outbound_table_0",
 					     &ent);
 	if (rc) {
 		P4_LOG("outbound entry del %d", rc);
@@ -1668,7 +1764,7 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 	 * and ctl keeps the policy on error -- so the mirror must too (else the
 	 * next rebind re-programs a policy ctl already dropped, and the bucket
 	 * they agree on never empties). */
-	rc = rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+	rc = rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
 	if (rc) {
 		P4_LOG("sp_del commit %d; keeping policy", rc);
 		return rc;
@@ -1751,7 +1847,7 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 		} else {
 			memset(p, 0, sizeof(*p));   /* drop the new ghost */
 		}
-		rte_swx_ctl_pipeline_abort(pr->ctl);
+		rte_swx_ctl_pipeline_abort(pr->inst[0].ctl);
 		return rc;
 	}
 
@@ -1759,7 +1855,7 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	 * in_use after we know the whole add succeeded; on a failed commit
 	 * (abort_on_fail=1 rolls the table op back) mirror the rollback so our
 	 * view matches ctl's, which keeps its policy on error. */
-	rc = rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+	rc = rte_swx_ctl_pipeline_commit(pr->inst[0].ctl, 1);
 	if (rc) {
 		if (was_live) {
 			p->sp = saved_sp;
@@ -1786,24 +1882,24 @@ static void p4_stop(struct fwd_dp *dp)
 	struct p4_priv *pr = dp->priv;
 	/* Always free whatever was allocated, even on a partial start (the
 	 * probe calls stop on failure).  `started` is not the only guard. */
-	atomic_store_explicit(&pr->running, 0, __ATOMIC_RELAXED);
-	if (pr->th_started) {
-		pthread_join(pr->th, NULL);
-		pr->th_started = 0;
+	atomic_store_explicit(&pr->inst[0].running, 0, __ATOMIC_RELAXED);
+	if (pr->inst[0].th_started) {
+		pthread_join(pr->inst[0].th, NULL);
+		pr->inst[0].th_started = 0;
 	}
-	if (pr->ctl)
-		rte_swx_ctl_pipeline_free(pr->ctl);
-	if (pr->ipsec)
-		rte_swx_ipsec_free(pr->ipsec);
-	if (pr->p)
-		rte_swx_pipeline_free(pr->p);
+	if (pr->inst[0].ctl)
+		rte_swx_ctl_pipeline_free(pr->inst[0].ctl);
+	if (pr->inst[0].ipsec)
+		rte_swx_ipsec_free(pr->inst[0].ipsec);
+	if (pr->inst[0].p)
+		rte_swx_pipeline_free(pr->inst[0].p);
 	if (pr->pool)
 		rte_mempool_free(pr->pool);
-	pr->ctl = NULL;
-	pr->ipsec = NULL;
-	pr->p = NULL;
+	pr->inst[0].ctl = NULL;
+	pr->inst[0].ipsec = NULL;
+	pr->inst[0].p = NULL;
 	pr->pool = NULL;
-	pr->in0 = pr->in1 = pr->out0 = pr->out1 = NULL;
+	pr->inst[0].in0 = pr->inst[0].in1 = pr->inst[0].out0 = pr->inst[0].out1 = NULL;
 	pr->started = 0;
 }
 
@@ -1828,6 +1924,22 @@ int fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	dp->priv = pr;
 	pr->spec_path = spec_path ? strdup(spec_path) : NULL;
 	dp->wake_fd = -1;
+
+	/* Number of P4 slices (cores).  R2DP_P4_WORKERS=N starts N independent
+	 * pipeline replicas, each on its own core -- the NIC-compatible multicore
+	 * model.  Default/absent = 1 (the historical single pipeline). */
+	{
+		const char *w = getenv("R2DP_P4_WORKERS");
+		long n = w ? strtol(w, NULL, 10) : 1;
+		if (n < 1) n = 1;
+		if (n > R2DP_P4_MAX_INST) {
+			P4_LOG("R2DP_P4_WORKERS=%ld clamped to %d", n,
+			       R2DP_P4_MAX_INST);
+			n = R2DP_P4_MAX_INST;
+		}
+		pr->n_inst = (uint32_t)n;
+	}
+	P4_LOG("slices=%u", pr->n_inst);
 
 	/* The SWX pipeline lives in the DPDK EAL heap; init EAL first (the
 	 * r2dp-fwd --dp p4 path passes its leftover args as EAL args). */
