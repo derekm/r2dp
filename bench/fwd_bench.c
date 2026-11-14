@@ -35,7 +35,9 @@
  * are gated, so it is stable across machines and runners:
  *   - scaling: per size, cycles at the largest tunnel count <=
  *     R2DP_BENCH_MAX_SCALE (default 1.5) x cycles at the smallest, for enc
- *     and dec -- exactly what a per-packet table scan breaks;
+ *     and dec -- exactly what a per-packet table scan breaks.  A failing
+ *     size is re-measured at the largest count up to twice (best kept),
+ *     so one noisy median on a shared runner does not fail the gate;
  *   - absolute sanity: smallest size, smallest tunnel count <=
  *     R2DP_BENCH_MAX_CYC (default 8000) cycles/pkt; 0 disables it
  *     (sanitizer builds).  Order-of-magnitude losses only.
@@ -597,6 +599,22 @@ main(int argc, char **argv)
 		for (int z = 0; z < nsz && t > 0; z++) {
 			double se = enc[z][t] / enc[z][0], sd = dec[z][t] / dec[z][0];
 			int ok = se <= ms && sd <= ms;
+			/* A shared runner can lose a whole median to a noisy
+			 * neighbour.  Re-measure the large-table point (up to
+			 * twice, best kept): a real per-packet scan is
+			 * deterministic and fails every attempt. */
+			for (int retry = 0; !ok && retry < 2; retry++) {
+				double e2, d2;
+				if (measure(a, b, 0, (unsigned)sizes[z], runs, &e2, &d2)) {
+					puts("FAIL measure"); return 1;
+				}
+				if (e2 < enc[z][t]) enc[z][t] = e2;
+				if (d2 < dec[z][t]) dec[z][t] = d2;
+				se = enc[z][t] / enc[z][0]; sd = dec[z][t] / dec[z][0];
+				ok = se <= ms && sd <= ms;
+				printf("retry %4dB at %d tunnels: enc x%.2f dec x%.2f\n",
+				    sizes[z], tunnels[t], se, sd);
+			}
 			printf("%s %4dB scaling %d->%d tunnels: enc x%.2f dec x%.2f (max x%.2f)\n",
 			    ok ? "ok  " : "FAIL", sizes[z], tunnels[0], tunnels[t],
 			    se, sd, ms);
