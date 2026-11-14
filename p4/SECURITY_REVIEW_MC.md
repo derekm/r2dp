@@ -214,6 +214,35 @@ per-slice best_cyc_pkt pps):**
   - `R2DP_P4_WORKERS > R2DP_P4_MAX_INST (8)` now REFUSES (-EINVAL) rather
     than silently clamping, so the plane is never under-provisioned vs.
     what the operator asked for.
+- **VERIFIED (independent review, `deleg_14119f51`) fixes in `fe4abd4`:**
+  - **TX data race closed.** Both ethdev legs are now owned by a single
+    `p4_io_worker` (RX distributor + TX): one thread owns RX (single
+    consumer) AND TX (single producer) so N per-slice workers never call
+    `rte_eth_tx_burst` on queue 0 concurrently.  TX counted with the
+    `tx_burst` RETURN (not the dequeue count); unsent mbufs freed (a full
+    TX queue is not "transmitted").
+  - Outbound `SA_DEL` commits EVERY slice's rebind BEFORE deleting the
+    crypto SAs / clearing the slot, so a failed commit leaves the slot
+    findable (`in_use`) with the SA still present -- ctl's retry is not
+    `-ENOENT` with the SA gone (keep-on-error preserved on the commit path).
+  - `p4_flow_slice` hashes ALL ESP frames on the outer IP flow (src,dst),
+    not (dst,SPI): only the first fragment carries the SPI, so a (dst,SPI)
+    hash scattered one SA's fragments across slices; src+dst is
+    fragment-invariant and keeps an entire SA (and its fragments) on one
+    slice.
+  - `R2DP_P4_WORKERS` empty/non-numeric/<1 refuses -EINVAL (like >MAX)
+    instead of silently defaulting to 1.
+  - Per-worker periodic-dump accumulate buffers made stack-local (were
+    static, shared across workers -> torn/overwritten a6/a7 under N>1).
+- REMOVED honest overclaims: the commit-phase of cross-slice fan-out is
+  documented in `p4_spd_bind`/`p4_sp_del`/`p4_sp_add` as inherently
+  per-pipeline (a slice whose commit already succeeded cannot be rolled
+  back in one-shot; the common failure is symmetric).  An explicit live
+  multi-packet replay test on the P4 INBOUND path is still NOT verified
+  (the scapy harness reached the forwarder but `ib: hit=0`, so the replay
+  window was never exercised); replay-state single-ownership is guaranteed
+  by construction (per-slice extern + steering) but the live demonstration
+  remains a reviewer action.
 - Remaining for a full APPROVE (procedures, not missing code):
   - live replay/seq-integrity assertion (same-flow monotonic seq on the
     pinned shard) -- steering makes this possible by construction (per-SA
