@@ -1364,20 +1364,27 @@ static int p4_start(struct fwd_dp *dp)
 		 * right tables regardless of p4c-dpdk's emission order.  A resolved
 		 * table absent from this program version fails here (fail-fast)
 		 * rather than silently programming a shifted sibling table. */
-		pr->inst[s].tid_inbt    = p4_table_id_by_name(pr->inst[s].p, "inbound_table_0");
-		pr->inst[s].tid_outbt   = p4_table_id_by_name(pr->inst[s].p, "outbound_table_0");
-		pr->inst[s].tid_routing = p4_table_id_by_name(pr->inst[s].p, "routing_table_0");
-		pr->inst[s].tid_nhop    = p4_table_id_by_name(pr->inst[s].p, "next_hop_table_0");
-		pr->inst[s].tid_inspd   = p4_table_id_by_name(pr->inst[s].p, "inbound_spd_table_0");
-		if (pr->inst[s].tid_inbt < 0 || pr->inst[s].tid_outbt < 0 ||
-		    pr->inst[s].tid_routing < 0 || pr->inst[s].tid_nhop < 0 ||
-		    pr->inst[s].tid_inspd < 0) {
-			P4_LOG("slice %u table id resolve: inbt=%d outbt=%d "
-			       "routing=%d nhop=%d inspd=%d",
-			       s, pr->inst[s].tid_inbt, pr->inst[s].tid_outbt,
-			       pr->inst[s].tid_routing, pr->inst[s].tid_nhop,
-			       pr->inst[s].tid_inspd);
-			return -EIO;
+		{
+			/* resolve into signed ints: the stored IDs are
+			 * unsigned, so a negative "not found" can only be
+			 * caught before it is assigned (COMMITS C3) */
+			int ib = p4_table_id_by_name(pr->inst[s].p, "inbound_table_0");
+			int ob = p4_table_id_by_name(pr->inst[s].p, "outbound_table_0");
+			int rt = p4_table_id_by_name(pr->inst[s].p, "routing_table_0");
+			int nh = p4_table_id_by_name(pr->inst[s].p, "next_hop_table_0");
+			int is = p4_table_id_by_name(pr->inst[s].p, "inbound_spd_table_0");
+
+			if (ib < 0 || ob < 0 || rt < 0 || nh < 0 || is < 0) {
+				P4_LOG("slice %u table id resolve: inbt=%d outbt=%d "
+				       "routing=%d nhop=%d inspd=%d",
+				       s, ib, ob, rt, nh, is);
+				return -EIO;
+			}
+			pr->inst[s].tid_inbt    = (uint32_t)ib;
+			pr->inst[s].tid_outbt   = (uint32_t)ob;
+			pr->inst[s].tid_routing = (uint32_t)rt;
+			pr->inst[s].tid_nhop    = (uint32_t)nh;
+			pr->inst[s].tid_inspd   = (uint32_t)is;
 		}
 
 		/* ipsec extern instance the spec's ipsec_enable/protect actions
