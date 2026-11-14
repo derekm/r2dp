@@ -177,15 +177,27 @@ parse_name(const char *s, const char *const names[], const int vals[], int *v)
 }
 
 static int
+hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* Exactly two hex digits per byte, nothing else: "%2x" accepted a pair
+ * like "1g" as 0x01 and silently changed the key (CTL1).  The whole
+ * string is validated before any byte is written. */
+static int
 parse_hex(const char *s, uint8_t *out, size_t max)
 {
 	size_t n = s ? strlen(s) : 0;
 	if (!n || n % 2 || n / 2 > max) return -1;
-	for (size_t i = 0; i < n / 2; i++) {
-		unsigned b;
-		if (sscanf(s + 2 * i, "%2x", &b) != 1) return -1;
-		out[i] = (uint8_t)b;
-	}
+	for (size_t i = 0; i < n; i++)
+		if (hex_nibble(s[i]) < 0) return -1;
+	for (size_t i = 0; i < n / 2; i++)
+		out[i] = (uint8_t)(hex_nibble(s[2 * i]) << 4 |
+		    hex_nibble(s[2 * i + 1]));
 	return (int)(n / 2);
 }
 

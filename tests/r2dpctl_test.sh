@@ -36,6 +36,20 @@ rc 2 $C sa-add dir=in spi=0x3001 src=192.0.2.2 dst=192.0.2.1 enc=aes-gcm-16 key=
 rc 2 $C sa-add spi=0x1001 dst=192.0.2.2 src=192.0.2.1 enc=aes-gcm-16 key=$KEY   # no dir (v2)
 rc 2 $C sp-add dir=out action=protect src=10.0.0.0/8 dst=10.0.0.0/8             # no tunnel
 rc 2 $C bogus
+# CTL1: every key character must be a hex digit (start, middle, end, either
+# nibble, both keys); none of these may reach the forwarder.
+for bad in 1g0102030405060708090a0b0c0d0e0f10111213 \
+           000102030405060708x90a0b0c0d0e0f10111213 \
+           000102030405060708090a0b0c0d0e0f1011121z \
+           " 00102030405060708090a0b0c0d0e0f10111213" \
+           +00102030405060708090a0b0c0d0e0f10111213 \
+           0x0102030405060708090a0b0c0d0e0f10111213; do
+	rc 2 $C sa-add dir=out spi=0x4001 src=192.0.2.1 dst=192.0.2.2 enc=aes-gcm-16 "key=$bad"
+done
+rc 2 $C sa-add dir=out spi=0x4001 src=192.0.2.1 dst=192.0.2.2 enc=aes-cbc integ=sha256 \
+      key=000102030405060708090a0b0c0d0e0f authkey=000102030405060708090a0b0c0d0e0f00010203040506070809g0b0c0d0e0f
+rc 1 $C sa-del spi=0x4001 dst=192.0.2.2    # none of them was installed
+ok $C sa-add dir=out spi=0x4002 src=192.0.2.1 dst=192.0.2.2 enc=aes-gcm-16 key=00AABBccDDeeFF0102030405060708090a0b0c0d
 # KEYS KY2/KY3: once sa-add has sent its request the key text is gone
 # from its command line while it waits for the completion.
 S2=$T/slow.sock
