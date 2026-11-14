@@ -189,19 +189,25 @@ parse_hex(const char *s, uint8_t *out, size_t max)
 	return (int)(n / 2);
 }
 
-/* Send one request and wait for its completion; 0 or -errno. */
+static uint32_t req_seq = 0x57525430;   /* 'WRT0' */
+
+/* Send one request; its completion is collected by request_wait. */
 static int
-request(int fd, uint16_t type, uint32_t flags, const void *body, size_t blen,
-    const void *tail, size_t tlen)
+request_send(int fd, uint16_t type, uint32_t flags, const void *body,
+    size_t blen, const void *tail, size_t tlen)
 {
-	static uint32_t seq = 0x57525430;   /* 'WRT0' */
+	req_seq++;
+	return r2dp_send(fd, type, req_seq, 0, flags, body, blen, tail, tlen);
+}
+
+/* Wait for the completion of the last request_send; 0 or -errno. */
+static int
+request_wait(int fd, uint16_t type)
+{
+	uint32_t seq = req_seq;
 	struct r2dp_msg m;
 	int r;
 
-	seq++;
-	r = r2dp_send(fd, type, seq, 0, flags, body, blen, tail, tlen);
-	if (r < 0)
-		return r;
 	for (;;) {
 		r = r2dp_recv(fd, &m);
 		if (r < 0)
@@ -212,6 +218,26 @@ request(int fd, uint16_t type, uint32_t flags, const void *body, size_t blen,
 			return st < 0 ? st : -st;
 		}
 	}
+}
+
+/* Send one request and wait for its completion; 0 or -errno. */
+static int
+request(int fd, uint16_t type, uint32_t flags, const void *body, size_t blen,
+    const void *tail, size_t tlen)
+{
+	int r = request_send(fd, type, flags, body, blen, tail, tlen);
+
+	return r < 0 ? r : request_wait(fd, type);
+}
+
+/* Overwrite a key=HEX argument's value in argv once it is decoded, so the
+ * text does not stay visible for the whole request (it cannot undo an
+ * observer at exec time or shell history; KEYS KY2). */
+static void
+wipe_arg(const char *v)
+{
+	if (v)
+		explicit_bzero((char *)(uintptr_t)v, strlen(v));
 }
 
 static int
@@ -241,9 +267,9 @@ cmd_sa(int fd, int add, int argc, char **argv)
 	    R2DP_INTEG_HMAC_SHA2_256_128, R2DP_INTEG_HMAC_SHA2_384_192,
 	    R2DP_INTEG_HMAC_SHA2_512_256 };
 	struct r2dp_sa sa;
-	uint8_t keys[2 * 64];
+	uint8_t keys[2 * 64] = { 0 };
 	uint32_t v;
-	int ek = 0, ak = 0, e;
+	int ek = 0, ak = 0, e, r;
 	const char *s;
 
 	memset(&sa, 0, sizeof(sa));
@@ -295,16 +321,29 @@ cmd_sa(int fd, int add, int argc, char **argv)
 		sa.natt_sport = htons((uint16_t)sp);
 		sa.natt_dport = htons((uint16_t)dp);
 	}
-	if ((ek = parse_hex(kv(argc, argv, "key"), keys, 64)) < 0)
+	ek = parse_hex(kv(argc, argv, "key"), keys, 64);
+	wipe_arg(kv(argc, argv, "key"));
+	if (ek < 0) {
+		explicit_bzero(keys, sizeof(keys));
 		return usage("key=HEX required (incl. salt/nonce, max 64 bytes)");
-	if ((s = kv(argc, argv, "authkey")) &&
-	    (ak = parse_hex(s, keys + ek, 64)) < 0)
-		return usage("bad authkey=HEX");
+	}
+	if ((s = kv(argc, argv, "authkey"))) {
+		ak = parse_hex(s, keys + ek, 64);
+		wipe_arg(s);
+		if (ak < 0) {
+			explicit_bzero(keys, sizeof(keys));
+			return usage("bad authkey=HEX");
+		}
+	}
 	sa.enckeylen = (uint16_t)ek;
 	sa.authkeylen = (uint16_t)ak;
 	sa.natoa_src.family = sa.natoa_dst.family = R2DP_AF_UNSET;
-	return done("sa-add", request(fd, R2DP_SA_ADD, 0, &sa, sizeof(sa),
-	    keys, (size_t)(ek + ak)));
+	/* the send copies the keys out; wipe them before the (unbounded)
+	 * wait for the completion rather than at exit (KEYS KY3) */
+	r = request_send(fd, R2DP_SA_ADD, 0, &sa, sizeof(sa), keys,
+	    (size_t)(ek + ak));
+	explicit_bzero(keys, sizeof(keys));
+	return done("sa-add", r < 0 ? r : request_wait(fd, R2DP_SA_ADD));
 }
 
 static int

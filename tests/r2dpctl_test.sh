@@ -36,5 +36,29 @@ rc 2 $C sa-add dir=in spi=0x3001 src=192.0.2.2 dst=192.0.2.1 enc=aes-gcm-16 key=
 rc 2 $C sa-add spi=0x1001 dst=192.0.2.2 src=192.0.2.1 enc=aes-gcm-16 key=$KEY   # no dir (v2)
 rc 2 $C sp-add dir=out action=protect src=10.0.0.0/8 dst=10.0.0.0/8             # no tunnel
 rc 2 $C bogus
+# KEYS KY2/KY3: once sa-add has sent its request the key text is gone
+# from its command line while it waits for the completion.
+S2=$T/slow.sock
+"$MOCK" -s "$S2" -D 1500 2>"$T/mock2.log" & MP2=$!
+for _ in $(seq 50); do [ -S "$S2" ] && break; sleep 0.1; done
+MARK=c0ffee00c0ffee00c0ffee00c0ffee00deadbeef
+"$CTL" "$S2" sa-add dir=out spi=0x5001 src=192.0.2.1 dst=192.0.2.2 \
+	enc=aes-gcm-16 key=$MARK authkey=$MARK >"$T/out" 2>&1 & CP=$!
+seen=1
+for _ in $(seq 40); do
+	sleep 0.05
+	[ -r /proc/$CP/cmdline ] || continue
+	if tr '\0' ' ' </proc/$CP/cmdline | grep -q "spi=0x5001"; then
+		tr '\0' ' ' </proc/$CP/cmdline | grep -q "$MARK" && seen=1 || { seen=0; break; }
+	fi
+done
+wait $CP; r=$?
+kill $MP2 2>/dev/null; wait $MP2 2>/dev/null
+if [ -d /proc/self ]; then
+	[ $seen = 0 ] && echo "ok   key text wiped from argv while waiting" ||
+		{ echo "FAIL key text still in argv during the completion wait"; fails=$((fails+1)); }
+fi
+[ $r = 0 ] && echo "ok   sa-add with wiped argv still installs" ||
+	{ echo "FAIL slow sa-add rc=$r"; cat "$T/out"; fails=$((fails+1)); }
 [ $fails = 0 ] && echo "r2dpctl_test: OK" || echo "r2dpctl_test: $fails failures"
 exit $((fails != 0))

@@ -157,6 +157,8 @@ static void do_getspi(int fd, const struct r2dp_msg *m)
 	reply_sa(fd, m, ENOSPC, NULL);
 }
 
+static unsigned sa_add_delay_ms;   /* -D: delay SA_ADD completions */
+
 static void do_sa(int fd, const struct r2dp_msg *m)
 {
 	const struct r2dp_sa *rq = r2dp_msg_sa(m);
@@ -168,6 +170,8 @@ static void do_sa(int fd, const struct r2dp_msg *m)
 		if (e && !e->larval) { reply_sa(fd, m, EEXIST, NULL); return; }
 		if (!e && !(e = sa_alloc())) { reply_sa(fd, m, ENOBUFS, NULL); return; }
 		e->used = 1; e->larval = 0; sa_store(e, m);
+		if (sa_add_delay_ms)   /* tests: hold the completion back */
+			usleep((useconds_t)sa_add_delay_ms * 1000u);
 		reply_sa(fd, m, 0, e); return;
 	case R2DP_SA_UPDATE:
 		log_sa("SA_UPDATE", rq);
@@ -276,12 +280,13 @@ int main(int argc, char **argv)
 	struct pollfd pf[MAXCLI + 1];
 	int c, lfd, ncli = 0, cli[MAXCLI];
 
-	while ((c = getopt(argc, argv, "s:vK")) != -1) {
+	while ((c = getopt(argc, argv, "s:vKD:")) != -1) {
 		switch (c) {
 		case 's': path = optarg; break;
 		case 'v': verbose = 1; break;
 		case 'K': echo_keys = 1; break;
-		default: fprintf(stderr, "usage: %s [-s sock] [-v] [-K]\n", argv[0]); return 2;
+		case 'D': sa_add_delay_ms = (unsigned)strtoul(optarg, NULL, 10); break;
+		default: fprintf(stderr, "usage: %s [-s sock] [-v] [-K] [-D ms]\n", argv[0]); return 2;
 		}
 	}
 	epoch = ((uint64_t)time(NULL) << 20) ^ (uint64_t)getpid();
