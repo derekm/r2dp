@@ -324,14 +324,26 @@ parse_list(const char *s, int *v, int lo, int hi)
 	return n;
 }
 
-/* Prefer AES-NI multi-buffer, else OpenSSL.  Returns the cryptodev id. */
-static int
-pick_cdev(const char *pmd, const char **name)
+/* Cryptodev PMDs default max_nb_queue_pairs to 8 (a per-device creation arg,
+ * not a code limit), which would otherwise cap the benchmark at 8 workers.
+ * Emit the devargs string "max_nb_queue_pairs=N". */
+static char *
+pmd_dev_str(char *buf, size_t bs, int nw)
 {
+	snprintf(buf, bs, "max_nb_queue_pairs=%d", nw);
+	return buf;
+}
+
+static int
+pick_cdev(const char *pmd, int nw, const char **name)
+{
+	char arg[64];
 	int id;
 
 	if (strcmp(pmd, "openssl") &&
-	    (rte_eal_hotplug_add("vdev", "crypto_aesni_mb0", "") == 0 ||
+	    (rte_eal_hotplug_add("vdev", "crypto_aesni_mb0",
+				 pmd_dev_str(arg, sizeof(arg), nw))
+	     == 0 ||
 	     rte_cryptodev_get_dev_id("crypto_aesni_mb0") >= 0) &&
 	    (id = rte_cryptodev_get_dev_id("crypto_aesni_mb0")) >= 0) {
 		*name = "aesni_mb";
@@ -339,6 +351,8 @@ pick_cdev(const char *pmd, const char **name)
 	}
 	if (!strcmp(pmd, "aesni_mb"))
 		return -1;
+	/* openssl is created by EAL from the --vdev=... devargs in ea[]
+	 * (sized to nw).  Just look it up. */
 	*name = "openssl";
 	return rte_cryptodev_get_dev_id("crypto_openssl0");
 }
@@ -458,10 +472,10 @@ usage(void)
 int
 main(int argc, char **argv)
 {
-	char lcl[16] = "0";
+	char lcl[32] = "0";
+	char vdev[128] = "crypto_openssl0";
 	char *ea[] = { "fwd_bench", "-l", lcl, "--no-huge", "-m", "1024",
-	    "--no-pci", "--no-telemetry", "--vdev=crypto_openssl0",
-	    "--log-level=1", NULL };
+	    "--no-pci", "--no-telemetry", vdev, NULL };
 	int sizes[MAXN] = { 64, 512, 1400 }, tunnels[MAXN] = { 1, 65, 201 };
 	int nsz = 3, ntun = 3, runs = 5, check = 0, have = 1, fails = 0;
 	int nw = 1;
@@ -511,10 +525,15 @@ main(int argc, char **argv)
 		}
 	if (nw > 1)
 		snprintf(lcl, sizeof(lcl), "0-%d", nw);
+	snprintf(vdev, sizeof(vdev), "--vdev=crypto_openssl0,max_nb_queue_pairs=%d", nw);
 	setvbuf(stdout, NULL, _IONBF, 0);
-	if (rte_eal_init(10, ea) < 0 || (cdev = pick_cdev(pmd, &pmdname)) < 0) {
-		if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
-		puts("SKIP: EAL/cryptodev"); return 77;
+	{
+		int eac = (int)(sizeof(ea) / sizeof(ea[0])) - 1;  /* drop NULL */
+		if (rte_eal_init(eac, ea) < 0 ||
+		    (cdev = pick_cdev(pmd, nw, &pmdname)) < 0) {
+			if (getenv("R2DP_REQUIRE_DPDK")) { puts("DPDK setup FAILED"); return 1; }
+			puts("SKIP: EAL/cryptodev"); return 77;
+		}
 	}
 	hz = (double)rte_get_tsc_hz();
 	memset(&cc, 0, sizeof(cc)); cc.socket_id = SOCKET_ID_ANY;
