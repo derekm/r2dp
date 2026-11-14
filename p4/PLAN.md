@@ -261,16 +261,22 @@ and the delegated `deleg_8f37ef0b` review):
   see the dated §8 updates at the top of this section.
 - **SPD binding contract (rounds 4+5):** the control plane may install an
   OUT PROTECT policy with no egress SA yet (spmd loads SPD at startup, then
-  GETSPI/SA_ADD) — so `p4_sp_add` **accepts** and never refuses.  It keeps a
+  GETSPI/SA_ADD) — so `p4_sp_add` **accepts an unbound policy** (programs it
+  fail-closed to `spd_discard`, never bypass).  The one refusal is a
+  selector the table cannot name: `p4_pol_row_conflicts` rejects an OUT policy
+  that would share an existing ACL row with a *different* full selector
+  (port/scope/host-bits) via `-E2BIG`, so ctl never commits a policy whose
+  later `SP_DEL` would drop the shared row for both (fail-open).  It keeps a
   policy mirror (`pr->spd[]`) and programs an unbound OUT PROTECT to
   **`spd_discard` (FAIL CLOSED)**, never bypass (DPDK drops a matched OUT
   PROTECT with no SA, `DR_NO_SA_OUT`).  `p4_sa_add` (outbound add/delete) and
   rekey call `p4_spd_rebind` to (re)target `outbound_table_0`.  The egress SA
   is chosen by tunnel endpoint and **highest install generation**
-  (`p4_sa.gen`), not slot index.  `table_entry_add` rejects a duplicate key so
-  a re-bind/rekey is add-with-EEXIST-fallback-to-delete-then-add (never
-  delete-first: a delete+failed-add would commit the deletion to the default).
-  `p4_spd_rebind` propagates bind failure instead of swallowing it.  Bind and
+  (`p4_sa.gen`), not slot index.  (The `-EEXIST` delete-then-add fallback in
+  `p4_spd_bind` is defensive only: on DPDK 24.11.4 `table_entry_add` modifies
+  an existing row in place and returns 0, so that branch does not execute.
+  Never delete-first.)  `p4_spd_rebind` propagates bind failure instead of
+  swallowing it.  Bind and
   fail-closed are proven by `tools/p4_bind_probe.c` (meson
   `r2dp-p4-bind-probe`), which reads the forwarder log: SA-first → direct bind
   with NO discard; SP-first → `OUT PROTECT unbound -> DISCARD` then a rebind to
@@ -343,13 +349,17 @@ and the delegated `deleg_8f37ef0b` review):
 Review `deleg_0e75fd7b` found the delete/same-prefix fix correct but the mirror
 identity incomplete vs ctl, and stale doc/skill lines.  All closed:
 - **Ports now in the mirror.** `p4_pol_find` also matches `sel_src.port`/
-  `sel_dst.port` (mirrors ctl `sel_eq_d`).  Before, two OUT policies differing
-  only by port shared one mirror slot and one ACL row; `SP_DEL` of either
-  deleted the row for both (fail-open).  Now a second policy that would share
-  an ACL row — same (proto, masked src, masked dst) but different port or host
-  bits inside the prefix — is **rejected with `-E2BIG`** by `p4_pol_row_conflicts`
-  + `p4_sp_add` before any mirror state changes, so ctl never commits it.
-  Same-policy live updates still bind via the `-EEXIST` delete-then-add path.
+  `sel_dst.port` and `scope` (full ctl `sel_eq_d` identity).  Before, two OUT
+  policies differing only by port shared one mirror slot and one ACL row;
+  `SP_DEL` of either deleted the row for both (fail-open).  Now a second
+  policy that would share an ACL row — same (proto, masked src, masked dst)
+  but different port, scope, or host bits inside the prefix — is **rejected
+  with `-E2BIG`** by `p4_pol_row_conflicts` + `p4_sp_add` before any mirror
+  state changes, so ctl never commits it.  Same-policy re-installs (the
+  mirror slot found by full identity) take the live-update/bind path; on DPDK
+  24.11.4 `table_entry_add` modifies an existing row in place and returns 0,
+  so the `-EEXIST` delete-then-add fallback in `p4_spd_bind` is dead (leave it
+  defensively, but do not describe it as the executing path).
 - **IN/FWD `SP_DEL` un-stuck.** `p4_sp_add` never stores non-OUT policies, so
   `p4_sp_del` returning `-ENOENT` made ctl keep the IN/FWD entry forever.
   Non-OUT delete now returns 0 (no-op), matching the add.

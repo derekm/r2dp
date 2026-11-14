@@ -1195,10 +1195,14 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 
 /* ---- SPD policy mirror ---- */
 
-/* Match a policy against the mirror by selector (dir, ul_proto, pref_src,
- * pref_dst, family, ports, addr) -- the full ctl identity (sel_eq_d).  The
- * P4 ACL row keys only (proto, masked src, masked dst); the extra fields keep
- * the mirror 1:1 with ctl so a delete finds exactly the policy it installed. */
+/* Match a policy against the mirror by selector -- the full ctl identity
+ * (sel_eq_d): dir, ul_proto, pref_src, pref_dst, family, scope, ports, addr.
+ * The P4 ACL row keys only (proto, masked src, masked dst); the extra fields
+ * keep the mirror 1:1 with ctl so a delete finds exactly the policy it
+ * installed.  Note scope is compared here ONLY (identity), never added to the
+ * ACL key image -- it is not a match field, so two policies differing only by
+ * scope are distinct in the mirror and collide on one row, which
+ * p4_pol_row_conflicts rejects (-E2BIG). */
 static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 {
 	int i;
@@ -1216,6 +1220,9 @@ static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 			continue;
 		if (q->sel_src.port != sp->sel_src.port ||
 		    q->sel_dst.port != sp->sel_dst.port)
+			continue;
+		if (q->sel_src.scope != sp->sel_src.scope ||
+		    q->sel_dst.scope != sp->sel_dst.scope)
 			continue;
 		if (memcmp(q->sel_src.addr, sp->sel_src.addr, 4) != 0)
 			continue;
@@ -1322,7 +1329,10 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 	struct p4_sa *ea;
 	int rc;
 
-	/* IPv4 selectors only; ports deferred (exact ipv4 selector). */
+	/* IPv4 selectors only; the ACL row keys (proto, masked src, masked dst)
+	 * and nothing else -- ports/scope are not match fields (a policy that
+	 * differs from a live one only by port/scope/host-bits collides on the
+	 * row and is rejected by p4_sp_add/-E2BIG before reaching here). */
 	if (sp->sel_src.family != R2DP_AF_INET4 ||
 	    sp->sel_dst.family != R2DP_AF_INET4)
 		return -EAFNOSUPPORT;
