@@ -1532,6 +1532,12 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 						return rc;
 				}
 			}
+			/* Outbound delete done: the crypto SA is removed from every
+			 * slice's extern and each slice committed.  MUST return here
+			 * (the inbound block below is for IN SAD only) -- falling
+			 * through would re-delete this slice's (now zeroed) sl_id,
+			 * i.e. SA id 0, on every slice. */
+			return 0;
 		}
 		/* Inbound delete: the (dip,spi) table delete is already scheduled.
 		 * Apply it BEFORE tearing down the crypto SA / slot: with
@@ -1969,7 +1975,16 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 			}
 		}
 		if (rc) {
-			P4_LOG("slice %u outbound entry add %d", s, rc);
+			/* Abort EVERY slice that scheduled an op so nothing is left
+			 * pending: a pending delete/add on slices 0..s-1 would
+			 * otherwise be committed by a later success, silently
+			 * dropping this selector to the (bypass) default -- the
+			 * delayed fail-open this tree fixes for N=1, now for all
+			 * N.  abort on a slice with no pending op is a no-op. */
+			for (unsigned u = 0; u < pr->n_inst; u++)
+				if (pr->inst[u].ctl)
+					rte_swx_ctl_pipeline_abort(pr->inst[u].ctl);
+			P4_LOG("slice %u outbound entry add %d; aborted all", s, rc);
 			return rc;
 		}
 		P4_LOG("slice %u OUT BIND installed sel=%08x/%08x proto=%u "
@@ -2044,19 +2059,34 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 	ent.key_priority = p4_spd_prio(&p->sp);
 	{
 		unsigned s;
+		/* Phase 1: schedule the delete on EVERY slice with no commit.
+		 * All-or-nothing across slices: if scheduling fails on slice k,
+		 * abort every slice that already scheduled (a pending delete on
+		 * slices 0..k-1 would otherwise commit later and drop the
+		 * selector to bypass -- the delayed fail-open).  No delete is
+		 * published until every slice has accepted the schedule. */
 		for (s = 0; s < pr->n_inst; s++) {
 			rc = rte_swx_ctl_pipeline_table_entry_delete(pr->inst[s].ctl,
-					     "outbound_table_0", &ent);
+				     "outbound_table_0", &ent);
 			if (rc) {
-				P4_LOG("slice %u outbound entry del %d", s, rc);
+				for (unsigned u = 0; u < pr->n_inst; u++)
+					if (pr->inst[u].ctl)
+						rte_swx_ctl_pipeline_abort(pr->inst[u].ctl);
+				P4_LOG("slice %u outbound entry del %d; aborted all",
+				       s, rc);
 				return rc;
 			}
 		}
-		/* Schedule applied only on commit.  Do NOT clear the mirror before it
-		 * succeeds: with abort_on_fail=1 a failed commit rolls the delete
-		 * back, and ctl keeps the policy on error -- so the mirror must too
-		 * (else the next rebind re-programs a policy ctl already dropped,
-		 * and the bucket they agree on never empties). */
+		/* Phase 2: commit every slice's scheduled delete.  Do NOT clear
+		 * the mirror before ALL succeed: with abort_on_fail=1 a failed
+		 * commit rolls that slice's delete back and ctl keeps the policy
+		 * on error, so the mirror must too (else the next rebind
+		 * re-programs a policy ctl already dropped, and the bucket they
+		 * agree on never empties).  A slice whose commit already
+		 * succeeded cannot be rolled back here; that is the residual
+		 * cross-slice hazard of per-pipeline commits (documented), but
+		 * the common failure is symmetric, and an aborted schedule never
+		 * leaks. */
 		for (s = 0; s < pr->n_inst; s++) {
 			rc = rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
 			if (rc) {
@@ -2247,14 +2277,20 @@ int fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	 * model.  Default/absent = 1 (the historical single pipeline). */
 	{
 		const char *w = getenv("R2DP_P4_WORKERS");
-		long n = w ? strtol(w, NULL, 10) : 1;
-		if (n < 1) n = 1;
-		if (n > R2DP_P4_MAX_INST) {
-			P4_LOG("R2DP_P4_WORKERS=%ld clamped to %d", n,
-			       R2DP_P4_MAX_INST);
-			n = R2DP_P4_MAX_INST;
-		}
-		pr->n_inst = (uint32_t)n;
+			long n = w ? strtol(w, NULL, 10) : 1;
+			if (n < 1) n = 1;
+			if (n > R2DP_P4_MAX_INST) {
+				/* Fail closed, do not silently clamp: N slices must map 1:1
+				 * to cryptodev queue pairs and to CPU cores, and a request
+				 * the box cannot honour (N > MAX_INST, e.g. >8 QPs) must
+				 * not quietly run fewer slices than the control plane
+				 * thinks it programmed.  A silent clamp under-provisions
+				 * the plane while the operator believes N peers exist. */
+				P4_LOG("R2DP_P4_WORKERS=%ld refused: max %d", n,
+				       R2DP_P4_MAX_INST);
+				return -EINVAL;
+			}
+			pr->n_inst = (uint32_t)n;
 	}
 	P4_LOG("slices=%u", pr->n_inst);
 
