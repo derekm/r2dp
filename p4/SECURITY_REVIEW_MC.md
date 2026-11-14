@@ -246,15 +246,22 @@ per-slice best_cyc_pkt pps):**
   decrypt + replay demonstration:
   - **Inbound DECRYPT now demonstrated (`d76acb2`).** The extern
     `ipsec_xform.spi` was being programmed in NETWORK order
-    (`sp.encap.esp.spi = sa->spi`), so `rte_ipsec_pkt_crypto_prepare`
-    could not match a session and every inbound frame stayed enq=0 even
-    after a correct SAD hit.  Fixed to HOST order (`ntohl(sa->spi)`),
+    (`sp.encap.esp.spi = sa->spi`); it must be HOST order (`ntohl(sa->spi)`),
     mirroring exactly what the DPDK backend programs (`dp_gcm.c:79 ->
-    ntohl(rsa->spi)`) and what the SAD stores (`dpdk_sad.c`).  With the
-    fix, a framed-AES-GCM inbound stimulus decrypts and EGRESSES the inner
-    leg: `crypto enq=deq=288, ib hit 0->300, inner-out 0->288`.  The
-    far-leg inner frame is now real (verified, same stimulus on the real
-    peer path is pending).
+    ntohl(rsa->spi)`) and what the SAD stores (`dpdk_sad.c`).  Mechanism
+    (per independent review of DPDK 24.11): rte_swx_ipsec copies
+    `ipsec_xform.spi` straight into the xform, and rte_ipsec stores
+    `sa->spi = rte_cpu_to_be_32(ipsec_xform.spi)` (`lib/ipsec/sa.c`), so
+    host order in becomes network order on the wire and in the GCM AAD.
+    A swapped SPI would corrupt the AAD and fail ICV in
+    `rte_ipsec_pkt_process` *after* enqueue (enq and deq both move, inner
+    egress stays 0) -- it is NOT what keeps `enq=0`, because DPDK selects
+    the SA by `sa_id` (meta), not by packet SPI.  With the fix, a
+    framed-AES-GCM inbound stimulus decrypts and EGRESSES the inner leg:
+    `crypto enq=deq=288, ib hit 0->300, inner-out 0->288`.  The far-leg
+    inner frame is now real (verified, same stimulus on the real peer
+    path is pending).  The real-peer `ib=15 / crypto enq=0` residual is a
+    separate, unexplained defect, not this SPI byte order.
   - **Real independent-peer e2e on P4 is NOT yet verified.** The scapy
     gateway on the same binary SAD-hits (`ib hit=15`) but `crypto enq=0`;
     the synthetic stimulus that decrypts is not yet matched by the real
