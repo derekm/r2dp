@@ -1987,14 +1987,9 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			}
 			return rc;
 		}
-		{
-			unsigned s;
-			for (s = 0; s < pr->n_inst; s++) {
-				rc = rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
-				if (rc)
-					return rc;
-			}
-		}
+		/* p4_spd_rebind committed (or aborted) every slice itself; a
+		 * second commit pass here could only fail half-way with no
+		 * rollback (C10). */
 		return 0;
 	}
 
