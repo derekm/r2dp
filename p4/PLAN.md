@@ -161,6 +161,24 @@ now closed on-box; limits 3 and 4 remain open.
   (`MainControlT_status` unwritten) and SPD is still exact
   `(src,dst,proto)` (no prefix/ANY/ports).  See list below.
 
+**§8 update (2026-11-07):** Limit 3's *security* property is verified at the
+crypto layer even though the P4 `status` branch is unwritten.
+- **Limit 3 (crypto-failure-drop) — AEAD auth drop proven, at the extern.**
+  `rte_swx_ipsec_post_crypto` calls `rte_ipsec_pkt_process`; on AEAD auth
+  failure (`esp_inb.c` returns `-EBADMSG`) the failing mbuf is freed and
+  never written to the pipeline's output ring, so a bad-ICV frame cannot
+  egress the inner leg.  On-box: 2s of tampered-ciphertext ESP (8 ESP
+  ciphertext bytes flipped, same SPI/seq) leaked **0** plaintext frames to
+  inner while an intact frame decoded (398).  The P4 `status ==
+  IPSEC_SUCCESS` branches are therefore dead-but-harmless: the drop already
+  happened in the extern.  Do not "fix" the P4 status until/unless a real
+  failure path that returns bad frames exists.
+- **Limit 4 (SPD prefix/ANY) still open** — the external SPD classifier in
+  dp_dpdk.c is rte_acl (native prefix/priority); the P4/SWX `outbound_table`
+  is a single exact `(src,dst,proto)` table.  Making it prefix-capable
+  means an LPM/ternary table + per-prefix priorities in the runtime bind and
+  is the highest-blast-radius change; see list below.
+
 The plan above was filed before the P4 toolchain existed.  What actually
 happened, per the review of commits `5b42982`..`6efe910` (`p4-dpdk-swx` skill
 and the delegated `deleg_8f37ef0b` review):
