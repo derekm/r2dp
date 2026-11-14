@@ -193,7 +193,7 @@ enum dp_drop {
 	(w)->n_dropr[(r)] += n_; } while (0)
 
 #ifndef DP_MAX_WK
-#define DP_MAX_WK 8       /* packet workers (-n); same default as dp.h */
+#define DP_MAX_WK 8       /* packet workers (-n); override with -DDP_MAX_WK=N */
 #endif
 
 struct dpdk_priv;
