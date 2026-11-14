@@ -14,7 +14,9 @@
  * Honest scope: this proves the TABLE INSTALL action from the log, NOT that a
  * real packet hits spd_discard.  It installs R2DP_PROTO_ANY and /24 selectors
  * (like spmd) — the SPD table is now a WILDCARD (ternary) table (`a8aedd2`) so
- * these DO collapse to a prefix/ANY entry that matches; still assert spd_discard
+ * these install as SEPARATE prefix/ANY wildcard rows that match their selectors
+ * (they do NOT collapse into one entry — that collapse was Limit 4's bug);
+ * still assert spd_discard
  * on a hit and never claim packet-hit or DR_NO_SA_OUT parity without a wire
  * proof.  This probe checks the bind log only.
  *
