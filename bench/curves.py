@@ -157,7 +157,6 @@ def plot(data, out):
 
     fig = plt.figure(figsize=(13.5, 10))
     gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 1])
-
     # (a) DPDK tap-free scaling (enc) per series
     ax = fig.add_subplot(gs[0, :])
     # Stable color keyed by (box, pmd); reused verbatim in the P4 sweep panel
@@ -207,7 +206,10 @@ def plot(data, out):
     ax.legend()
 
     # (c) P4 tap-free sweep: Mpps vs packet size, per box/PMD (single instance)
-    ax = fig.add_subplot(gs[1, 1])
+    gs_c = gs[1, 1].subgridspec(2, 1, height_ratios=[1.15, 1], hspace=0.45)
+
+    # (c1) P4 tap-free size sweep: Mpps vs packet size (single instance)
+    ax = fig.add_subplot(gs_c[0])
     p4sweep = p4.get("sweep", {})
     if p4sweep:
         styles4 = {"openssl": "o-", "aesni_mb": "^-"}
@@ -234,8 +236,13 @@ def plot(data, out):
                 f"for reference (shared net_tap, .165, 64B): P4 {p4_tap*1e3:.0f}K "
                 f"pps, DPDK {dpdk_tap*1e3:.0f}K pps -- tap is the I/O wall",
                 transform=ax.transAxes, va="top", fontsize=7, color="#555555")
+
+    # (c1) size sweep done (if/else above).  Now (c2) the core sweep on the
+    # lower half of the right-hand panel -- a separate if/else, NOT nested in
+    # the size-sweep block.
+    if p4sweep:
+        pass
     else:
-        # fall back to the tap-free-vs-tap bar wall
         dpdk_tapfree = {}
         for s in dpdk:
             if "1" in s["enc"]:
@@ -256,6 +263,39 @@ def plot(data, out):
         plt.setp(ax.get_xticklabels(), rotation=20, ha="right")
     ax.grid(True, alpha=0.3)
     ax.legend()
+
+    # (c2) P4 multicore core sweep: aggregate Mpps vs R2DP_P4_WORKERS
+    ax2 = fig.add_subplot(gs_c[1])
+    p4core = p4.get("core_sweep", {})
+    if p4core:
+        for box, pms in p4core.items():
+            for pmd, ws in pms.items():
+                xs = sorted(int(k) for k in ws)
+                ys = [ws[str(x)]["mpps"] for x in xs]
+                ax2.plot(xs, ys, styles4.get(pmd, "o-"), ms=6,
+                         label=f"P4 {box} {pmd}", color=color(box, pmd))
+                for xi, yi in zip(xs, ys):
+                    ax2.annotate(f"{yi:.2f}", (xi, yi),
+                                 textcoords="offset points", xytext=(0, 7),
+                                 ha="center", fontsize=8, color=color(box, pmd))
+        ax2.set_xlabel("p4 slices (R2DP_P4_WORKERS)")
+        ax2.set_ylabel("aggregate Mpps (sum of slices)")
+        ax2.set_title("P4 multicore, aggregate tap-free (core sweep)")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        # resilient-per-core DPDK reference on .179 aesni for scale context
+        kase = next((s for s in dpdk if s.get("enc") and "179" in s["box"] and
+                     s["pmd"] == "aesni_mb"), None)
+        if kase:
+            dx = sorted(int(k) for k in kase["enc"])
+            ax2.plot(dx, [kase["enc"][str(x)] for x in dx], "--",
+                     color="#888888", lw=1.2,
+                     label="DPDK .179 aesni (resilient, for scale)")
+    else:
+        ax2.text(0.5, 0.5, "multicore sweep not collected; run the R2DP_P4_WORKERS bench",
+                 transform=ax2.transAxes, ha="center", va="center", fontsize=9,
+                 color="#888888")
+        ax2.set_title("P4 multicore core sweep (not yet collected)")
 
     fig.suptitle("r2dp dataplane performance - measured, both engines, both boxes, all PMDs",
                  fontsize=13)
