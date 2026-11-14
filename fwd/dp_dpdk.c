@@ -474,8 +474,11 @@ inner_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port)
 		for (uint16_t i = 0; i < nnon; i++)
 			if (nonesp[i] != NULL)
 				txq[ntx++] = nonesp[i];
-		if (ntx && is_udp(txq[0]))
-			w->n_ike += ntx;
+		/* count per frame: a bypass burst can mix IKE with other
+		 * clear traffic (WORKER W7) */
+		for (uint16_t i = 0; i < ntx; i++)
+			if (is_udp(txq[i]))
+				w->n_ike++;
 		uint16_t sent = port_tx(to, w->txq, txq, ntx);
 		w->n_tx += sent;
 		DROP(w, DR_TX_FULL, ntx - sent);
