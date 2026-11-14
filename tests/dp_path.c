@@ -160,6 +160,37 @@ inner_frame(const char *src, const char *dst, uint8_t proto, uint16_t dport,
 	return inner_frame_len(src, dst, proto, dport, ipcopy, 64);
 }
 
+/* Move everything from packet offset `off` on (which must fall inside the
+ * last segment) into a new chained segment. */
+static struct rte_mbuf *
+split_at(struct rte_mbuf *m, uint32_t off)
+{
+	struct rte_mbuf *last, *t;
+	uint32_t base, rest;
+	uint8_t *dst;
+
+	if (!m)
+		return NULL;
+	last = rte_pktmbuf_lastseg(m);
+	base = rte_pktmbuf_pkt_len(m) - rte_pktmbuf_data_len(last);
+	rest = rte_pktmbuf_data_len(last) - (off - base);
+	t = rte_pktmbuf_alloc(mp);
+	if (!t || !(dst = (uint8_t *)rte_pktmbuf_append(t, (uint16_t)rest))) {
+		rte_pktmbuf_free(t);
+		rte_pktmbuf_free(m);
+		return NULL;
+	}
+	memcpy(dst, rte_pktmbuf_mtod_offset(last, uint8_t *, off - base), rest);
+	last->data_len = (uint16_t)(last->data_len - rest);
+	m->pkt_len -= rest;
+	if (rte_pktmbuf_chain(m, t) != 0) {
+		rte_pktmbuf_free(t);
+		rte_pktmbuf_free(m);
+		return NULL;
+	}
+	return m;
+}
+
 /* A -> encrypt -> B -> decrypt.  Returns 1 if an inner packet came out of
  * B (copied to `got`), 0 if dropped; *encrypted says whether A emitted ESP. */
 static int tamper_at = -1;   /* >= 0: flip this byte of the ESP datagram */
@@ -640,6 +671,59 @@ main(void)
 		}
 		CHECK(strstr(buf, " crypto_fail=3 ") && strstr(buf, " inner_sel=1 "),
 		    "drops: stats dump names each reason");
+	}
+
+	/* OUTBOUND O1: buffer segmentation never changes a packet's policy
+	 * disposition.  Split inside Ethernet, inside the IPv4 header,
+	 * exactly after it and inside the port bytes; two and three
+	 * segments.  PROTECT still encrypts byte-identically, a port DISCARD
+	 * still drops, and unmatched traffic is still bypass. */
+	{
+		static const uint32_t cuts[] = { 6, 20, 34, 36, 38 };
+		static uint8_t w[64], g[64];
+		unsigned mbs = rte_mempool_avail_count(mp);
+		uint64_t disc = a->wk[0].n_dropr[DR_POLICY_DISCARD];
+		int ok_p = 1, ok_d = 1;
+
+		for (unsigned c = 0; c < RTE_DIM(cuts); c++) {
+			struct rte_mbuf *m;
+
+			m = split_at(inner_frame("10.0.1.5", "10.0.2.5", 17, 4789, w),
+			    cuts[c]);
+			if (!m || m->nb_segs != 2 || !run(a, b, m, &enc, g) || !enc ||
+			    memcmp(g, w, 64)) {
+				printf("     split at %u: PROTECT not encrypted intact\n", cuts[c]);
+				ok_p = 0;
+			}
+			m = split_at(inner_frame("10.0.1.5", "10.0.2.5", 6, 23, NULL),
+			    cuts[c]);
+			if (!m || run(a, b, m, &enc, g) || enc) {
+				printf("     split at %u: TCP/23 not discarded\n", cuts[c]);
+				ok_d = 0;
+			}
+		}
+		CHECK(ok_p, "segmented PROTECT frames encrypt like contiguous ones");
+		CHECK(ok_d && a->wk[0].n_dropr[DR_POLICY_DISCARD] == disc + RTE_DIM(cuts),
+		    "segmented TCP/23 frames still hit the port DISCARD");
+		{
+			struct rte_mbuf *m = split_at(split_at(inner_frame("10.0.1.5",
+			    "10.0.2.5", 17, 4789, w), 10), 36);
+
+			CHECK(m && m->nb_segs == 3 && run(a, b, m, &enc, g) && enc &&
+			    !memcmp(g, w, 64), "three-segment PROTECT frame encrypts intact");
+		}
+		{
+			struct rte_mbuf *in[1], *esp[1] = { NULL };
+			uint16_t nout = 0, nb = 0;
+
+			in[0] = split_at(inner_frame("192.168.1.1", "192.168.2.2", 17,
+			    4789, NULL), 20);
+			esp_outbound(&a->wk[0], in, 1, esp, &nout, &nb);
+			CHECK(in[0] && nout == 0 && nb == 1 && in[0]->nb_segs == 2,
+			    "segmented unmatched frame stays bypass, untouched");
+			rte_pktmbuf_free(in[0]);
+		}
+		CHECK(rte_mempool_avail_count(mp) == mbs, "segmented frames: no mbuf leaked");
 	}
 
 	/* A session a stuck device still holds outlives its SA's deletion

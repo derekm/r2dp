@@ -636,6 +636,29 @@ in_inner_ok(struct dpdk_priv *d, struct rte_ipsec_session *ss,
 	    rte_pktmbuf_data_len(mb));
 }
 
+
+/* Bytes outbound policy classification reads: Ethernet, the largest IPv4
+ * header and the four port bytes after it. */
+#define DP_CLS_HDR (RTE_ETHER_HDR_LEN + 60 + 4)
+
+/* The frame's leading bytes, contiguous: in place when the first segment
+ * holds them (the common case, nothing copied), else read across the
+ * chain into `scratch` (DP_CLS_HDR bytes).  Buffer segmentation must not
+ * change how the same packet is classified (OUTBOUND O1).  Returns the
+ * readable length; 0 when the frame cannot be read. */
+static inline uint32_t
+frame_head(const struct rte_mbuf *m, uint8_t *scratch, const uint8_t **p)
+{
+	uint32_t want = RTE_MIN(rte_pktmbuf_pkt_len(m), (uint32_t)DP_CLS_HDR);
+
+	if (rte_pktmbuf_data_len(m) >= want) {
+		*p = rte_pktmbuf_mtod(m, const uint8_t *);
+		return rte_pktmbuf_data_len(m);
+	}
+	*p = rte_pktmbuf_read(m, 0, want, scratch);
+	return *p ? want : 0;
+}
+
 /* Outbound ESP: take inner IPv4 plaintext (L2 already stripped, l2_len=0),
  * look up the OUT policy + EGRESS SA, run rte_ipsec EGRESS encrypt, and write
  * the resulting ESP datagram (outer IP + ESP, L2 NOT yet re-added) into `out`.
@@ -654,16 +677,22 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 	const struct r2dp_sp *csp[BURST_SZ];
 	struct dp_sa *cds[BURST_SZ];
 	size_t cav[BURST_SZ] = { 0 };
+	const uint8_t *hp[BURST_SZ];
+	uint32_t hl[BURST_SZ];
+	uint8_t hs[BURST_SZ][DP_CLS_HDR];
 
 	if (nr > BURST_SZ) nr = BURST_SZ;
 	/* Inner IPv6 has no ESP path.  Default is discard (RFC 4301), not
 	 * bypass: a config with only IPv4 policies must not leak v6 clear. */
 	for (uint16_t i = 0; i < nr; i++) {
 		const uint8_t *f;
+
+		hl[i] = 0;
 		if (!bufs[i])
 			continue;
-		f = rte_pktmbuf_mtod(bufs[i], const uint8_t *);
-		if (rte_pktmbuf_data_len(bufs[i]) >= RTE_ETHER_HDR_LEN &&
+		hl[i] = frame_head(bufs[i], hs[i], &hp[i]);
+		f = hp[i];
+		if (hl[i] >= RTE_ETHER_HDR_LEN &&
 		    f[12] == 0x86 && f[13] == 0xdd) {
 			DROP(w, DR_V6_POLICY, 1);
 			rte_pktmbuf_free(bufs[i]);
@@ -679,15 +708,14 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 
 		cip[i] = NULL;
 		cav[i] = 0;
-		if (!bufs[i] || rte_pktmbuf_data_len(bufs[i]) <
-		    RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
+		if (!bufs[i] ||
+		    hl[i] < RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
 			continue;
-		ip = (const struct rte_ipv4_hdr *)(rte_pktmbuf_mtod(bufs[i],
-		    const uint8_t *) + RTE_ETHER_HDR_LEN);
+		ip = (const struct rte_ipv4_hdr *)(hp[i] + RTE_ETHER_HDR_LEN);
 		if ((ip->version_ihl >> 4) != 4)
 			continue;
 		cip[i] = ip;
-		cav[i] = rte_pktmbuf_data_len(bufs[i]) - RTE_ETHER_HDR_LEN;
+		cav[i] = hl[i] - RTE_ETHER_HDR_LEN;
 	}
 	sp_match_out_burst(d, cip, cav, nr, csp, cds);
 	for (uint16_t i = 0; i < nr; i++) {
@@ -717,6 +745,14 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 		/* Once the packet matched a policy, failure below must DROP it, never
 		 * leak it back as cleartext: the L2 header is about to be stripped,
 		 * so the mbuf is no longer a forwardable frame (H4/H2). */
+		why = DR_MALFORMED;
+		/* a segmented frame (O1) is made contiguous in its first
+		 * segment's own tailroom -- no allocation -- so headers, trim
+		 * and the crypto pass see one buffer; one that does not fit
+		 * is dropped, never sent clear */
+		if (!rte_pktmbuf_is_contiguous(bufs[i]) &&
+		    rte_pktmbuf_linearize(bufs[i]) != 0)
+			goto drop;
 		(void)rte_pktmbuf_adj(bufs[i], RTE_ETHER_HDR_LEN);
 		bufs[i]->l2_len = 0;
 		lip = rte_pktmbuf_mtod(bufs[i], struct rte_ipv4_hdr *);
@@ -966,12 +1002,13 @@ dp_steer_inner(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
 	size_t av[BURST_SZ] = { 0 };
 	const struct r2dp_sp *sp[BURST_SZ];
 	struct dp_sa *ds[BURST_SZ];
+	uint8_t hs[BURST_SZ][DP_CLS_HDR];
 
 	if (n > BURST_SZ)
 		n = BURST_SZ;
 	for (uint16_t i = 0; i < n; i++) {
-		const uint8_t *p = rte_pktmbuf_mtod(m[i], const uint8_t *);
-		uint32_t len = rte_pktmbuf_data_len(m[i]);
+		const uint8_t *p;
+		uint32_t len = frame_head(m[i], hs[i], &p);
 		const struct rte_ipv4_hdr *h;
 
 		if (len < RTE_ETHER_HDR_LEN + sizeof(*h))
