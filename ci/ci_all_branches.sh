@@ -12,7 +12,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 git fetch -q origin '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null || true
 BRANCHES="${BRANCHES:-$(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin | grep -vx HEAD)}"
-LOG="$ROOT/.ci_all.log"; : >"$LOG"
+# Keep the log out of the worktree: ci/no-cruft-guard.sh forbids
+# .ci_all.log there, and it runs right after this script.
+LOG="${CI_ALL_LOG:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ci_all.log}"; : >"$LOG"
 PASS=0; SKIP=0; FAIL=0
 
 build_tip() {     # cwd = worktree; prints the kind, returns 0 on success
