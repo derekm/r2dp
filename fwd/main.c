@@ -18,6 +18,7 @@
  * --nh-size: initial size of the DPDK next-hop table, in tunnel peers
  * (default 1024).  It is not a limit: the table doubles as it fills.
  */
+#include <errno.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdio.h>
@@ -84,7 +85,21 @@ main(int argc, char **argv)
 				return 2;
 			}
 		} else if (strcmp(a, "-n") == 0 && i + 1 < argc) {
-			nb_workers = atoi(argv[++i]);   /* DPDK packet workers */
+			char *e;
+			long v;
+
+			/* DPDK packet workers: a typo must stop the daemon,
+			 * not degrade it to control-only (INIT I2). */
+			errno = 0;
+			v = strtol(argv[++i], &e, 10);
+			if (errno || e == argv[i] || *e || v < 1 ||
+			    v > DP_MAX_WK) {
+				fprintf(stderr, "r2dp-fwd: -n %s: want 1..%d "
+				    "workers\n", argv[i], DP_MAX_WK);
+				free(eal_base);
+				return 2;
+			}
+			nb_workers = (int)v;
 		} else {
 			eal_argv[eal_argc++] = argv[i];
 		}
@@ -110,14 +125,27 @@ main(int argc, char **argv)
 		free(eal_base);
 		return 2;
 	} else
-	/* Optional DPDK dataplane probe.  Failure is non-fatal: we still serve
-	 * the control socket (racoon2 bring-up + M0 tests). */
+	/* DPDK dataplane probe.  Control-only (no dataplane, ESP dropped, IKE
+	 * still answered) is only valid when there is no backend to ask for:
+	 * -2 = built without DPDK, -ENODEV = no dataplane port.  Any other
+	 * failure (EAL init, -n beyond the cryptodev's queue pairs, setup
+	 * errors) is a configuration error and stops the process: degrading
+	 * to control-only would accept SA_ADD/SP_ADD while forwarding
+	 * nothing (INIT I2). */
 	{
 		int r = fwd_dp_dpdk_probe(&ctl.dp, &eal_argc, &eal_argv,
 		    sockpath, verbose, nb_workers, (unsigned)nh_size);
-		if (r < 0)
+		if (r == -2 || r == -ENODEV) {
 			fprintf(stderr, "r2dp-fwd: DPDK dataplane unavailable (%s); "
-			    "serving control-only\n", r == -2 ? "no DPDK build" : strerror(-r));
+			    "serving control-only\n",
+			    r == -2 ? "no DPDK build" : strerror(-r));
+		} else if (r < 0) {
+			fprintf(stderr, "r2dp-fwd: DPDK dataplane failed to start "
+			    "(%s); refusing to run control-only\n",
+			    strerror(-r));
+			free(eal_base);
+			return 1;
+		}
 		(void)g_stop;
 	}
 	free(eal_base);   /* rte_eal_init advanced eal_argv; free the calloc base */

@@ -913,10 +913,14 @@ crypto_init(struct dpdk_priv *d)
 	d->cdev_id = (uint8_t)id;
 	rte_cryptodev_info_get(d->cdev_id, &d->cdev_info);
 	if (d->cdev_info.max_nb_queue_pairs < d->nb_wk) {
-		fprintf(stderr, "r2dp-fwd: %s has %u queue pairs; -n %u clamped\n",
+		/* Fail closed rather than silently running fewer workers than
+		 * requested: a clamped -n looks like scaling but is not. */
+		fprintf(stderr, "r2dp-fwd: %s only has %u queue pairs but -n %u was "
+		    "requested; add max_nb_queue_pairs=<n> to the --vdev (e.g. "
+		    "--vdev='crypto_openssl0,max_nb_queue_pairs=%u')\n",
 		    rte_cryptodev_name_get(d->cdev_id),
-		    d->cdev_info.max_nb_queue_pairs, d->nb_wk);
-		d->nb_wk = RTE_MAX(1u, d->cdev_info.max_nb_queue_pairs);
+		    d->cdev_info.max_nb_queue_pairs, d->nb_wk, d->nb_wk);
+		return -EINVAL;
 	}
 	memset(&cconf, 0, sizeof(cconf));
 	cconf.socket_id = SOCKET_ID_ANY;
@@ -1028,7 +1032,12 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 
 	ret = rte_eal_init(*argc, *argv);
 	if (ret < 0) {
-		fprintf(stderr, "r2dp-fwd: rte_eal_init failed (%d)\n", ret);
+		/* rte_eal_init returns -1 and sets rte_errno.  -ENODEV is
+		 * reserved for "no dataplane port" (main's control-only
+		 * case), so an EAL failure never maps onto it. */
+		ret = rte_errno > 0 && rte_errno != ENODEV ? -rte_errno : -EIO;
+		fprintf(stderr, "r2dp-fwd: rte_eal_init failed: %s\n",
+		    rte_strerror(-ret));
 		free(d);
 		return ret;
 	}
@@ -1042,7 +1051,15 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		free(d);
 		return -ENOMEM;
 	}
-	(void)crypto_init(d);      /* none: ESP is dropped, IKE still flows */
+	ret = crypto_init(d);
+	/* -ENODEV: no crypto device -- tolerated, ESP is dropped and IKE still
+	 * flows.  A device that is present but cannot be set up for -n
+	 * workers refuses the dataplane instead (CRYPTOQ CQ2). */
+	if (ret < 0 && ret != -ENODEV) {
+		rte_mempool_free(d->pool);
+		free(d);
+		return ret;
+	}
 
 	{
 		struct rte_ipsec_sad_conf conf;

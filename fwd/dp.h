@@ -84,6 +84,12 @@ struct fwd_dp {
  * dumps its counters, incl. per-reason drops, and clears it. */
 extern volatile sig_atomic_t fwd_stats_req;
 
+/* Packet-worker bound for -n (DPDK backend); main validates against it
+ * before probing.  Override at build time with -Ddp_max_wk=N. */
+#ifndef DP_MAX_WK
+#define DP_MAX_WK 8
+#endif
+
 /* Defaults: zero -> no backend (ctl.c still answers protocol). */
 void fwd_dp_init(struct fwd_dp *dp);
 

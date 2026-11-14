@@ -86,7 +86,15 @@ main(int argc, char **argv)
 	if ((child = fork()) < 0)
 		return 2;
 	if (child == 0) {
-		execl(bin, bin, "-s", sockpath, (char *)NULL);
+		/* Explicit EAL config: a DPDK build must come up without
+		 * hugepages or PCI and, with no dataplane port, serve
+		 * control-only.  A failed EAL init is fatal (INIT I2), so
+		 * never rely on its defaults here.  Ignored without DPDK. */
+		char pfx[40];
+		snprintf(pfx, sizeof(pfx), "r2dpt%ld", (long)getpid());
+		execl(bin, bin, "-s", sockpath, "--no-huge", "-m", "256",
+		    "--no-pci", "--no-telemetry", "--no-shconf",
+		    "--file-prefix", pfx, (char *)NULL);
 		_exit(127);
 	}
 
