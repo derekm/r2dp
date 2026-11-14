@@ -28,9 +28,10 @@ ctl/proto/libr2dp/tests untouched.
 
 ## 2. The packet engine: P4-DPDK on the installed DPDK soft-switch
 
-The P4-DPDK target compiles a P4 program (arch **PNA**) with `p4c --target
-dpdk --arch pna` into a `rte_swx_pipeline` **text spec** (`.spec`) plus a
-`.code` blob, which a host program loads via `rte_swx_pipeline_*` / `rte_swx_ctl_*`.
+The P4-DPDK target compiles a P4 program (arch **PNA**) with the standalone
+`p4c-dpdk --arch pna` (NOT `p4c --target dpdk`, which the driver rejects) into
+a `rte_swx_pipeline` **text spec** (`.spec`), which a host program loads via
+`rte_swx_pipeline_*` / `rte_swx_ctl_*`.
 
 Confirmed present in the DPDK 25.11 build already installed on `.179`
 

@@ -1,17 +1,20 @@
+// SPDX-FileCopyrightText: 2023 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 // r2dp P4 backend — first behavior (PNA arch, compiled by p4c-dpdk --arch pna).
 //
-// This program is derived from p4c's backends/dpdk/examples/ipsec.p4
-// (Copyright(c) Intel Corporation / p4lang, Apache-2.0): the parser/control/
-// package structure and the ipsec_accelerator extern usage follow that
-// reference, adapted to r2dp's inbound-SAD / outbound-SPD contract.
+// Modeled on p4c's backends/dpdk/examples/ipsec.p4 (Copyright 2023 Intel
+// Corporation, Apache-2.0): the parser/control/package structure and the
+// ipsec_accelerator extern usage follow that reference, adapted to r2dp's
+// inbound-SAD / outbound-SPD contract.
 //
-// It expresses the same SPD/SAD behaviour as the r2dp DPDK backend
-// (fwd/dp_dpdk.c) behind the same r2dp socket: inbound ESP -> SAD (dst, spi)
-// -> ipsec extern decap; outbound -> SPD -> ipsec extern encap; bypass otherwise.
-// The same source can later target a switch ASIC once the P4 abstraction is
-// kept (see p4/PLAN.md).
+// It targets the same SPD/SAD contract as the r2dp DPDK backend
+// (fwd/dp_dpdk.c) behind the same r2dp socket.  NOTE this first version's
+// limits (see p4/PLAN.md §8): inbound non-ESP (IKE/ARP) is dropped, every
+// UDP/4500 is parsed as ESP (no NAT-T marker demux), SPD is exact
+// (src,dst,proto) only, and the inbound miss action is `drop`, which is NOT the
+// DPDK backend's DR_NO_SA_IN counter.  These are scope decisions for the first
+// behavior, not full parity.
 //
 // The tables below are populated from the r2dp control plane (SA_ADD/SP_ADD ->
 // rte_swx_ctl_* table entries + rte_swx_ipsec_sa_add), mapping fwd_dp_ops:
@@ -159,7 +162,8 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
     }
 
     /* Inbound SAD: (outer dst, esp spi) -> the SA the ipsec extern decrypts
-     * with.  A miss drops (DR_NO_SA_IN). */
+     * with.  A miss runs the const default `drop`; note this is NOT the DPDK
+     * backend's DR_NO_SA_IN drop-counter (see header/PLAN §8). */
     table inbound_table {
         key = {
             hdrs.ipv4.dst_addr : exact;

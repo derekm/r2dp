@@ -109,10 +109,16 @@ struct p4_priv {
 
 static void p4_caps(struct fwd_dp *dp)
 {
-	/* SWX ipsec extern honours the transforms the crypto device does;
-	 * advertise AES-256 (the transform dp_gcm.c KAT proves). */
-	dp->caps_bits_enc[3] |= (1U << 7);       /* AES-256 */
-	dp->caps_bits_integ[3] |= (1U << 7);     /* GCM/AEAD combined */
+	/* Advertise ONLY what the ipsec extern actually installs.  We program
+	 * AEAD AES-GCM-128 (sa_add wires RTE_CRYPTO_AEAD_AES_GCM from the
+	 * r2dp key||salt blob) with no separate integrity transform, so the
+	 * enc/integ bitmap pairs must match the DPDK backend (dpdk_sad.c):
+	 * advertising a transform the dataplane cannot install makes racoon2
+	 * negotiate a dead SA. */
+	memset(dp->caps_bits_enc, 0, sizeof(dp->caps_bits_enc));
+	memset(dp->caps_bits_integ, 0, sizeof(dp->caps_bits_integ));
+	dp->caps_bits_enc[0]    = (1u << R2DP_ENCR_AES_GCM_16);
+	dp->caps_bits_integ[0]  = (1u << R2DP_INTEG_NONE);
 }
 
 /* ------------------------------------------------------------- SA store */
@@ -423,8 +429,14 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	struct p4_sa *e;
 	uint8_t key[16], data[4];
 	struct rte_swx_table_entry ent;
-	int rc, i;
+	int rc, i, inbound, deleting;
 	uint32_t dip, spi;
+
+	/* Direction comes from the vtable flag (dp.h): only SA_ADD with
+	 * FWD_DP_SA_INBOUND installs the inbound (decrypt) SAD entry; an
+	 * outbound SA is the encrypt leg the SPD references via sa_id. */
+	inbound = (add & FWD_DP_SA_INBOUND) != 0;
+	deleting = !(add & 1);
 
 	/* Host-order key from the wire (matches dpdk_sad.c conventions). */
 	if (sa->dst.family != R2DP_AF_INET4)
@@ -433,14 +445,32 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	dip = ntohl(dip);
 	spi = ntohl(sa->spi);
 
-	if (!add) {                       /* delete */
-		e = p4_sad_lookup(pr, dip, spi, sa->proto);
-		if (e)
-			e->in_use = 0;
-		return 0;
+	e = p4_sad_lookup(pr, dip, spi, sa->proto);
+	if (deleting) {
+		if (!e)
+			return -ENOENT;
+		if (pr->ipsec)
+			rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
+		if (inbound) {
+			/* remove the (dip,spi) -> ipsec_enable SAD entry */
+			memset(&ent, 0, sizeof(ent));
+			memset(key, 0, sizeof(key));
+			{
+				uint32_t dip_be = htonl(dip);
+				uint32_t spi_be = htonl(spi);
+				memcpy(&key[0], &dip_be, 4);
+				memcpy(&key[4], &spi_be, 4);
+			}
+			ent.key = key;
+			rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl,
+					"inbound_table_0", &ent);
+			if (rc)
+				P4_LOG("inbound entry del %d", rc);
+		}
+		e->in_use = 0;
+		return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 	}
 
-	e = p4_sad_lookup(pr, dip, spi, sa->proto);
 	if (!e) {
 		for (i = 0; i < P4_SA_MAX; i++)
 			if (!pr->sad[i].in_use) { e = &pr->sad[i]; break; }
@@ -449,7 +479,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		e->dip = dip;
 		e->spi = spi;
 		e->proto = sa->proto;
-		e->dir = sa->dir;
+		e->dir = inbound ? R2DP_DIR_IN : R2DP_DIR_OUT;
 		e->sl_id = (uint32_t)i;      /* stable per-install id */
 		e->in_use = 1;
 	}
@@ -460,7 +490,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	if (blob && blen) {
 		uint32_t sa_id = 0;
 		struct rte_swx_ipsec_sa_params sp = {0};
-		sp.encrypt = (e->dir == R2DP_DIR_OUT);
+		sp.encrypt = !inbound;    /* encrypt = outbound */
 		sp.crypto.is_aead = 1;
 		sp.crypto.aead.alg = RTE_CRYPTO_AEAD_AES_GCM;
 		if (blen > RTE_SWX_IPSEC_KEY_SIZE_MAX)
@@ -479,10 +509,16 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		rc = rte_swx_ipsec_sa_add(pr->ipsec, &sp, &sa_id);
 		if (rc) {
 			P4_LOG("ipsec sa_add %d", rc);
+			e->in_use = 0;
 			return rc;
 		}
 		e->sl_id = sa_id;   /* the id the action must write */
 	}
+
+	/* Only the inbound (decrypt) SA gets a SAD table entry; outbound SAs
+	 * are reached through the SPD's ipsec_protect(sa_id). */
+	if (!inbound)
+		return 0;
 
 	/* inbound_table_0 entry: (ipv4.dst_addr, esp.spi)
 	 * -> ipsec_enable(sl_id).  Keys are big-endian wire bytes. */
@@ -506,7 +542,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		P4_LOG("inbound entry add %d", rc);
 		return rc;
 	}
-	return 0;
+	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 }
 
 static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
@@ -554,16 +590,46 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	}
 	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "outbound_table_0",
 						  &ent);
-	if (rc)
+	if (rc) {
 		P4_LOG("outbound entry add %d", rc);
-	return rc;
+		return rc;
+	}
+	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 }
 
 static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 {
-	/* rte_swx_ctl_pipeline_table_entry_delete(ctl, "outbound_table_0", e). */
-	(void)dp; (void)sp;
-	return 0;
+	struct p4_priv *pr = dp->priv;
+	uint8_t key[16];
+	struct rte_swx_table_entry ent;
+	uint32_t ssrc, sdst;
+	int rc;
+
+	if (sp->sel_src.family != R2DP_AF_INET4 ||
+	    sp->sel_dst.family != R2DP_AF_INET4)
+		return -EAFNOSUPPORT;
+	memcpy(&ssrc, sp->sel_src.addr, 4);
+	memcpy(&sdst, sp->sel_dst.addr, 4);
+	ssrc = ntohl(ssrc);
+	sdst = ntohl(sdst);
+
+	memset(&ent, 0, sizeof(ent));
+	memset(key, 0, sizeof(key));
+	{
+		uint32_t src_be = htonl(ssrc);
+		uint32_t dst_be = htonl(sdst);
+		memcpy(&key[0], &src_be, 4);
+		memcpy(&key[4], &dst_be, 4);
+		key[8] = sp->ul_proto;
+	}
+	ent.key = key;
+	rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl, "outbound_table_0",
+						     &ent);
+	if (rc) {
+		P4_LOG("outbound entry del %d", rc);
+		return rc;
+	}
+	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 }
 
 static int64_t p4_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
@@ -575,9 +641,8 @@ static int64_t p4_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 static void p4_stop(struct fwd_dp *dp)
 {
 	struct p4_priv *pr = dp->priv;
-	if (!pr->started)
-		return;
-	pr->started = 0;
+	/* Always free whatever was allocated, even on a partial start (the
+	 * probe calls stop on failure).  `started` is not the only guard. */
 	if (pr->ctl)
 		rte_swx_ctl_pipeline_free(pr->ctl);
 	if (pr->ipsec)
@@ -587,6 +652,7 @@ static void p4_stop(struct fwd_dp *dp)
 	pr->ctl = NULL;
 	pr->ipsec = NULL;
 	pr->p = NULL;
+	pr->started = 0;
 }
 
 static void p4_idle(struct fwd_dp *dp)
