@@ -654,6 +654,43 @@ static int p4_start(struct fwd_dp *dp)
 	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
 		"ipsec_port_in_outbound", 0, (uint64_t)0xffffffffUL);
 
+	/* Egress must be reachable, or no frame can leave the dataplane:
+	 * routing_table_0 (id 2) maps an outer/host dst (LPM) to a next_hop_id
+	 * (default next_hop_id 0), and next_hop_table_0 (id 3) maps that id to
+	 * next_hop_set(port_id).  next_hop_table_0's const default is `drop`,
+	 * so populate at least the id-0 hop (and a same-direction id-1 hop)
+	 * to the matching pipeline output port: id 0 = outer leg (port 0),
+	 * id 1 = inner leg (port 1). */
+	{
+		/* next_hop_set args: dst_mac(6) src_mac(6) ether_type(2) port_id(4). */
+		struct rte_swx_table_entry en;
+		int rid = p4_table_action_id(pr->p, 3, 0);  /* next_hop_set */
+		uint8_t k0[4] = { 0, 0, 0, 0 }, k1[4] = { 0, 0, 0, 1 };
+		uint8_t ab[18];
+		if (rid < 0) {
+			P4_LOG("next_hop_set action id lookup failed");
+		} else {
+			memset(&en, 0, sizeof(en));
+			memset(ab, 0, sizeof(ab));
+			/* ether_type = 0x0800 (IPv4) at offset 12. */
+			ab[12] = 0x08; ab[13] = 0x00;
+			en.action_id = (uint64_t)rid;
+			en.action_data = ab;
+			en.key = k0;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+				 "next_hop_table_0", &en))
+				P4_LOG("next_hop id0 add failed");
+			/* id1 -> inner leg (port 1): port_id at offset 14. */
+			ab[14] = 0x00; ab[15] = 0x00; ab[16] = 0x00; ab[17] = 0x01;
+			en.key = k1;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+				 "next_hop_table_0", &en))
+				P4_LOG("next_hop id1 add failed");
+			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 0);
+			P4_LOG("next_hop table populated (id0->outer, id1->inner)");
+		}
+	}
+
 	/* Find + configure the two ethdev legs (tap/memif/vhost) and the mbuf
 	 * pool; a box with no such NIC runs control-only. */
 	rc = p4_io_init(pr);
