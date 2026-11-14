@@ -258,7 +258,25 @@ per-slice best_cyc_pkt pps):**
   - **Real independent-peer e2e on P4 is NOT yet verified.** The scapy
     gateway on the same binary SAD-hits (`ib hit=15`) but `crypto enq=0`;
     the synthetic stimulus that decrypts is not yet matched by the real
-    peer.  This remains a reviewer action.
+    peer.  Two independent blockers remain:
+    - (a) real-peer frames SAD-hit but the extern does not dequeue/enqueue
+      (`crypto enq=0`) on the same binary that decrypts the synthetic
+      stimuli -- the wire-frame delta (outer frame / sequence / timing)
+      is not yet explained.  N=1 reproduces it, so it is not slicing.
+    - (b) **`next_hop_set` installs all-zero MACs.**  `fwd/dp_p4.c`
+      `p4_start` programs `next_hop_table_0` action data by zeroing `ab[]`
+      and setting only `ether_type` (0x0800) and `port_id` -- the
+      `next_hop_set(dst_addr, src_addr, ether_type, port_id)` action's
+      `dst_addr`/`src_addr` field are both left `00:00:00:00:00:00`.
+      Every processed frame (including a decrypted inner frame) egresses
+      with a zero L2 destination.  An AF_PACKET sniff/peer (outer leg)
+      sees it regardless, but the INNER host (real kernel 10.2.0.2 on the
+      inner tap) drops a frame dstd to `00:00:00:00:00:00`, so the ICMP
+      reply can never return -- the real-peer round trip cannot pass even
+      after decrypt is fixed.  The DPDK backend MAC-learns the inner peer
+      (`dp_dpdk.c` nh_learn + our_inner_mac); P4's next_hop_set has no
+      such mechanism.  Fix requires programming the inner/outer peer MACs
+      into the env table actions (or learning), then drivers both legs.
   - **Per-slice replay-window drop on P4 is NOT yet verified.** The stock
     DPDK 24.11 extern hardcodes `replay_win_sz = 0` / `options.esn = 0`
     (anti-replay off), so a live seq-drop cannot be claimed on unpatched
