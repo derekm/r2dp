@@ -84,11 +84,17 @@ resides on the `p4-backend` branch and is not on `origin/main`.
 
 **Measured throughput** (`bench/p4_bench.sh`, i5-6500T 4-core,
 `crypto_openssl0`, 64B): ~132K pps through the shared net_tap — the tap I/O
-crossing is the wall.  DPDK's internal dataplane ceiling is ~2.4–3.0 Mpps
-(enc/dec, 64B, `fwd_bench`), so both engines are bounded by the tap, not the
-dataplane.  P4 runs one SWX pipeline instance on the box; a multicore P4
-layout (multiple pipeline instances straddling traffic by RSS/hash) is the
-path to scaling aggregate throughput.
+crossing is the wall, not the data plane.  DPDK's internal dataplane ceiling
+is ~2.4–3.0 Mpps (enc/dec, 64B, `fwd_bench`), so both engines are bounded by
+the tap at the lab I/O layer.  A tap-free P4 measurement
+(`R2DP_P4_BENCH=1`; the worker injects plaintext directly into the pipeline
+rings, no ethdev) shows the real SWX+crypto cost: **~1.00 Mpps / ~2484
+cyc/pkt** at 64B — about 8× the tap figure — versus DPDK's internal
+~2.99 Mpps / ~836 cyc/pkt (enc).  So on a common single instance, DPDK's
+data plane is roughly 3× P4's; the tap hides that for real I/O.  P4 runs one
+SWX pipeline instance on the box; a multicore P4 layout (multiple pipeline
+instances straddling traffic by RSS/hash) is the path to scaling aggregate
+throughput.
 
 **Known open points (current state):**
 - `sa_set_hard_bytes` / `sa_set_hard_time` are unset (NULL) on the P4 backend,
@@ -98,9 +104,9 @@ path to scaling aggregate throughput.
   masked dst)`, differing only by port, scope, or host-bits — are rejected
   (`-E2BIG`) because the table cannot name them separately.  Port-scoped SPD
   (e.g. UDP/500 vs UDP/4500 on one prefix) is therefore not expressible.
-- The lab runs on root `net_tap` (memif does not materialize on `.165`); the
-  P4 leg has no tap-free `fwd_bench`-style microbench harness yet, so its
-  true per-frame-size dataplane ceiling is unmeasured.
+- The lab runs on root `net_tap` (memif does not materialize on `.165`);
+  `bench/p4_bench.sh` drives both engines through that shared I/O path, and
+  `R2DP_P4_BENCH=1` measures the P4 data plane tap-free.
 - Not yet wired into CI (DPDK/kernel engines are; P4 is lab-proven only).
 
 ## Provenance / reconstruction
