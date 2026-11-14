@@ -617,15 +617,15 @@ armed:
 			min_c = (t1 - t0) / npkt;
 			tot_pkt = npkt;
 			best = (trial == 0 || min_c < best) ? min_c : best;
-			P4_LOG("bench[%d]: pkt=%llu cyc/pkt=%llu pps=%llu",
-			       trial,
+			P4_LOG("bench[%d] slice %u: pkt=%llu cyc/pkt=%llu pps=%llu",
+			       trial, it->s,
 			       (unsigned long long)npkt,
 			       (unsigned long long)min_c,
 			       (unsigned long long)((uint64_t)rte_get_tsc_hz() *
 						    npkt / (t1 - t0)));
 			(void)tot_pkt;
 		}
-		P4_LOG("bench: best_cyc_pkt=%llu",
+		P4_LOG("bench[slice %u]: best_cyc_pkt=%llu", it->s,
 		       (unsigned long long)best);
 	}
 	return NULL;

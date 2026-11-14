@@ -232,10 +232,12 @@ def plot(data, out):
         ax.ticklabel_format(axis="x", style="plain")
         # tap wall (was the only place the shared net_tap numbers were on the
         # figure; keep them as a caption so the wall isn't lost from the chart)
-        ax.text(0.02, 0.98,
-                f"for reference (shared net_tap, .165, 64B): P4 {p4_tap*1e3:.0f}K "
-                f"pps, DPDK {dpdk_tap*1e3:.0f}K pps -- tap is the I/O wall",
-                transform=ax.transAxes, va="top", fontsize=7, color="#555555")
+        # Anchored bottom-right so it does not collide with the Mpps labels.
+        ax.text(0.98, 0.03,
+                f"net_tap ref (.165 64B): P4 {p4_tap*1e3:.0f}K / "
+                f"DPDK {dpdk_tap*1e3:.0f}K pps",
+                transform=ax.transAxes, va="bottom", ha="right",
+                fontsize=7, color="#555555")
 
     # (c1) size sweep done (if/else above).  Now (c2) the core sweep on the
     # lower half of the right-hand panel -- a separate if/else, NOT nested in
@@ -269,6 +271,10 @@ def plot(data, out):
     p4core = p4.get("core_sweep", {})
     if p4core:
         for box, pms in p4core.items():
+            # Alternate 5-tuple boxes so same-x annotations don't stack at
+            # the default (0,7) offset.
+            yoff = {"165": -10, "179": 10}.get(
+                box[:3], -10 if "165" in box else 10)
             for pmd, ws in pms.items():
                 xs = sorted(int(k) for k in ws)
                 ys = [ws[str(x)]["mpps"] for x in xs]
@@ -276,14 +282,14 @@ def plot(data, out):
                          label=f"P4 {box} {pmd}", color=color(box, pmd))
                 for xi, yi in zip(xs, ys):
                     ax2.annotate(f"{yi:.2f}", (xi, yi),
-                                 textcoords="offset points", xytext=(0, 7),
+                                 textcoords="offset points", xytext=(0, yoff),
                                  ha="center", fontsize=8, color=color(box, pmd))
         ax2.set_xlabel("p4 slices (R2DP_P4_WORKERS)")
         ax2.set_ylabel("aggregate Mpps (sum of slices)")
         ax2.set_title("P4 multicore, aggregate tap-free (core sweep)")
         ax2.grid(True, alpha=0.3)
-        ax2.legend()
         # resilient-per-core DPDK reference on .179 aesni for scale context
+        # (plot BEFORE legend so the reference appears in it)
         kase = next((s for s in dpdk if s.get("enc") and "179" in s["box"] and
                      s["pmd"] == "aesni_mb"), None)
         if kase:
@@ -291,6 +297,7 @@ def plot(data, out):
             ax2.plot(dx, [kase["enc"][str(x)] for x in dx], "--",
                      color="#888888", lw=1.2,
                      label="DPDK .179 aesni (resilient, for scale)")
+        ax2.legend()
     else:
         ax2.text(0.5, 0.5, "multicore sweep not collected; run the R2DP_P4_WORKERS bench",
                  transform=ax2.transAxes, ha="center", va="center", fontsize=9,
