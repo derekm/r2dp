@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <limits.h>
@@ -1165,11 +1166,22 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 	snprintf(code_c,  sizeof(code_c),  "%s/%s.c",  tmp, base);
 	snprintf(code_so, sizeof(code_so), "%s/%s.so", tmp, base);
 
-	/* Ensure the scratch dir exists (best-effort mkdir -p). */
+	/* Ensure the scratch dir exists (mkdir -p, without a shell).  A
+	 * failure here surfaces as the codegen step's own error below. */
 	{
 		char m[PATH_MAX];
-		snprintf(m, sizeof(m), "mkdir -p '%s'", tmp);
-		(void)system(m);
+		if (snprintf(m, sizeof(m), "%s", tmp) < (int)sizeof(m)) {
+			for (char *c = m + 1; *c; c++) {
+				if (*c != '/')
+					continue;
+				*c = '\0';
+				if (mkdir(m, 0700) && errno != EEXIST)
+					P4_LOG("mkdir %s: %s", m, strerror(errno));
+				*c = '/';
+			}
+			if (mkdir(m, 0700) && errno != EEXIST)
+				P4_LOG("mkdir %s: %s", m, strerror(errno));
+		}
 	}
 
 	/* DPDK source dir for the internal codegen headers (runtime override of
