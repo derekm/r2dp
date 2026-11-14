@@ -1707,7 +1707,13 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		}
 		memcpy(sp.crypto.aead.key, blob, blen);
 		sp.crypto.aead.key_size = (uint32_t)blen;   /* key || salt */
-		sp.encap.esp.spi = sa->spi;   /* network order SPI */
+		/* The extern's ipsec_xform.spi must be HOST-order (matches what the
+		 * DPDK backend programs: dp_gcm.c "spi = ntohl(rsa->spi)", and the
+		 * SAD lookup in dpdk_sad.c).  ctl hands sa->spi as network order
+		 * (htonl at parse), so decrypt needs ntohl to find the matching SA in
+		 * rte_ipsec_pkt_crypto_prepare; the raw network-order value made
+		 * every inbound packet SAD-hit but enq=0 and never decrypt. */
+		sp.encap.esp.spi = ntohl(sa->spi);
 		sp.encap.tunnel_mode = (sa->mode == R2DP_MODE_TUNNEL);
 		sp.encap.tunnel_ipv4 = 1;
 		if (sa->src.family == R2DP_AF_INET4)
