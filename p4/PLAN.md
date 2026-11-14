@@ -73,7 +73,7 @@ NOTE (post-implementation): `p4c`/p4c-dpdk **is** now built and working (see the
 |---|---|
 | `caps()` | Set `enc_caps`/`integ_caps` from the pipeline's advertised transforms (ipsec block caps; DPDK baseline ok initially). |
 | `sa_add(add, sa, blob, blen)` | Inbound (`FWD_DP_SA_INBOUND`): `rte_swx_ipsec_sa_add` (AEAD key‖salt) + `inbound_table_0` entry keyed `(dst,spi)` → `ipsec_enable(sa_id)`. Outbound/egress SA: `rte_swx_ipsec_sa_add` with encrypt, NO SAD entry (reached through the SPD's `ipsec_protect(sa_id)`). `add==0`: `rte_swx_ipsec_sa_delete` + (if inbound) `inbound_table_0` delete, direction from the stored `e->dir`. |
-| `sp_add(sp)` / `sp_del(sp)` | SPD table (`rte_swx_ctl_*` entry, exact `(src,dst,proto)`): action `ipsec_protect(crypto_sa_id)` / `spd_bypass` / `spd_discard`; `ipsec_protect` resolves the egress SA by tunnel endpoint + highest install gen (like `dpdk_spd.c` `sa_by_policy`), never the policy `slid`. **Accepts unbound OUT PROTECT** (keeps a policy mirror, writes a `spd_bypass` placeholder, rebinds on `SA_ADD`/`SA_DEL`/rekey). |
+| `sp_add(sp)` / `sp_del(sp)` | SPD table (`rte_swx_ctl_*` entry, exact `(src,dst,proto)`): action `ipsec_protect(crypto_sa_id)` / `spd_bypass` / `spd_discard`; `ipsec_protect` resolves the egress SA by tunnel endpoint + highest install gen (like `dpdk_spd.c` `sa_by_policy`), never the policy `slid`. **Accepts unbound OUT PROTECT and programs it to `spd_discard` (fail-closed), upgrades on `SA_ADD`/`SA_DEL`/rekey.** |
 | `sa_bytes(spi,dip)` | **Not implemented**: returns `-1` (no SWX per-SA byte-counter surfaced yet). |
 | `sa_set_hard_bytes/hard_time` | Hard-lifetime enforcement is intentionally **control-side (ctl.c)** and engine-agnostic; P4 backend returns 0 / tracks trivially or reuses the same ctl `check_lifetimes` logic. |
 | `start`/`stop` | Launch packet threads running `rte_swx_pipeline_run`; load `.spec`/`.code` at start; stop join. |
@@ -182,19 +182,22 @@ and the delegated `deleg_8f37ef0b` review):
   round-trip** (crypto + forward through the PNA tables) is the m1 gate and
   needs the two-forwarder + e2e_tgen bench assembly.  Plus the §8 limits above
   (IKE/ARP/NAT-T/SPD expressiveness).
-- **SPD binding contract (round-4 review):** the control plane may install an
+- **SPD binding contract (rounds 4+5):** the control plane may install an
   OUT PROTECT policy with no egress SA yet (spmd loads SPD at startup, then
   GETSPI/SA_ADD) — so `p4_sp_add` **accepts** and never refuses.  It keeps a
-  policy mirror (`pr->spd[]`) and writes an `spd_bypass` placeholder until an
-  outbound SA binds; `p4_sa_add` (outbound add/delete) and rekey call
-  `p4_spd_rebind` to (re)target `outbound_table_0`.  The egress SA is chosen by
-  tunnel endpoint and **highest install generation** (`p4_sa.gen`), not slot
-  index.  The SPD entry is replaced delete-then-add (table_entry_add rejects a
-  duplicate key).  Unbound PROTECT only drops table traffic via the default,
-  and the old `-ENOENT` refusal is removed.  Bind is proven by a
-  `tools/p4_bind_probe.c` that drives both orders (SA→SP direct-bind and SP→SA
-  rebind) and is observed as `OUT PROTECT bind sa_id=N` in the forwarder log —
-  not inferred from `r2dpctl dump`.
+  policy mirror (`pr->spd[]`) and programs an unbound OUT PROTECT to
+  **`spd_discard` (FAIL CLOSED)**, never bypass (DPDK drops a matched OUT
+  PROTECT with no SA, `DR_NO_SA_OUT`).  `p4_sa_add` (outbound add/delete) and
+  rekey call `p4_spd_rebind` to (re)target `outbound_table_0`.  The egress SA
+  is chosen by tunnel endpoint and **highest install generation**
+  (`p4_sa.gen`), not slot index.  `table_entry_add` rejects a duplicate key so
+  a re-bind/rekey is add-with-EEXIST-fallback-to-delete-then-add (never
+  delete-first: a delete+failed-add would commit the deletion to the default).
+  `p4_spd_rebind` propagates bind failure instead of swallowing it.  Bind and
+  fail-closed are proven by `tools/p4_bind_probe.c` (meson
+  `r2dp-p4-bind-probe`), which reads the forwarder log: SA-first → direct bind
+  with NO discard; SP-first → `OUT PROTECT unbound -> DISCARD` then a rebind to
+  `ipsec_protect` — not inferred from `r2dpctl dump`.
 - **Egress next-hop staged (round-5):** every classified/processed frame must
   exit through `routing_table_0` → `next_hop_table_0`, and `next_hop_table_0`'s
   const default was `drop` — so NO frame could leave the dataplane even after a
