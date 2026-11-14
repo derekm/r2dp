@@ -16,6 +16,28 @@ fake_wr(void *ctx, const char *name, uint32_t idx, uint64_t val)
 	return nwr++ == fail_at ? fake_rc : 0;
 }
 
+/* Ethernet + IPv4 frame: ihl words, proto, frag field, then a UDP
+ * header (sport, dport) after the options. */
+static size_t
+mkframe(uint8_t *f, unsigned ihl, uint8_t proto, uint16_t frag,
+    uint16_t sport, uint16_t dport)
+{
+	size_t hl = ihl * 4u;
+	memset(f, 0, 128);
+	f[12] = 0x08; f[13] = 0x00;
+	f[14] = (uint8_t)(0x40 | ihl);
+	f[14 + 6] = (uint8_t)(frag >> 8); f[14 + 7] = (uint8_t)frag;
+	f[14 + 9] = proto;
+	f[14 + 12] = 203; f[14 + 13] = 0; f[14 + 14] = 113; f[14 + 15] = 1;
+	f[14 + 16] = 192; f[14 + 17] = 0; f[14 + 18] = 2;  f[14 + 19] = 1;
+	for (size_t i = 20; i < hl; i++)
+		f[14 + i] = 0x01;            /* NOP options */
+	f[14 + hl] = (uint8_t)(sport >> 8); f[14 + hl + 1] = (uint8_t)sport;
+	f[14 + hl + 2] = (uint8_t)(dport >> 8); f[14 + hl + 3] = (uint8_t)dport;
+	f[14 + hl + 8] = 0x12; f[14 + hl + 9] = 0x34;   /* SPI-ish bytes */
+	return 14 + hl + 8 + 64;
+}
+
 int
 main(void)
 {
@@ -58,6 +80,44 @@ main(void)
 	    "newest wins among reqid matches");
 	CHECK(p4_sa_outranks(7, 0, 2, 9, 1),
 	    "no reqid match: newest endpoint match, as on main");
+	{
+		uint8_t f[128];
+		int same = 1, ihl_ok = 1, spread = 0;
+		for (uint32_t n = 2; n <= 8; n++) {
+			size_t l = mkframe(f, 5, 17, 0, 4500, 4500);
+			uint32_t whole = p4_flow_slice_of(f, l, n);
+			l = mkframe(f, 5, 17, 0x2000, 4500, 4500);      /* first frag */
+			same &= p4_flow_slice_of(f, l, n) == whole;
+			l = mkframe(f, 5, 17, 0x0010, 0, 0);            /* later frag */
+			same &= p4_flow_slice_of(f, l, n) == whole;
+			l = mkframe(f, 5, 17, 0x2010, 0, 0);            /* middle */
+			same &= p4_flow_slice_of(f, l, n) == whole;
+			l = mkframe(f, 5, 50, 0, 0, 0);                 /* ESP */
+			same &= p4_flow_slice_of(f, l, n) == whole;
+			l = mkframe(f, 7, 17, 0, 4500, 4500);           /* IHL 7 */
+			ihl_ok &= p4_flow_slice_of(f, l, n) == whole;
+		}
+		CHECK(same, "one NAT-T SA: whole, first, middle and last fragments "
+		    "and ESP share a slice (N=2..8)");
+		CHECK(ihl_ok, "NAT-T behind IPv4 options steers like IHL 5");
+		{
+			uint8_t bb[16];
+			size_t l = mkframe(f, 6, 6, 0, 1234, 80);
+			CHECK(p4_flow_key(f, l, bb) == 13 && bb[9] == 0x04 &&
+			    bb[10] == 0xd2 && bb[11] == 0 && bb[12] == 80,
+			    "5-tuple ports read after the real IHL");
+			l = mkframe(f, 3, 17, 0, 4500, 4500);         /* bad IHL */
+			CHECK(p4_flow_key(f, l, bb) == 9,
+			    "malformed IHL hashes as raw IP, never reads ports");
+			f[12] = 0x86; f[13] = 0xdd;
+			CHECK(p4_flow_key(f, l, bb) == 0, "non-IPv4 hashes the frame");
+		}
+		for (uint16_t sp = 1000; sp < 1064; sp++) {
+			size_t l = mkframe(f, 5, 17, 0, sp, 53);
+			spread |= 1u << p4_flow_slice_of(f, l, 4);
+		}
+		CHECK(spread == 0xf, "unfragmented UDP flows still spread over slices");
+	}
 	CHECK(p4_lft_supported(0, 0) == 0, "infinite byte lifetime accepted");
 	CHECK(p4_lft_supported(1 << 20, 0) == -EOPNOTSUPP &&
 	    p4_lft_supported(0, 1 << 20) == -EOPNOTSUPP,

@@ -10,7 +10,9 @@
 #define R2DP_P4_MAP_H
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /* r2dp window semantics (both backends): a window of w accepts a sequence
  * number at distance 0..w-1 below the highest accepted one and refuses
@@ -73,6 +75,70 @@ p4_sa_outranks(uint32_t sp_reqid, uint32_t reqid, uint64_t gen,
 	int bc = sp_reqid && best_reqid == sp_reqid;
 
 	return c != bc ? c > bc : gen > best_gen;
+}
+
+/* Slice steering for frames the RX distributor reads (dp_p4.c).
+ *
+ * Per-SA state (replay window, extern SA) is per slice, so every frame
+ * of one SA must reach one slice.  ESP (proto 50), ESP-in-UDP (UDP to
+ * 4500) and EVERY fragment of any protocol hash on the same
+ * fragment-invariant image, outer (src, dst): an unfragmented NAT-T
+ * frame, its first fragment (MF=1, which used to fall into a
+ * (src,proto,dst) branch) and its later fragments all agree
+ * (COMMITS C8).  Transport ports are read after the real IPv4 header
+ * length, not at a fixed +20 (P4 review P9, distributor part); a
+ * malformed IHL hashes as raw IP.  The P4 parser itself still assumes
+ * IHL 5 (see p4/r2dp.p4). */
+static inline uint32_t
+p4_xor(const uint8_t *p, size_t n)
+{
+	uint32_t h = 0x9e3779b9;
+	for (size_t i = 0; i < n; i++) {
+		h ^= p[i];
+		h *= 0x85ebca6b;
+		h ^= h >> 13;
+	}
+	return h;
+}
+
+/* Fill bb (>= 13 bytes) with the steering image; returns its length. */
+static inline size_t
+p4_flow_key(const uint8_t *d, size_t l, uint8_t *bb)
+{
+	const uint8_t *ip = d + 14;
+	size_t hl;
+	uint8_t proto;
+	uint16_t frag;
+
+	if (l < 14 + 20 || d[12] != 0x08 || d[13] != 0x00)
+		return 0;          /* not IPv4: caller hashes the frame */
+	proto = ip[9];
+	hl = (size_t)(ip[0] & 0x0f) * 4;
+	frag = (uint16_t)(((uint16_t)ip[6] << 8) | ip[7]);
+	if (proto == 50 || (frag & 0x3fff) ||
+	    (proto == 17 && hl >= 20 && l >= 14 + hl + 8 &&
+	     ip[hl + 2] == 0x11 && ip[hl + 3] == 0x94)) {
+		memcpy(bb, ip + 12, 4);      /* src */
+		memcpy(bb + 4, ip + 16, 4);  /* dst */
+		return 8;
+	}
+	memcpy(bb, ip + 12, 4);
+	bb[4] = proto;
+	memcpy(bb + 5, ip + 16, 4);
+	if (hl >= 20 && l >= 14 + hl + 4 && (proto == 6 || proto == 17)) {
+		memcpy(bb + 9, ip + hl, 4);  /* sport, dport */
+		return 13;
+	}
+	return 9;                    /* raw IP: (src, proto, dst) */
+}
+
+static inline uint32_t
+p4_flow_slice_of(const uint8_t *d, size_t l, uint32_t n_inst)
+{
+	uint8_t bb[16];
+	size_t n = p4_flow_key(d, l, bb);
+
+	return (n ? p4_xor(bb, n) : p4_xor(d, l)) % n_inst;
 }
 
 /* The extern keeps no per-SA byte counter (p4_sa_bytes reports none), so

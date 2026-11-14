@@ -354,100 +354,24 @@ static void *p4_worker(void *arg)
  *    scatter one SA's fragments across slices.  src+dst is fragment-invariant
  *    and keeps an entire SA (incl. all its fragments) on one slice, so the
  *    extern's per-SA state (CSP replay window, SA crypto) stays on one core.
- *  - Everything else: (proto, src, dst, sport, dport) 5-tuple.
+ *  - ESP-in-UDP (UDP to 4500) and every fragment of any protocol: the
+ *    same (src, dst) image, so a NAT-T SA's whole and fragmented frames
+ *    agree (C8).
+ *  - Everything else: (proto, src, dst, sport, dport) 5-tuple, ports read
+ *    after the real IHL.  Pure rule: p4_flow_key (p4_map.h).
  * Returns 0..n_inst-1; must be stable across relaunch (fixed seed = xor
  * fold, no randomness).  For n_inst<=1 returns slice 0 without hashing.
  */
-static uint32_t p4_xor(const uint8_t *p, size_t n)
-{
-	uint32_t h = 0x9e3779b9;
-	size_t i;
-	for (i = 0; i < n; i++) {
-		h ^= p[i];
-		h *= 0x85ebca6b;
-		h ^= h >> 13;
-	}
-	return h;
-}
-
 /* The one slice that encrypts: owner of every outbound SA's sequence. */
 #define P4_OUT_OWNER 0u
 
 static uint32_t p4_flow_slice(struct p4_priv *pr, const struct rte_mbuf *m)
 {
-	uint8_t bb[16];
-	size_t n = 0;
-	const uint8_t *d = rte_pktmbuf_mtod(m, const uint8_t *);
-	uint16_t l = rte_pktmbuf_pkt_len(m);
-
 	if (pr->n_inst <= 1)
 		return 0;   /* one slice: everything lands on it */
-
-	/* Ethernet (14B) + IPv4 (20B).  Requires ethertype 0x0800. */
-	if (l < 14 + 20)
-		return p4_xor(d, l) % pr->n_inst;
-	if (d[12] != 0x08 || d[13] != 0x00)
-		return p4_xor(d, l) % pr->n_inst;
-	{
-		const uint8_t *ip = d + 14;
-		uint8_t proto = ip[9];
-		/* IPv4 fragment flags/offset (bytes 6-8): offset (8-byte units) is
-		 * the low 13 bits; MF (more-fragments) is bit 14 of byte 6.
-		 * A NON-FIRST fragment carries NO transport header (no UDP dport,
-		 * no ESP header), so ports/SPI are unreadable there -- hash it on
-		 * the fragment-invariant (proto, src, dst) so every fragment of one
-		 * datagram stays on the same slice as the first. */
-		uint16_t frag = ((uint16_t)ip[6] << 8) | ip[7];
-		int mf =     (frag >> 13) & 1;   /* more-fragments */
-		uint16_t fo = frag & 0x1fff;     /* fragment offset (8-byte units) */
-		if (proto == 50) {
-			/* ESP: pin on the outer IP flow (src, dst) -- NOT
-			 * (dst + SPI).  Fragments arrive as separate outer
-			 * IP packets and only the FIRST carries the ESP
-			 * header/SPI; a non-first fragment has no SPI at
-			 * ip+20, so a (dst,SPI) hash would scatter one SA's
-			 * fragments across slices.  All fragments of one SA
-			 * must land on one slice (reassembly + per-SA replay
-			 * are per-slice and single-owner), so hash every ESP
-			 * frame on the fragment-invariant outer src+dst. */
-			memcpy(bb, ip + 12, 4);          /* src */
-			memcpy(bb + 4, ip + 16, 4);      /* dst */
-			n = 8;
-		} else if (proto == 17 && fo == 0 && !mf && l >= 14 + 20 + 8 &&
-			   ip[22] == 0x11 && ip[23] == 0x94) {
-			/* ESP-in-UDP (RFC 3948): proto 17, unfragmented FIRST
-			 * frame, UDP dst port 4500 (0x1194).  The parser
-			 * (nat_demux) treats this as ESP when the first 32
-			 * bits after UDP are a non-zero SPI, so it carries
-			 * per-SA state in the extern -- hash it like ESP on
-			 * (src,dst) so the same SA's ESP-in-UDP and its
-			 * fragments stay on one slice. */
-			memcpy(bb, ip + 12, 4);          /* src */
-			memcpy(bb + 4, ip + 16, 4);      /* dst */
-			n = 8;
-		} else if (fo != 0 || mf) {
-			/* Non-first fragment (any proto): no transport header.  Hash on
-			 * (proto, src, dst) so all fragments of one datagram -- incl. a
-			 * fragmented ESP-in-UDP flow, whose first fragment hashes
-			 * (src,dst) above -- land on the same slice as the first. */
-			bb[0]=ip[12]; bb[1]=ip[13]; bb[2]=ip[14]; bb[3]=ip[15];
-			bb[4]=proto;
-			memcpy(bb + 5, ip + 16, 4);
-			n = 9;
-		} else if (l >= 14 + 20 + 8) {  /* 5-tuple incl. TCP/UDP */
-			/* src(4) proto(1) dst(4) sport(2) dport(2) = 13B */
-			bb[0]=ip[12]; bb[1]=ip[13]; bb[2]=ip[14]; bb[3]=ip[15];
-			bb[4]=proto;
-			bb[5]=ip[16]; bb[6]=ip[17]; bb[7]=ip[18]; bb[8]=ip[19];
-			bb[9]=ip[20]; bb[10]=ip[21]; bb[11]=ip[22]; bb[12]=ip[23];
-			n = 13;
-		} else {
-			/* raw IP: (proto, src, dst) */
-			memcpy(bb, ip + 12, 4); bb[4]=proto;
-			memcpy(bb + 5, ip + 16, 4); n = 9;
-		}
-	}
-	return p4_xor(bb, n) % pr->n_inst;
+	/* Only the first segment is addressable through mtod. */
+	return p4_flow_slice_of(rte_pktmbuf_mtod(m, const uint8_t *),
+	    rte_pktmbuf_data_len(m), pr->n_inst);
 }
 
 /*
