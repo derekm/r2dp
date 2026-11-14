@@ -856,10 +856,14 @@ static int p4_start(struct fwd_dp *dp)
 		en.key_mask = rmask;
 		en.action_id = (uint64_t)rid;
 		en.action_data = rdata;
-		/* Fail-closed: without the inner route a decrypted frame that is not
-		 * already in 10/8 egresses clear on the outer wire (fail-open).  This
-		 * 10/8 entry is the lab's inner-leg post-decrypt route; its absence
-		 * must not silently start a loop that leaks plaintext outward. */
+		/* Fail-closed: routing_table's default miss is next_hop 0 -> outer
+		 * leg.  A decrypted frame whose inner dst is NOT covered by any LPM
+		 * entry already goes outer (that default decides the miss).  The
+		 * 10/8 -> next_hop 1 entry here is what keeps a decrypted frame
+		 * whose inner dst IS in 10/8 on the inner leg instead of leaking it
+		 * back out the outer wire in the clear.  Absent this entry a
+		 * 10/8-destined decrypted frame egresses outer (plaintext leak), so
+		 * a failed add must not silently start a loop — fail the start. */
 		if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
 			 "routing_table_0", &en)) {
 			P4_LOG("routing 10/8 add failed");
