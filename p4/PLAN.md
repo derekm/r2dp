@@ -198,6 +198,15 @@ and the delegated `deleg_8f37ef0b` review):
   `r2dp-p4-bind-probe`), which reads the forwarder log: SA-first → direct bind
   with NO discard; SP-first → `OUT PROTECT unbound -> DISCARD` then a rebind to
   `ipsec_protect` — not inferred from `r2dpctl dump`.
+  **Honest scope of the fail-closed claim:** it holds only for an **exact**
+  `(src,dst,proto)` table hit (see §8 limit 4 — SPD is exact only, no
+  prefix/ports/ANY).  A policy shaped `R2DP_PROTO_ANY`/`/24`, as spmd and the
+  bind probe install, does NOT collapse to one exact entry: the real packet
+  holds a concrete proto/address that misses the entry and falls to the
+  `spd_bypass` default.  DPDK honors ANY/prefix (`dpdk_spd.c:250,307`); this
+  backend does not yet.  So the unbound-PROTECT drop is exact-hit-only, not
+  `DR_NO_SA_OUT` parity until SPD expressiveness lands.  PLAN is explicit
+  about this rather than overclaiming.
 - **Framed forward proven (round-6):** a real IPv4/UDP frame injected on the
   inner tap (`r2pi`, outbound leg) is processed by the SWX pipeline and
   egresses the outer tap (`r2po`) — captured by tcpdump (`10.0.0.1.1024 >
