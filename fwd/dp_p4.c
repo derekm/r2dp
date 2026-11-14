@@ -86,7 +86,8 @@
 
 struct p4_sa {
 	uint32_t spi;        /* host order */
-	uint32_t dip;        /* host order (addr4_to_u32) */
+	uint32_t sip;        /* host order tunnel src */
+	uint32_t dip;        /* host order tunnel dst */
 	uint32_t sl_id;      /* sa_index == ipsec_hdr.sa_id the action writes */
 	int in_use;
 	uint8_t proto;
@@ -161,6 +162,35 @@ static struct p4_sa *p4_sad_lookup(struct p4_priv *pr, uint32_t dip,
 		    pr->sad[i].spi == spi && pr->sad[i].proto == proto)
 			return &pr->sad[i];
 	return NULL;
+}
+
+/* Find the egress (encrypt) SA for an OUT PROTECT policy, binding by tunnel
+ * endpoint like the DPDK backend's sa_by_policy (dpdk_spd.c): the policy's
+ * tun_src/tun_dst must equal an outbound SA's src/dst; among overlaps take the
+ * newest slot (there is no generation counter here, so last-installed). */
+static struct p4_sa *p4_spd_sa_lookup(struct p4_priv *pr,
+				      const struct r2dp_sp *sp)
+{
+	struct p4_sa *best = NULL;
+	uint32_t ts, td;
+	int i;
+
+	if (sp->tun_src.family != R2DP_AF_INET4 ||
+	    sp->tun_dst.family != R2DP_AF_INET4)
+		return NULL;
+	memcpy(&ts, sp->tun_src.addr, 4);
+	memcpy(&td, sp->tun_dst.addr, 4);
+	ts = ntohl(ts); td = ntohl(td);
+
+	for (i = 0; i < P4_SA_MAX; i++) {
+		struct p4_sa *x = &pr->sad[i];
+		if (!x->in_use || x->dir == R2DP_DIR_IN)
+			continue;
+		if (x->sip != ts || x->dip != td)
+			continue;
+		best = x;   /* last-installed wins (rekey overlap) */
+	}
+	return best;
 }
 
 /* ------------------------------------------------------------- ops */
@@ -488,7 +518,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	uint8_t key[16], data[4];
 	struct rte_swx_table_entry ent;
 	int rc, i, inbound, deleting;
-	uint32_t dip, spi;
+	uint32_t dip, spi, sa_sip = 0;
 
 	/* Direction comes from the vtable flag (dp.h): only SA_ADD with
 	 * FWD_DP_SA_INBOUND installs the inbound (decrypt) SAD entry; an
@@ -502,14 +532,23 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	memcpy(&dip, sa->dst.addr, 4);
 	dip = ntohl(dip);
 	spi = ntohl(sa->spi);
+	if (sa->src.family == R2DP_AF_INET4) {
+		memcpy(&sa_sip, sa->src.addr, 4);
+		sa_sip = ntohl(sa_sip);
+	} else {
+		sa_sip = 0;
+	}
 
 	e = p4_sad_lookup(pr, dip, spi, sa->proto);
 	if (deleting) {
+		int isin;
 		if (!e)
 			return -ENOENT;
-		if (pr->ipsec)
-			rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
-		if (inbound) {
+		/* Direction of a delete is NOT carried by the vtable flags (ctl
+		 * passes add=0 with no FWD_DP_SA_INBOUND on R2DP_SA_DEL); use
+		 * the direction we stored at install to pick the SAD table. */
+		isin = (e->dir == R2DP_DIR_IN);
+		if (isin) {
 			/* remove the (dip,spi) -> ipsec_enable SAD entry */
 			memset(&ent, 0, sizeof(ent));
 			memset(key, 0, sizeof(key));
@@ -522,9 +561,16 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			ent.key = key;
 			rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl,
 					"inbound_table_0", &ent);
-			if (rc)
+			if (rc) {
+				/* keep the slot live: the dataplane still owns
+				 * the (dip,spi)->SA binding (ctl drops its entry
+				 * only on success, dp.h/ctl.c contract). */
 				P4_LOG("inbound entry del %d", rc);
+				return rc;
+			}
 		}
+		if (pr->ipsec)
+			rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
 		e->in_use = 0;
 		return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
 	}
@@ -535,11 +581,16 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		if (!e)
 			return -ENOSPC;
 		e->dip = dip;
+		e->sip = sa_sip;
 		e->spi = spi;
 		e->proto = sa->proto;
 		e->dir = inbound ? R2DP_DIR_IN : R2DP_DIR_OUT;
 		e->sl_id = (uint32_t)i;      /* stable per-install id */
 		e->in_use = 1;
+		if (sa->src.family == R2DP_AF_INET4) {
+			memcpy(&e->sip, sa->src.addr, 4);
+			e->sip = ntohl(e->sip);
+		}
 	}
 
 	/* Crypto SA in the ipsec extern (spi -> cipher/AEAD params + key).
@@ -597,7 +648,13 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "inbound_table_0",
 						  &ent);
 	if (rc) {
+		/* Roll back the crypto SA and the local slot: a second install
+		 * would otherwise allocate a fresh sa_id and leak this one. */
 		P4_LOG("inbound entry add %d", rc);
+		if (pr->ipsec)
+			rte_swx_ipsec_sa_delete(pr->ipsec, e->sl_id);
+		e->in_use = 0;
+		e->sl_id = 0;
 		return rc;
 	}
 	return rte_swx_ctl_pipeline_commit(pr->ctl, 0);
@@ -636,7 +693,18 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 2); /* spd_discard */
 		break;
 	case R2DP_ACT_PROTECT: {
-		uint32_t id_be = htonl(sp->slid);
+		/* The SPD action must write the CRYPTO SA id (from
+		 * rte_swx_ipsec_sa_add), not the policy slid.  Resolve the
+		 * egress SA by tunnel endpoint, like sa_by_policy.  If no
+		 * outbound SA is installed yet, refuse the entry rather than
+		 * emit an ipsec_protect bound to a bogus sa_id. */
+		struct p4_sa *ea = p4_spd_sa_lookup(pr, sp);
+		uint32_t id_be;
+		if (!ea) {
+			P4_LOG("OUT PROTECT: no egress SA for tunnel");
+			return -ENOENT;
+		}
+		id_be = htonl(ea->sl_id);
 		memcpy(data, &id_be, 4);
 		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 0); /* ipsec_protect */
 		ent.action_data = data;
