@@ -109,13 +109,17 @@ nlb_attr(struct nlb *n, uint16_t type, const void *d, size_t l)
 /* Send one request; wait for its ACK/ERROR (0 or the kernel's -errno).  If
  * `reply` is set, the first non-error message for this seq is copied there
  * (GET requests answer with data, then no ACK). */
+/* Netlink receive storage.  A GETSA reply can carry the SA's keys and an
+ * uncapped error ACK echoes the key-bearing request, so it is wiped after
+ * every exchange (KEYS KY1). */
+static uint8_t rbuf[16384];
+
 static int
-nl_xfer(struct kx *k, struct nlb *n, char *why, size_t whylen,
+nl_xfer_raw(struct kx *k, struct nlb *n, char *why, size_t whylen,
     void *reply, size_t rlen)
 {
 	struct nlmsghdr *h = (struct nlmsghdr *)n->b;
 	struct sockaddr_nl kern = { .nl_family = AF_NETLINK };
-	static uint8_t rbuf[16384];
 	ssize_t r;
 
 	if (k->fd < 0)
@@ -169,6 +173,16 @@ nl_xfer(struct kx *k, struct nlb *n, char *why, size_t whylen,
 			return e->error;
 		}
 	}
+}
+
+static int
+nl_xfer(struct kx *k, struct nlb *n, char *why, size_t whylen,
+    void *reply, size_t rlen)
+{
+	int r = nl_xfer_raw(k, n, why, whylen, reply, rlen);
+
+	explicit_bzero(rbuf, sizeof(rbuf));
+	return r;
 }
 
 /* ------------------------------------------------------ r2dp -> xfrm maps */
@@ -245,14 +259,15 @@ lft_inf(struct xfrm_lifetime_cfg *l)
 }
 
 /* ---------------------------------------------------------------- states */
+#define KX_AB_LEN (sizeof(struct xfrm_algo_aead) + 2 * R2DP_MAX_KEY)
+
 static int
-build_sa(struct nlb *n, uint16_t type, const struct r2dp_sa *sa,
-    const uint8_t *enc, const uint8_t *auth, int inbound)
+build_sa_ab(struct nlb *n, uint16_t type, const struct r2dp_sa *sa,
+    const uint8_t *enc, const uint8_t *auth, int inbound, uint8_t *ab)
 {
 	struct xfrm_usersa_info x;
 	const struct enc_map *em = NULL;
 	const struct integ_map *im = NULL;
-	uint8_t ab[sizeof(struct xfrm_algo_aead) + 2 * R2DP_MAX_KEY];
 	int fam = fam_of(&sa->src), esn = (sa->saflags & R2DP_SAF_ESN) != 0, r;
 
 	if (!fam || fam != fam_of(&sa->dst))
@@ -348,6 +363,25 @@ build_sa(struct nlb *n, uint16_t type, const struct r2dp_sa *sa,
 	return 0;
 }
 
+/* Build an SA message; the algorithm scratch holding key bytes is wiped
+ * on every path.  The caller wipes n (kx_wipe) once it is sent. */
+static int
+build_sa(struct nlb *n, uint16_t type, const struct r2dp_sa *sa,
+    const uint8_t *enc, const uint8_t *auth, int inbound)
+{
+	uint8_t ab[KX_AB_LEN];
+	int r = build_sa_ab(n, type, sa, enc, auth, inbound, ab);
+
+	explicit_bzero(ab, sizeof(ab));
+	return r;
+}
+
+static void
+kx_wipe(struct nlb *n)
+{
+	explicit_bzero(n, sizeof(*n));
+}
+
 static struct kx_sa *
 kx_sa_find(struct kx *k, const struct r2dp_sa *sa)
 {
@@ -405,6 +439,7 @@ kx_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	    key + sa->enckeylen, (add & FWD_DP_SA_INBOUND) != 0);
 	if (!r)
 		r = nl_xfer(k, &n, why, sizeof(why), NULL, 0);
+	kx_wipe(&n);
 	if (k->verbose)
 		fprintf(stderr, "r2dp-fwd[xfrm]: %s spi=0x%08x dir=%s -> %s%s%s\n",
 		    e ? "UPDSA" : "NEWSA", ntohl(sa->spi),
@@ -448,12 +483,17 @@ kx_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 	id.proto = IPPROTO_ESP;
 	nlb_init(&n, XFRM_MSG_GETSA, 0, &id, sizeof(id));
 	((struct nlmsghdr *)n.b)->nlmsg_flags &= ~NLM_F_ACK;
-	if (nl_xfer(k, &n, NULL, 0, rep, sizeof(rep)) != 0 ||
-	    h->nlmsg_type != XFRM_MSG_NEWSA ||
-	    h->nlmsg_len < NLMSG_LENGTH(sizeof(*x)))
-		return -1;
-	x = NLMSG_DATA(h);
-	return (int64_t)x->curlft.bytes;
+	int64_t bytes = -1;
+
+	if (nl_xfer(k, &n, NULL, 0, rep, sizeof(rep)) == 0 &&
+	    h->nlmsg_type == XFRM_MSG_NEWSA &&
+	    h->nlmsg_len >= NLMSG_LENGTH(sizeof(*x))) {
+		x = NLMSG_DATA(h);
+		bytes = (int64_t)x->curlft.bytes;
+	}
+	/* the reply also carries the SA's algorithm attributes (keys) */
+	explicit_bzero(rep, sizeof(rep));
+	return bytes;
 }
 
 /* -------------------------------------------------------------- policies */
@@ -758,6 +798,8 @@ fwd_dp_xfrm_probe(struct fwd_dp *dp, int verbose, int cleanup)
 		return e;
 	}
 	setsockopt(k->fd, SOL_NETLINK, NETLINK_EXT_ACK, &one, sizeof(one));
+	/* error ACKs need not echo the (key-bearing) request back */
+	setsockopt(k->fd, SOL_NETLINK, NETLINK_CAP_ACK, &one, sizeof(one));
 	setsockopt(k->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	n = kx_probe(k);
 	if (n == 0) {

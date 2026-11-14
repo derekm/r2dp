@@ -59,7 +59,11 @@ main(void)
 	memset(rbuf, 0xc5, sizeof(rbuf));
 	memset(&k, 0, sizeof(k));
 	k.fd = -1;
-	nlb_init(&n, XFRM_MSG_GETSA, 0, NULL, 0);
+	{
+		struct xfrm_usersa_id id;
+		memset(&id, 0, sizeof(id));
+		nlb_init(&n, XFRM_MSG_GETSA, 0, &id, sizeof(id));
+	}
 	CHECK(nl_xfer(&k, &n, NULL, 0, NULL, 0) == -EBADF &&
 	    all_zero(rbuf, sizeof(rbuf)), "receive buffer wiped on failure");
 	{

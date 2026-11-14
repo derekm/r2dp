@@ -153,6 +153,12 @@ test('ctl_unit',
     link_with: libr2dp),
   is_parallel: false)
 
+# xfrm_scrub: kernel backend netlink buffers drop key bytes (KEYS KY1).
+test('xfrm_scrub',
+  executable('xfrm_scrub', 'xfrm_scrub.c', '../fwd/dp_sel.c',
+    include_directories: [include_directories('../include'),
+                          include_directories('../fwd')]))
+
 # sel_test: selector matching incl. ports (fwd/dp_sel.c, no DPDK needed).
 test('sel_test',
   executable('sel_test', 'sel_test.c', '../fwd/dp_sel.c',
