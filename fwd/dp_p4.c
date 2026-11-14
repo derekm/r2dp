@@ -240,6 +240,19 @@ static void *p4_worker(void *arg)
 				       (unsigned long long)cst.enqueue_err_count);
 			memset(&ts1, 0, sizeof(ts1));
 			ts1.n_pkts_action = act1;
+			{
+				struct rte_swx_table_stats ibs;
+				static uint64_t iba[16];
+				memset(&ibs, 0, sizeof(ibs));
+				ibs.n_pkts_action = iba;
+				if (rte_swx_ctl_pipeline_table_stats_read(pr->p,
+					 "inbound_table_0", &ibs) == 0)
+					P4_LOG("ib: hit=%llu miss=%llu a0=%llu a1=%llu",
+					       (unsigned long long)ibs.n_pkts_hit,
+					       (unsigned long long)ibs.n_pkts_miss,
+					       (unsigned long long)iba[0],
+					       (unsigned long long)iba[1]);
+			}
 			if (rte_swx_ctl_pipeline_table_stats_read(pr->p,
 				 "outbound_table_0", &ts1) == 0)
 				P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
@@ -775,10 +788,40 @@ static int p4_start(struct fwd_dp *dp)
 			ab[14] = 0x01; ab[15] = 0x00; ab[16] = 0x00; ab[17] = 0x00;
 			en.key = k1;
 			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
-				 "next_hop_table_0", &en))
+				"next_hop_table_0", &en))
 				P4_LOG("next_hop id1 add failed");
 			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 1);
 			P4_LOG("next_hop table populated (id0->outer, id1->inner)");
+		}
+	}
+
+	/* Clear-forward hops for non-IP / control-plane (ARP): preserve the frame
+	 * unchanged (next_hop_preserve) to inner (id 2) or outer (id 3) leg. */
+	{
+		struct rte_swx_table_entry en;
+		int rid = p4_table_action_id(pr->p, 3, 1);  /* next_hop_preserve */
+		uint8_t k2[4] = { 2, 0, 0, 0 }, k3[4] = { 3, 0, 0, 0 };
+		uint8_t ab[4];
+		if (rid < 0) {
+			P4_LOG("next_hop_preserve action id lookup failed");
+		} else {
+			memset(&en, 0, sizeof(en));
+			memset(ab, 0, sizeof(ab));
+			en.action_id = (uint64_t)rid;
+			en.action_data = ab;
+			/* port_id at offset 0, HOST order (LE 1 = {1,0,0,0}). */
+			ab[0] = 0x01;   /* inner leg (port 1) */
+			en.key = k2;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+				"next_hop_table_0", &en))
+				P4_LOG("next_hop id2 (preserve->inner) add failed");
+			ab[0] = 0x00;   /* outer leg (port 0) */
+			en.key = k3;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+				"next_hop_table_0", &en))
+				P4_LOG("next_hop id3 (preserve->outer) add failed");
+			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 1);
+			P4_LOG("next_hop preserve hops populated (id2->inner, id3->outer)");
 		}
 	}
 
