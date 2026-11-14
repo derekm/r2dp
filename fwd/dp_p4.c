@@ -1,9 +1,10 @@
 /* fwd/dp_p4.c — P4/SWX data plane backend.
  *
  * Implements the fwd_dp_ops vtable (fwd/dp.h) against DPDK's software-switch
- * pipeline (librte_swx_pipeline), loading the p4c-compiled PNA program
- * (p4/r2dp.out, a SWX .spec) and driving its SAD/SPD tables through
- * rte_swx_ctl_* and the ipsec extern through rte_swx_ipsec_*.
+ * pipeline (librte_swx_pipeline, bundled in librte_pipeline in DPDK 24.11),
+ * loading the p4c-compiled PNA program (p4/r2dp.out, a SWX .spec) and driving
+ * its SAD/SPD tables through rte_swx_ctl_* and the ipsec extern through
+ * rte_swx_ipsec_*.
  *
  * Everything except the packet engine is the SAME as the DPDK backend:
  * fwd/ctl.c, include/r2dp/proto.h, libr2dp and tests are reused untouched.
@@ -23,8 +24,9 @@
  *         -> ipsec_protect(sa_index) | spd_bypass | spd_discard | drop (SPD)
  *   - routing_table_0  key (ipv4.dst_addr) lpm  -> next_hop_id_set
  *   - next_hop_table_0 key (local_metadata.next_hop_id) -> next_hop_set
- * Action args carry the SA id the extern post-processes (see RTE ipsec
- * extern; the action's sa_index lands in the packet's ipsec_hdr.sa_id).
+ *
+ * Entry key/action-data are SIZED from the table's rte_swx_ctl_table_info +
+ * match-field info (the entry struct itself carries no key_size).
  */
 #define _GNU_SOURCE
 
@@ -42,7 +44,7 @@
 #include <rte_swx_ipsec.h>
 
 #include "dp.h"
-#include "ctl.h"
+#include <r2dp/proto.h>   /* r2dp_sa / r2dp_sp layouts */
 
 /* Compiled PNA program + where the codegen .so lands. */
 #ifndef R2DP_P4_SPEC
@@ -57,18 +59,31 @@
 #define R2DP_RTE_LIB "/usr/lib64"
 #endif
 
+#define P4_LOG(fmt, ...) \
+	fprintf(stderr, "r2dp-fwd: p4: " fmt "\n", ##__VA_ARGS__)
+
+#define P4_SA_MAX 1024
+
 struct p4_sa {
-	uint32_t spi;
-	uint32_t dip;
-	uint32_t sa_index;      /* == ipsec_hdr.sa_id the action writes */
+	uint32_t spi;        /* host order */
+	uint32_t dip;        /* host order (addr4_to_u32) */
+	uint32_t sl_id;      /* sa_index == ipsec_hdr.sa_id the action writes */
 	int in_use;
+	uint8_t proto;
+	uint8_t dir;
 };
 
 struct p4_priv {
 	struct rte_swx_pipeline *p;
 	struct rte_swx_ctl_pipeline *ctl;
 	struct rte_swx_ipsec *ipsec;
-	struct p4_sa sad[1024];
+	struct p4_sa sad[P4_SA_MAX];
+	char *spec_path;
+
+	/* Cached table key layout from table_info (bytes, big-endian order). */
+	uint32_t inbound_key_size;
+	uint32_t outbound_key_size;
+
 	int started;
 	int wake_fd;
 };
@@ -84,17 +99,40 @@ static void p4_caps(struct fwd_dp *dp)
 /* ------------------------------------------------------------- SA store */
 
 static struct p4_sa *p4_sad_lookup(struct p4_priv *pr, uint32_t dip,
-				   uint32_t spi)
+				   uint32_t spi, uint8_t proto)
 {
 	int i;
-	for (i = 0; i < 1024; i++)
+	for (i = 0; i < P4_SA_MAX; i++)
 		if (pr->sad[i].in_use && pr->sad[i].dip == dip &&
-		    pr->sad[i].spi == spi)
+		    pr->sad[i].spi == spi && pr->sad[i].proto == proto)
 			return &pr->sad[i];
 	return NULL;
 }
 
 /* ------------------------------------------------------------- ops */
+
+/* Sum a table's match-field bit widths -> key size in bytes. */
+static int p4_table_key_size(struct rte_swx_pipeline *p, uint32_t table_id,
+			     uint32_t *nbytes)
+{
+	struct rte_swx_ctl_table_info ti;
+	uint32_t bits = 0, i;
+	int rc;
+
+	memset(&ti, 0, sizeof(ti));
+	rc = rte_swx_ctl_table_info_get(p, table_id, &ti);
+	if (rc)
+		return rc;
+	for (i = 0; i < ti.n_match_fields; i++) {
+		struct rte_swx_ctl_table_match_field_info mf;
+		rc = rte_swx_ctl_table_match_field_info_get(p, table_id, i, &mf);
+		if (rc)
+			return rc;
+		bits += mf.n_bits;
+	}
+	*nbytes = (bits + 7) / 8;
+	return 0;
+}
 
 /* USC/DSC flow: .spec -> codegen C -> compile to .so -> build_from_lib. */
 static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
@@ -119,7 +157,7 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 	fclose(spec);
 	fclose(code);
 	if (rc) {
-		CERROR("p4: codegen %s@%u: %s", spec_path, err_line,
+		P4_LOG("codegen %s@%u: %s", spec_path, err_line,
 		       err ? err : "?");
 		return -EINVAL;
 	}
@@ -127,20 +165,18 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 	/* Compile the codegen C to a shared object (the .so step). */
 	snprintf(cmd, sizeof(cmd),
 		"gcc -shared -fPIC -O2 -o '%s' '%s' -I'%s' -L'%s' "
-		"-lrte_swx_pipeline -lrte_swx_table -lrte_swx_ipsec "
-		"-lrte_pipeline -lrte_eal -lrte_mbuf -lrte_mempool "
-		"-lrte_ring 2>%s.err",
+		"-lrte_pipeline -lrte_ipsec -lrte_eal -lrte_mbuf "
+		"-lrte_mempool -lrte_ring 2>%s.err",
 		code_so, code_c, R2DP_RTE_INCLUDE, R2DP_RTE_LIB, spec_path);
 	rc = system(cmd);
 	if (rc) {
-		CERROR("p4: compile .so failed rc=%d (see %s.err)", rc,
-		       spec_path);
+		P4_LOG("compile .so failed rc=%d (see %s.err)", rc, spec_path);
 		return -EIO;
 	}
 
 	rc = rte_swx_pipeline_build_from_lib(&pr->p, "r2dp", code_so, NULL, 0);
 	if (rc) {
-		CERROR("p4: build_from_lib %d", rc);
+		P4_LOG("build_from_lib %d", rc);
 		return -EIO;
 	}
 	return 0;
@@ -149,7 +185,7 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 static int p4_start(struct fwd_dp *dp)
 {
 	struct p4_priv *pr = dp->priv;
-	const char *spec = dp->spec_path ? dp->spec_path : R2DP_P4_SPEC;
+	const char *spec = pr->spec_path ? pr->spec_path : R2DP_P4_SPEC;
 	int rc;
 
 	if (pr->started)
@@ -159,9 +195,22 @@ static int p4_start(struct fwd_dp *dp)
 	if (rc)
 		return rc;
 
-	rc = rte_swx_ctl_pipeline_create(pr->p);
+	pr->ctl = rte_swx_ctl_pipeline_create(pr->p);
+	if (!pr->ctl) {
+		P4_LOG("ctl pipeline create failed");
+		return -EIO;
+	}
+
+	/* Cache table key sizes (0 = inbound SAD, 1 = outbound SPD; order
+	 * matches the spec -- see header notes). */
+	rc = p4_table_key_size(pr->p, 0, &pr->inbound_key_size);
 	if (rc) {
-		CERROR("p4: ctl pipeline create %d", rc);
+		P4_LOG("inbound table info %d", rc);
+		return -EIO;
+	}
+	rc = p4_table_key_size(pr->p, 1, &pr->outbound_key_size);
+	if (rc) {
+		P4_LOG("outbound table info %d", rc);
 		return -EIO;
 	}
 
@@ -172,10 +221,10 @@ static int p4_start(struct fwd_dp *dp)
 					.ring_in_name    = "IP_IN",
 					.ring_out_name   = "IP_OUT",
 					.crypto_dev_name = NULL,
-					.n_sa_max        = 1024,
+					.n_sa_max        = P4_SA_MAX,
 				  }, 0);
 	if (rc) {
-		CERROR("p4: ipsec_create %d", rc);
+		P4_LOG("ipsec_create %d", rc);
 		return -EIO;
 	}
 
@@ -188,57 +237,86 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 {
 	struct p4_priv *pr = dp->priv;
 	struct p4_sa *e;
+	uint8_t key[16], data[4];
+	struct rte_swx_table_entry ent;
 	int rc, i;
+	uint32_t dip, spi;
+
+	/* Host-order key from the wire (matches dpdk_sad.c conventions). */
+	if (sa->dst.family != R2DP_AF_INET4)
+		return -EAFNOSUPPORT;
+	memcpy(&dip, sa->dst.addr, 4);
+	dip = ntohl(dip);
+	spi = ntohl(sa->spi);
 
 	if (!add) {                       /* delete */
-		e = p4_sad_lookup(pr, sa->dip, sa->spi);
+		e = p4_sad_lookup(pr, dip, spi, sa->proto);
 		if (e)
 			e->in_use = 0;
 		return 0;
 	}
 
-	e = p4_sad_lookup(pr, sa->dip, sa->spi);
+	e = p4_sad_lookup(pr, dip, spi, sa->proto);
 	if (!e) {
-		for (i = 0; i < 1024; i++)
+		for (i = 0; i < P4_SA_MAX; i++)
 			if (!pr->sad[i].in_use) { e = &pr->sad[i]; break; }
 		if (!e)
 			return -ENOSPC;
-		e->dip = sa->dip;
-		e->spi = sa->spi;
-		e->sa_index = (uint32_t)i;   /* stable per-install id */
+		e->dip = dip;
+		e->spi = spi;
+		e->proto = sa->proto;
+		e->dir = sa->dir;
+		e->sl_id = (uint32_t)i;      /* stable per-install id */
 		e->in_use = 1;
 	}
 
 	/* Crypto SA in the ipsec extern (spi -> cipher/AEAD params + key). */
 	if (blob && blen) {
-		rc = rte_swx_ipsec_sa_add(pr->ipsec, e->sa_index,
-					  &(struct rte_swx_ipsec_sa_params){
-						/* cipher/auth from blob */
-					  });
+		uint32_t sa_id = 0;
+		struct rte_swx_ipsec_sa_params sp = {0};
+		sp.encrypt = (e->dir == R2DP_DIR_OUT);
+		sp.crypto.is_aead = 0;   /* cipher+auth split; AEAD later */
+		sp.crypto.cipher_auth.cipher.alg =
+		    RTE_CRYPTO_CIPHER_AES_CBC;
+		if (blen > RTE_SWX_IPSEC_KEY_SIZE_MAX)
+			return -E2BIG;
+		memcpy(sp.crypto.cipher_auth.cipher.key, blob, blen);
+		sp.crypto.cipher_auth.cipher.key_size = (uint32_t)blen;
+		sp.crypto.cipher_auth.auth.alg = RTE_CRYPTO_AUTH_SHA1_HMAC;
+		sp.encap.esp.spi = sa->spi;   /* network order SPI */
+		sp.encap.tunnel_mode = (sa->mode == R2DP_MODE_TUNNEL);
+		sp.encap.tunnel_ipv4 = 1;
+		memcpy(&sp.encap.tunnel.ipv4.dst_addr,
+		       sa->dst.addr, sizeof(struct in_addr));
+		rc = rte_swx_ipsec_sa_add(pr->ipsec, &sp, &sa_id);
 		if (rc) {
-			CERROR("p4: ipsec sa_add %d", rc);
+			P4_LOG("ipsec sa_add %d", rc);
 			return rc;
 		}
+		e->sl_id = sa_id;   /* the id the action must write */
 	}
 
 	/* inbound_table_0 entry: (ipv4.dst_addr, esp.spi)
-	 * -> ipsec_enable(e->sa_index).  Keys are network-order bytes. */
+	 * -> ipsec_enable(sl_id).  Keys are big-endian wire bytes. */
+	memset(&ent, 0, sizeof(ent));
+	memset(key, 0, sizeof(key));
 	{
-		uint8_t key[8], data[4];
-		struct rte_swx_table_entry ent = {0};
-		memcpy(&key[0], &(uint32_t){htonl(sa->dip)}, 4);
-		memcpy(&key[4], &(uint32_t){htonl(sa->spi)}, 4);
-		memcpy(data, &(uint32_t){htonl(e->sa_index)}, 4);
-		ent.key = key;   ent.key_size = 8;
-		ent.action_id = 0;   /* resolved post-build via table info */
-		ent.action_data = data;   ent.action_data_size = 4;
-		rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
-							 "inbound_table_0",
-							 &ent);
-		if (rc) {
-			CERROR("p4: inbound entry add %d", rc);
-			return rc;
-		}
+		uint32_t dip_be = htonl(dip);
+		uint32_t spi_be = htonl(spi);
+		uint32_t id_be  = htonl(e->sl_id);
+		/* match-field order from the spec: dst_addr then spi */
+		memcpy(&key[0], &dip_be, 4);
+		memcpy(&key[4], &spi_be, 4);
+		memcpy(data, &id_be, 4);
+	}
+	ent.key = key;
+	ent.action_id = 0;      /* ipsec_enable; resolved via action info */
+	ent.action_data = data;
+	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "inbound_table_0",
+						  &ent);
+	if (rc) {
+		P4_LOG("inbound entry add %d", rc);
+		return rc;
 	}
 	return 0;
 }
@@ -246,41 +324,63 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 {
 	struct p4_priv *pr = dp->priv;
-	uint8_t key[9], data[4];
-	struct rte_swx_table_entry ent = {0};
+	uint8_t key[16], data[4];
+	struct rte_swx_table_entry ent;
 	int rc;
+	uint32_t ssrc, sdst;
 
-	/* outbound_table_0 keyed (src, dst, proto); exact selector from the
-	 * r2dp SP -> ipsec_protect(idx) / spd_bypass / spd_discard.  Full
-	 * selector (port/range) support is the deferred SPD classifier. */
-	memcpy(&key[0], &(uint32_t){htonl(sp->src)}, 4);
-	memcpy(&key[4], &(uint32_t){htonl(sp->dst)}, 4);
-	key[8] = sp->proto;
-	ent.key = key;   ent.key_size = 9;
-	if (sp->discard) {
-		ent.action_id = 0;             /* spd_discard */
-	} else if (sp->protect) {
-		memcpy(data, &(uint32_t){htonl(sp->spd_index)}, 4);
-		ent.action_id = 0;             /* ipsec_protect(idx) */
-		ent.action_data = data;   ent.action_data_size = 4;
-	} else {
-		ent.action_id = 0;             /* spd_bypass */
+	/* IPv4 selectors only; ports are deferred (exact ipv4 selector). */
+	if (sp->sel_src.family != R2DP_AF_INET4 ||
+	    sp->sel_dst.family != R2DP_AF_INET4)
+		return -EAFNOSUPPORT;
+	memcpy(&ssrc, sp->sel_src.addr, 4);
+	memcpy(&sdst, sp->sel_dst.addr, 4);
+	ssrc = ntohl(ssrc);
+	sdst = ntohl(sdst);
+
+	/* outbound_table_0 keyed (src, dst, proto) in match-field order. */
+	memset(&ent, 0, sizeof(ent));
+	memset(key, 0, sizeof(key));
+	{
+		uint32_t src_be = htonl(ssrc);
+		uint32_t dst_be = htonl(sdst);
+		memcpy(&key[0], &src_be, 4);
+		memcpy(&key[4], &dst_be, 4);
+		key[8] = sp->ul_proto;
+	}
+	ent.key = key;
+	switch (sp->action) {
+	case R2DP_ACT_DISCARD:
+		ent.action_id = 0;   /* spd_discard */
+		break;
+	case R2DP_ACT_PROTECT: {
+		uint32_t id_be = htonl(sp->slid);
+		memcpy(data, &id_be, 4);
+		ent.action_id = 0;   /* ipsec_protect(slid) */
+		ent.action_data = data;
+		break;
+	}
+	default:
+		ent.action_id = 0;   /* spd_bypass */
+		break;
 	}
 	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "outbound_table_0",
 						  &ent);
 	if (rc)
-		CERROR("p4: outbound entry add %d", rc);
+		P4_LOG("outbound entry add %d", rc);
 	return rc;
 }
 
 static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 {
 	/* rte_swx_ctl_pipeline_table_entry_delete(ctl, "outbound_table_0", e). */
+	(void)dp; (void)sp;
 	return 0;
 }
 
 static int64_t p4_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 {
+	(void)spi; (void)dip;
 	return -1;    /* SWX per-SA byte counters exposed when available */
 }
 
@@ -290,14 +390,20 @@ static void p4_stop(struct fwd_dp *dp)
 	if (!pr->started)
 		return;
 	pr->started = 0;
-	if (pr->ctl)   rte_swx_ctl_pipeline_free(pr->ctl);
-	if (pr->ipsec) rte_swx_ipsec_free(pr->ipsec);
-	if (pr->p)     rte_swx_pipeline_free(pr->p);
-	pr->ctl = pr->ipsec = pr->p = NULL;
+	if (pr->ctl)
+		rte_swx_ctl_pipeline_free(pr->ctl);
+	if (pr->ipsec)
+		rte_swx_ipsec_free(pr->ipsec);
+	if (pr->p)
+		rte_swx_pipeline_free(pr->p);
+	pr->ctl = NULL;
+	pr->ipsec = NULL;
+	pr->p = NULL;
 }
 
 static void p4_idle(struct fwd_dp *dp)
 {
+	(void)dp;
 }
 
 static struct fwd_dp_ops p4_ops;
@@ -309,11 +415,12 @@ int fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
 {
 	struct p4_priv *pr;
 
+	(void)argc; (void)argv;
 	pr = calloc(1, sizeof(*pr));
 	if (!pr)
 		return -ENOMEM;
 	dp->priv = pr;
-	dp->spec_path = spec_path ? strdup(spec_path) : NULL;
+	pr->spec_path = spec_path ? strdup(spec_path) : NULL;
 	dp->wake_fd = -1;
 
 	p4_ops.caps    = p4_caps;
