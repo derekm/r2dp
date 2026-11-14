@@ -84,28 +84,35 @@ resides on the `p4-backend` branch and is not on `origin/main`.
 
 **Measured throughput** (`bench/p4_bench.sh`, i5-6500T 4-core,
 `crypto_openssl0`, 64B): ~132K pps through the shared net_tap — the tap I/O
-crossing is the wall, not the data plane.  DPDK's internal dataplane ceiling
-is ~2.4–3.0 Mpps (enc/dec, 64B, `fwd_bench`, single worker on `.165`), so
-both engines are bounded by the tap at the lab I/O layer.  A tap-free P4 measurement
+crossing is the wall, not the data plane.  A tap-free P4 measurement
 (`R2DP_P4_BENCH=1`; the worker injects plaintext directly into the pipeline
 rings, no ethdev) shows the real SWX+crypto cost: **~1.00 Mpps / ~2484
-cyc/pkt** at 64B — about 8× the tap figure — versus DPDK's internal
-~2.99 Mpps / ~836 cyc/pkt (enc).  So on a common single instance, DPDK's
-data plane is roughly 3× P4's; the tap hides that for real I/O.  P4 runs one
-SWX pipeline instance on the box; a multicore P4 layout (multiple pipeline
+cyc/pkt** at 64B on `.165` — about 8× the tap figure.  P4 runs one SWX
+pipeline instance on the box; a multicore P4 layout (multiple pipeline
 instances straddling traffic by RSS/hash) is the path to scaling aggregate
 throughput.
 
-DPDK scales past single instance: on the 12-core i7-8700 (`fwd_bench
---workers N`), openssl reaches ~16 Mpps and aesni ~27 Mpps encrypt at 64B
-over 11 workers (`nw+1` lcores), given a cryptodev created with
-`max_nb_queue_pairs=<nw>` (both PMDs default to 8 queue pairs, which would
-silently cap the run at 8 workers) and `dp_max_wk` raised past the old
-DP_MAX_WK=8 ceiling.  `bench/curves.py` regenerates `bench/curves.png` from
-real `fwd_bench --json` runs: `plot` renders the committed
-`curves_data.json`; `collect --from-json` (or `--bin`) folds fresh runs into
-it, with DPDK tap-free plotted alongside P4 tap-free and the net_tap wall in
-the bottom-right panel.
+DPDK tap-free numbers below come from `bench/fwd_bench --json` runs captured
+in `bench/curves_data.json` (regenerate with `bench/curves.py plot`); both
+crypto PMDs default to **8 queue pairs**, so a cryptodev used for more than
+8 workers must be created with `max_nb_queue_pairs=<n>` and the code ceiling
+raised with `dp_max_wk` (= `-DDP_MAX_WK=`).
+
+| box / PMD | enc W=1 | enc W=11 | per-worker cyc W=1 → W=11 |
+|---|---|---|---|
+| .165 openssl | 2.94 Mpps | (4-core: 3 workers) | 850 → 994 |
+| .179 openssl | 4.34 Mpps | 15.93 Mpps | 736 → 2239 |
+| .179 aesni_mb | 8.04 Mpps | 28.47 Mpps | 397 → 1243 |
+
+Aggregate throughput scales roughly linearly to 11 workers (`nw+1` lcores);
+per-worker `enc cyc/pkt` rises with contention, so the efficiency panel in
+`curves.png` plots the bench's own column, not an aggregate reciprocal.
+`r2dp-fwd` (unlike `fwd_bench`) refuses to start a dataplane that cannot
+serve `-n`: if the cryptodev has fewer queue pairs than requested it prints
+the fix and drops to control-only only for `-ENODEV`/no-DPDK-build — an
+over-request is a config error, not a silent clamp.  Note that even after
+SA_ADD/SP_ADD succeed, a control-only or under-provisioned forwarder will
+accept policy but not move ESP, so `-n` must match the device.
 
 **Known open points (current state):**
 - `sa_set_hard_bytes` / `sa_set_hard_time` are unset (NULL) on the P4 backend,
