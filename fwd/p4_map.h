@@ -60,6 +60,21 @@ p4_sp_supported(uint16_t sport, uint16_t dport)
 	return (sport || dport) ? -EOPNOTSUPP : 0;
 }
 
+/* Egress SA choice for an OUT PROTECT policy among endpoint matches, the
+ * same rule as main's sa_by_policy (dpdk_spd.c): an SA whose nonzero
+ * reqid equals the policy's outranks every other endpoint match, and the
+ * newest install (highest gen) wins within a class.  racoon2 sends reqid 0,
+ * so the common case stays endpoint + newest (P4 review P4). */
+static inline int
+p4_sa_outranks(uint32_t sp_reqid, uint32_t reqid, uint64_t gen,
+    uint32_t best_reqid, uint64_t best_gen)
+{
+	int c = sp_reqid && reqid == sp_reqid;
+	int bc = sp_reqid && best_reqid == sp_reqid;
+
+	return c != bc ? c > bc : gen > best_gen;
+}
+
 /* The extern keeps no per-SA byte counter (p4_sa_bytes reports none), so
  * ctl's soft/hard byte expiry never fires for this backend.  A finite
  * byte lifetime is refused rather than acknowledged as an infinite SA

@@ -122,6 +122,7 @@ struct p4_sa {
 					  * own SA id, so a logical SA maps to
 					  * one id per slice */
 	uint64_t gen;        /* install generation (higher = newer) */
+	uint32_t reqid;      /* binds an OUT policy with the same nonzero reqid */
 	int in_use;
 	uint8_t proto;
 	uint8_t dir;
@@ -949,7 +950,8 @@ static void pref2mask_bytes(uint8_t pref, uint8_t *out)
 /* Find the egress (encrypt) SA for an OUT PROTECT policy, binding by tunnel
  * endpoint like the DPDK backend's sa_by_policy (dpdk_spd.c): the policy's
  * tun_src/tun_dst must equal an outbound SA's src/dst; among overlaps take the
- * NEWEST INSTALL (highest gen), never the last slot index. */
+ * NEWEST INSTALL (highest gen), never the last slot index -- after an SA
+ * whose nonzero reqid matches the policy's (p4_sa_outranks). */
 static struct p4_sa *p4_spd_sa_lookup(struct p4_priv *pr,
 				      const struct r2dp_sp *sp)
 {
@@ -970,7 +972,8 @@ static struct p4_sa *p4_spd_sa_lookup(struct p4_priv *pr,
 			continue;
 		if (x->sip != ts || x->dip != td)
 			continue;
-		if (!best || x->gen > best->gen)
+		if (!best || p4_sa_outranks(sp->reqid, x->reqid, x->gen,
+		    best->reqid, best->gen))
 			best = x;
 	}
 	return best;
@@ -1903,6 +1906,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		for (unsigned s = 0; s < pr->n_inst; s++)
 			e->sl_id[s] = (uint32_t)i;  /* stable per-install slot id */
 		e->gen = ++pr->gen;
+		e->reqid = sa->reqid;
 		e->in_use = 1;
 		new_slot = 1;
 	} else if (blob && blen) {

@@ -50,6 +50,14 @@ main(void)
 	CHECK(p4_sp_supported(0, 500) == -EOPNOTSUPP &&
 	    p4_sp_supported(4500, 0) == -EOPNOTSUPP,
 	    "port-qualified selector refused, never widened to all ports");
+	CHECK(p4_sa_outranks(0, 0, 2, 0, 1) && !p4_sa_outranks(0, 0, 1, 0, 2),
+	    "reqid 0: newest endpoint match wins (rekey overlap)");
+	CHECK(p4_sa_outranks(7, 7, 1, 9, 2) && !p4_sa_outranks(7, 9, 2, 7, 1),
+	    "matching nonzero reqid outranks a newer SA with another reqid");
+	CHECK(p4_sa_outranks(7, 7, 3, 7, 2) && !p4_sa_outranks(7, 7, 2, 7, 3),
+	    "newest wins among reqid matches");
+	CHECK(p4_sa_outranks(7, 0, 2, 9, 1),
+	    "no reqid match: newest endpoint match, as on main");
 	CHECK(p4_lft_supported(0, 0) == 0, "infinite byte lifetime accepted");
 	CHECK(p4_lft_supported(1 << 20, 0) == -EOPNOTSUPP &&
 	    p4_lft_supported(0, 1 << 20) == -EOPNOTSUPP,
