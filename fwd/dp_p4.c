@@ -147,6 +147,16 @@ struct p4_inst {
 
 	/* RX/egress packet counters (set by the I/O thread, read by SIGUSR1 dump). */
 	unsigned long c_outer, c_inner, c_out0, c_out1;
+
+	/* Resolved pipeline table IDs (by name at bring-up).  p4c-dpdk emits the
+	 * tables in its own order (not source order), so hard-coded IDs are
+	 * wrong the moment a table is added or the source is reordered.  Resolve
+	 * each by name once per slice; every control-plane op uses these. */
+	uint32_t tid_inbt;   /* inbound_table_0   (SAD)            */
+	uint32_t tid_outbt;  /* outbound_table_0  (outbound SPD)   */
+	uint32_t tid_routing;/* routing_table_0   (LPM)            */
+	uint32_t tid_nhop;   /* next_hop_table_0  (egress)         */
+	uint32_t tid_inspd;  /* inbound_spd_table_0 (RFC 4301 drop) */
 };
 
 struct p4_priv {
@@ -983,6 +993,35 @@ static int p4_table_key_size(struct rte_swx_pipeline *p, uint32_t table_id,
 	return 0;
 }
 
+/* Resolve a pipeline table ID from its NAME.  p4c-dpdk emits the compiled
+ * tables in its own order (which is NOT source order and can change when a
+ * table is added or the program is reordered), so the control plane must not
+ * assume any fixed table ID.  Enumerate via rte_swx_ctl_pipeline_info_get /
+ * rte_swx_ctl_table_info_get and match by name.  Returns >=0 (id) or -ENOENT.
+ * Called once per slice at bring-up; every table op then uses the resolved id
+ * so an added/shifted table cannot silently re-target a different table. */
+static int p4_table_id_by_name(struct rte_swx_pipeline *p, const char *name)
+{
+	struct rte_swx_ctl_pipeline_info pi;
+	struct rte_swx_ctl_table_info ti;
+	uint32_t i;
+	int rc;
+
+	memset(&pi, 0, sizeof(pi));
+	rc = rte_swx_ctl_pipeline_info_get(p, &pi);
+	if (rc)
+		return -EIO;
+	for (i = 0; i < pi.n_tables; i++) {
+		memset(&ti, 0, sizeof(ti));
+		rc = rte_swx_ctl_table_info_get(p, i, &ti);
+		if (rc)
+			continue;
+		if (strcmp(ti.name, name) == 0)
+			return (int)i;
+	}
+	return -ENOENT;
+}
+
 /* Find + configure a lookaside cryptodev (the operator adds `--vdev
  * crypto_openssl0` or crypto_aesni_mb0 on the command line, like the DPDK
  * backend).  The ipsec extern's crypto_dev_name must resolve to a valid
@@ -1267,19 +1306,31 @@ static int p4_start(struct fwd_dp *dp)
 	if (rc)
 		return rc;
 
-	/* Cache table key sizes (0 = inbound SAD, 1 = outbound SPD; order
-	 * matches the spec -- see header notes).  Identical for every slice
-	 * (they share one compiled program), so cache once from slice 0. */
-	rc = p4_table_key_size(pr->inst[0].p, 0, &pr->inbound_key_size);
-	if (rc) {
-		P4_LOG("inbound table info %d", rc);
-		return -EIO;
+	/* Cache table key sizes (inbound SAD, outbound SPD).  Identical for
+	 * every slice (they share one compiled program), so cache once from
+	 * slice 0.  Resolve the IDs by name (not hard-coded) so the cache is
+	 * correct regardless of p4c-dpdk's table emission order. */
+	{
+		int t0 = p4_table_id_by_name(pr->inst[0].p, "inbound_table_0");
+		int t1 = p4_table_id_by_name(pr->inst[0].p, "outbound_table_0");
+		if (t0 < 0 || t1 < 0) {
+			P4_LOG("key-size table id resolve inbt=%d outbt=%d", t0, t1);
+			return -EIO;
+		}
+		rc = p4_table_key_size(pr->inst[0].p, (uint32_t)t0,
+				       &pr->inbound_key_size);
+		if (rc) {
+			P4_LOG("inbound table info %d", rc);
+			return -EIO;
+		}
+		rc = p4_table_key_size(pr->inst[0].p, (uint32_t)t1,
+				       &pr->outbound_key_size);
+		if (rc) {
+			P4_LOG("outbound table info %d", rc);
+			return -EIO;
+		}
 	}
-	rc = p4_table_key_size(pr->inst[0].p, 1, &pr->outbound_key_size);
-	if (rc) {
-		P4_LOG("outbound table info %d", rc);
-		return -EIO;
-	}
+
 	P4_LOG("table keys: inbound=%u outbound=%u", pr->inbound_key_size,
 	       pr->outbound_key_size);
 
@@ -1306,6 +1357,26 @@ static int p4_start(struct fwd_dp *dp)
 		pr->inst[s].ctl = rte_swx_ctl_pipeline_create(pr->inst[s].p);
 		if (!pr->inst[s].ctl) {
 			P4_LOG("slice %u ctl pipeline create failed", s);
+			return -EIO;
+		}
+
+		/* Resolve the table IDs by name so control-plane ops target the
+		 * right tables regardless of p4c-dpdk's emission order.  A resolved
+		 * table absent from this program version fails here (fail-fast)
+		 * rather than silently programming a shifted sibling table. */
+		pr->inst[s].tid_inbt    = p4_table_id_by_name(pr->inst[s].p, "inbound_table_0");
+		pr->inst[s].tid_outbt   = p4_table_id_by_name(pr->inst[s].p, "outbound_table_0");
+		pr->inst[s].tid_routing = p4_table_id_by_name(pr->inst[s].p, "routing_table_0");
+		pr->inst[s].tid_nhop    = p4_table_id_by_name(pr->inst[s].p, "next_hop_table_0");
+		pr->inst[s].tid_inspd   = p4_table_id_by_name(pr->inst[s].p, "inbound_spd_table_0");
+		if (pr->inst[s].tid_inbt < 0 || pr->inst[s].tid_outbt < 0 ||
+		    pr->inst[s].tid_routing < 0 || pr->inst[s].tid_nhop < 0 ||
+		    pr->inst[s].tid_inspd < 0) {
+			P4_LOG("slice %u table id resolve: inbt=%d outbt=%d "
+			       "routing=%d nhop=%d inspd=%d",
+			       s, pr->inst[s].tid_inbt, pr->inst[s].tid_outbt,
+			       pr->inst[s].tid_routing, pr->inst[s].tid_nhop,
+			       pr->inst[s].tid_inspd);
 			return -EIO;
 		}
 
@@ -1369,7 +1440,7 @@ static int p4_start(struct fwd_dp *dp)
 		/* next_hop id0 -> outer leg (port 0), id1 -> inner (port 1). */
 		{
 			struct rte_swx_table_entry en;
-			int rid = p4_table_action_id(pr->inst[s].p, 3, 0);
+			int rid = p4_table_action_id(pr->inst[s].p, pr->inst[s].tid_nhop, 0);
 			uint8_t k0[4] = { 0, 0, 0, 0 }, k1[4] = { 1, 0, 0, 0 };
 			uint8_t ab[18];
 			if (rid < 0) {
@@ -1398,7 +1469,7 @@ static int p4_start(struct fwd_dp *dp)
 		/* Clear-forward hops: id2 -> inner, id3 -> outer (preserve). */
 		{
 			struct rte_swx_table_entry en;
-			int rid = p4_table_action_id(pr->inst[s].p, 3, 1);
+			int rid = p4_table_action_id(pr->inst[s].p, pr->inst[s].tid_nhop, 1);
 			uint8_t k2[4] = { 2, 0, 0, 0 }, k3[4] = { 3, 0, 0, 0 };
 			uint8_t ab[4];
 			if (rid < 0) {
@@ -1434,7 +1505,7 @@ static int p4_start(struct fwd_dp *dp)
 		 * the outer wire for decrypted 10/8 frames. */
 		{
 			struct rte_swx_table_entry en;
-			int rid = p4_table_action_id(pr->inst[s].p, 2, 0);
+			int rid = p4_table_action_id(pr->inst[s].p, pr->inst[s].tid_routing, 0);
 			uint8_t rkey[4] = { 0x0a, 0, 0, 0 };
 			uint8_t rmask[4] = { 0xff, 0, 0, 0 };
 			uint8_t rdata[4] = { 1, 0, 0, 0 };
@@ -1521,7 +1592,7 @@ static int p4_start(struct fwd_dp *dp)
 			mac_is_zero &= pr->our_inner_mac[i] == 0;
 		for (int s = 0; s < pr->n_inst && !mac_is_zero; s++) {
 			struct rte_swx_table_entry en;
-			int rid = p4_table_action_id(pr->inst[s].p, 3, 0);
+			int rid = p4_table_action_id(pr->inst[s].p, pr->inst[s].tid_nhop, 0);
 			uint8_t k1[4] = { 1, 0, 0, 0 };
 			uint8_t ab[18];
 			if (rid < 0)
@@ -1785,6 +1856,18 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		sp.encap.esp.spi = ntohl(sa->spi);
 		sp.encap.tunnel_mode = (sa->mode == R2DP_MODE_TUNNEL);
 		sp.encap.tunnel_ipv4 = 1;
+		/* Anti-replay window (RFC 4303 s3.4.3): carry the ctl SA's
+		 * wsize/replay_win to the extern so rte_ipsec enforces a sliding
+		 * window in esp_inb_pkt_process (a replay or too-old seq is
+		 * dropped -> no reply).  0 disables anti-replay (PF_KEY
+		 * sadb_sa_replay); the DPDK backend matches via replay_accept.
+		 * rte_ipsec's window is INCLUSIVE at its top (esn_inb_check_sqn
+		 * rejects only when sqn + win_sz < rsn->sqn, i.e. it holds
+		 * win_sz+1 slots), whereas the r2dp/DPDK convention is strict
+		 * (a 64-window holds dist 0..63, rejects dist >= 64).  Pass
+		 * window-1 so rte_ipsec's inclusive top equals r2dp's strict
+		 * window and both backends agree on the farthest-accepted slot. */
+		sp.replay_win_sz = r2dp_sa_window(sa) ? r2dp_sa_window(sa) - 1 : 0;
 		/* RFC 3948 ESP-in-UDP (NAT-T): carry the ctl SA's natt params to
 		 * the extern.  udp_encap is set for BOTH directions so the
 		 * extern/xform build the NAT-T headers.  How udp_encap is
@@ -1909,7 +1992,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		memcpy(&key[4], &spi, 4);           /* host BE spi (ntohl'd)   */
 		memcpy(data, &id_be, 4);
 		ent.key = key;
-		ent.action_id = (uint64_t)p4_table_action_id(pr->inst[s].p, 0, 0);
+		ent.action_id = (uint64_t)p4_table_action_id(pr->inst[s].p, pr->inst[s].tid_inbt, 0);
 		ent.action_data = data;
 		rc = rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
 						  "inbound_table_0", &ent);
@@ -2133,7 +2216,7 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 		switch (sp->action) {
 		case R2DP_ACT_DISCARD:
 			ent.action_id = (uint64_t)p4_table_action_id(
-				pr->inst[s].p, 1, 2);
+				pr->inst[s].p, pr->inst[s].tid_outbt, 2);
 			break;
 		case R2DP_ACT_PROTECT:
 			ea = p4_spd_sa_lookup(pr, sp);
@@ -2141,16 +2224,18 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 				uint32_t id_be = htonl(ea->sl_id[s]);
 				memcpy(data, &id_be, 4);
 				ent.action_id = (uint64_t)
-					p4_table_action_id(pr->inst[s].p, 1, 0);
+					p4_table_action_id(pr->inst[s].p,
+							pr->inst[s].tid_outbt, 0);
 				ent.action_data = data;
 			} else {
 				ent.action_id = (uint64_t)
-					p4_table_action_id(pr->inst[s].p, 1, 2);
+					p4_table_action_id(pr->inst[s].p,
+							pr->inst[s].tid_outbt, 2);
 			}
 			break;
 		default:                       /* BYPASS */
 			ent.action_id = (uint64_t)p4_table_action_id(
-				pr->inst[s].p, 1, 1);
+				pr->inst[s].p, pr->inst[s].tid_outbt, 1);
 			break;
 		}
 
@@ -2194,6 +2279,76 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 		P4_LOG("slice %u OUT BIND installed sel=%08x/%08x proto=%u "
 		       "action=%u",
 		       s, ssrc, sdst, sp->ul_proto, (unsigned)ent.action_id);
+	}
+	return 0;
+}
+
+/* Write one IN policy to inbound_spd_table_0 (RFC 4301 fail-closed).
+ * inbound_spd_table_0 is the same WILDCARD (ternary) ACL keyed on the same
+ * (proto, masked src, masked dst) image as outbound_table_0, but it is
+ * applied on the inbound CLEAR (non-ESP) path: a clear IPv4 frame whose
+ * selector matches an inbound PROTECT/DISCARD policy is DROPPED
+ * (ipsec_require) rather than forwarded into the protected inner net.
+ * BYPASS policies (and the wildcard default) clear-forward, so IKE / ARP /
+ * NAT-T keepalive / non-protected traffic is unaffected.
+ *
+ * Table ID is resolved by name at bring-up (p4_table_id_by_name) because
+ * p4c-dpdk emits tables in its own (non-source) order -- a hard-coded index
+ * would silently re-target a sibling after the program is reordered.  The
+ * action indices come from the compiled spec: { ipsec_require;
+ * spd_bypass_1; drop_4; } -> 0 = ipsec_require (drop), 1 = spd_bypass.
+ * Same all-or-nothing multi-slice + abort discipline as p4_spd_bind. */
+static int p4_inspd_bind(struct p4_priv *pr, struct p4_pol *p)
+{
+	struct r2dp_sp *sp = &p->sp;
+	uint8_t key[16], mask[16];
+	struct rte_swx_table_entry ent;
+	uint32_t ssrc, sdst;
+	uint32_t aidx;
+	int rc;
+
+	if (sp->sel_src.family != R2DP_AF_INET4 ||
+	    sp->sel_dst.family != R2DP_AF_INET4)
+		return -EAFNOSUPPORT;
+	memcpy(&ssrc, sp->sel_src.addr, 4);
+	memcpy(&sdst, sp->sel_dst.addr, 4);
+	ssrc = ntohl(ssrc); sdst = ntohl(sdst);
+
+	/* Fail-closed mapping: PROTECT and DISCARD both drop the clear frame;
+	 * only BYPASS keeps it flowing. */
+	aidx = (sp->action == R2DP_ACT_BYPASS) ? 1u : 0u;
+
+	memset(&ent, 0, sizeof(ent));
+	p4_spd_key_image(sp, key, mask);
+	ent.key = key;
+	ent.key_mask = mask;
+	ent.key_priority = p4_spd_prio(sp);
+
+	for (unsigned s = 0; s < pr->n_inst; s++) {
+		ent.action_id = (uint64_t)p4_table_action_id(
+			pr->inst[s].p, pr->inst[s].tid_inspd, aidx);
+		rc = rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
+					       "inbound_spd_table_0", &ent);
+		if (rc == -EEXIST) {
+			(void)rte_swx_ctl_pipeline_table_entry_delete(
+				pr->inst[s].ctl, "inbound_spd_table_0", &ent);
+			rc = rte_swx_ctl_pipeline_table_entry_add(
+				pr->inst[s].ctl, "inbound_spd_table_0", &ent);
+			if (rc)
+				rte_swx_ctl_pipeline_abort(pr->inst[s].ctl);
+		}
+		if (rc) {
+			for (unsigned u = 0; u < pr->n_inst; u++)
+				if (pr->inst[u].ctl)
+					rte_swx_ctl_pipeline_abort(
+						pr->inst[u].ctl);
+			P4_LOG("slice %u inbound_spd entry add %d", s, rc);
+			return rc;
+		}
+		P4_LOG("slice %u IN BIND sel=%08x/%08x proto=%u action=%u "
+		       "aidx=%u",
+		       s, ssrc, sdst, sp->ul_proto,
+		       (unsigned)ent.action_id, aidx);
 	}
 	return 0;
 }
@@ -2272,6 +2427,10 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 	ent.key_mask = mask;
 	ent.key_priority = p4_spd_prio(&p->sp);
 	{
+		/* Delete from the table the policy's own direction was bound
+		 * to: OUT -> outbound_table_0, IN -> inbound_spd_table_0. */
+		const char *tname = (p->sp.dir == R2DP_DIR_OUT) ?
+			"outbound_table_0" : "inbound_spd_table_0";
 		unsigned s;
 		/* Phase 1: schedule the delete on EVERY slice with no commit.
 		 * All-or-nothing across slices: if scheduling fails on slice k,
@@ -2281,13 +2440,13 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 		 * published until every slice has accepted the schedule. */
 		for (s = 0; s < pr->n_inst; s++) {
 			rc = rte_swx_ctl_pipeline_table_entry_delete(pr->inst[s].ctl,
-				     "outbound_table_0", &ent);
+				     tname, &ent);
 			if (rc) {
 				for (unsigned u = 0; u < pr->n_inst; u++)
 					if (pr->inst[u].ctl)
 						rte_swx_ctl_pipeline_abort(pr->inst[u].ctl);
-				P4_LOG("slice %u outbound entry del %d; aborted all",
-				       s, rc);
+				P4_LOG("slice %u %s entry del %d; aborted all",
+				       s, tname, rc);
 				return rc;
 			}
 		}
@@ -2325,10 +2484,12 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	int rc, i;
 
 	/* A control plane that does not ask for a slid assigns one before
-	 * reaching us (ctl).  Respect the direction: only OUT policies drive
-	 * the outbound SPD table here. */
-	if (sp->dir != R2DP_DIR_OUT)
-		return 0;    /* IN policies are handled by the SAD path */
+	 * reaching us (ctl).  Both directions are enforced here: OUT policies
+	 * drive outbound_table_0 (encrypt/bypass), IN policies drive
+	 * inbound_spd_table_0 (RFC 4301 fail-closed: a clear frame matching
+	 * an inbound PROTECT/DISCARD policy is dropped, not forwarded). */
+	if (sp->dir != R2DP_DIR_OUT && sp->dir != R2DP_DIR_IN)
+		return 0;
 
 	p = p4_pol_find(pr, sp);
 	if (!p) {
@@ -2344,7 +2505,7 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 		 * path -- ctl rolls its own copy back on our error. */
 		for (i = 0; i < P4_SP_MAX; i++) {
 			struct p4_pol *q = &pr->spd[i];
-			if (!q->in_use || q->sp.dir != R2DP_DIR_OUT)
+			if (!q->in_use || q->sp.dir != sp->dir)
 				continue;
 			if (p4_pol_row_conflicts(&q->sp, sp))
 				return -E2BIG;  /* ACL cannot name both selectors */
@@ -2378,7 +2539,10 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	 * selector the ACL cannot name (-E2BIG); -ENOSPC covers a full mirror
 	 * and bind can return -EAFNOSUPPORT/commit errors.  Otherwise accept,
 	 * including an unbound PROTECT (fail-closed). */
-	rc = p4_spd_bind(pr, p);
+	if (sp->dir == R2DP_DIR_OUT)
+		rc = p4_spd_bind(pr, p);      /* outbound SPD: encrypt/bypass */
+	else
+		rc = p4_inspd_bind(pr, p);    /* inbound SPD: fail-closed drop */
 	if (rc) {
 		if (was_live) {
 			p->sp = saved_sp;

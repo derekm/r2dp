@@ -50,6 +50,25 @@ by the Limit 4 implementation in `p4/r2dp.p4` + `fwd/dp_p4.c` (`a8aedd2`).
   framing (UDP 4500->4500, SPI right after), keepalive, IKE and
   post-IKE health all pass; the DPDK backend passes the whole harness as a
   control.
+- `0005-rte_ipsec-replay-window.patch` — DPDK `lib/ipsec/ipsec_sqn.h` +
+  `lib/pipeline/rte_swx_ipsec.{h,c}`: real RFC 4303 anti-replay.  Two
+  source bugs had left anti-replay silently off / broken:
+  (1) `esn_inb_update_sqn` held the per-packet bit mask in a `uint32_t`
+  and assigned `(uint64_t)1 << (sqn & 63)`, so for any bucket-local bit
+  position >= 32 the mask truncated to 0 and the seen-bit was never
+  written -- a replay or far-old sequence at a high sequence number was
+  accepted (the replay window is `uint64_t rsn->window[]`, and the check
+  path already uses `((uint64_t)1 << bit)`).  (2) `rte_swx_ipsec_sa_params`
+  had no anti-replay field and `ipsec_xform_get` hardcoded
+  `replay_win_sz = 0` (anti-replay permanently off); added
+  `replay_win_sz` and plumb it into the xform so `fill_sa_replay` arms a
+  sliding window (0 stays off).  The r2dp ctl SA's `wsize`/`replay_win`
+  is carried as `replay_win_sz = r2dp_sa_window(sa) - 1` (rte_ipsec's
+  window is inclusive at its top while r2dp's is strict, so -1 makes the
+  dist-63-accepted / dist-64-rejected boundary agree with the DPDK
+  backend).  Verified on `.165` P4 backend, full harness: replay of an
+  accepted seq, far-old seq, and the dist-63/64 boundary all behave
+  identically to DPDK (37/37 PASS).  Applies on top of `0004`.
 
 ## Submission route (upstream)
 
