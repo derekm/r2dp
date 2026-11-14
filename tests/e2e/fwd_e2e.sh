@@ -134,8 +134,9 @@ if [ -z "${PHASES:-}" ] && [ "$BACKEND" = dpdk ]; then
 	# 15 positive + 4 accepted in the window phase + 1 post-garbage control
 	# = 20 round trips (20 ESP in + 20 ESP out, 40 tx).  ESP in beyond
 	# those: 1198 replayed + 1336 (distance 64) -> replay (authenticated,
-	# then refused by our window); 1019 (far too old) + truncated ESP ->
-	# ipsec_reject (rte_ipsec prepare); bit-flip + tampered seq ->
+	# then refused by our window); 1019 (far too old: rte_ipsec prepare
+	# rejects it, and our window refuses it too) -> replay; truncated ESP
+	# -> ipsec_reject (rte_ipsec prepare); bit-flip + tampered seq ->
 	# crypto_fail; unknown SPI -> no_sa_in; off-selector -> inner_sel.
 	# The cleartext ICMP is the one non-ESP frame (clear_outer).
 	# natt phase: 4 ESP-in-UDP round trips (+4 rx outer, +4 rx inner, +8
@@ -143,7 +144,7 @@ if [ -z "${PHASES:-}" ] && [ "$BACKEND" = dpdk ]; then
 	# keepalive (+1 rx, consumed, not a drop) and an IKE packet behind the
 	# non-ESP marker (+1 rx, ike, +1 tx to the kernel side).
 	eq rx 60; eq tx 49; eq esp 57; eq ike 1
-	eq replay 2; eq ipsec_reject 2; eq crypto_fail 2; eq no_sa_in 1
+	eq replay 3; eq ipsec_reject 1; eq crypto_fail 2; eq no_sa_in 1
 	eq inner_sel 1; eq clear_outer 1; eq encap 1; eq natt_keepalive 1
 	for z in malformed no_sa_out policy_discard crypto_enq crypto_stuck nomem no_nexthop esp_on_inner tx_full steer too_big spd_fail; do eq $z 0; done
 	eq drop 10
