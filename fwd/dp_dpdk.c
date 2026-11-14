@@ -335,11 +335,17 @@ outer_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port,
 		uint16_t to = (d->inner_port >= 0) ? d->inner_port : port;
 		uint16_t nf = 0;
 		struct rte_mbuf *fwd[BURST_SZ];
+		/* Classify once and settle every pointer here: rejected
+		 * frames are freed now, permitted ones go to TX.  Nothing in
+		 * exc[] is read again -- after TX the PMD owns (and may have
+		 * recycled) the sent frames (WORKER W1). */
 		for (uint16_t i = 0; i < nex; i++) {
-			if (is_ike_arp(exc[i]))
+			if (is_ike_arp(exc[i])) {
 				fwd[nf++] = exc[i];
-			else
+			} else {
 				DROP(w, DR_CLEAR_OUTER, 1);
+				rte_pktmbuf_free(exc[i]);
+			}
 		}
 		if (nf) {
 			/* Count IKE per-frame: only a UDP-headed frame is IKE
@@ -353,10 +359,6 @@ outer_burst(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr, int port,
 			for (uint16_t i = sent; i < nf; i++)
 				rte_pktmbuf_free(fwd[i]);
 		}
-		/* dropped-exception mbufs are freed here */
-		for (uint16_t i = 0; i < nex; i++)
-			if (!is_ike_arp(exc[i]))
-				rte_pktmbuf_free(exc[i]);
 	}
 }
 
