@@ -24,7 +24,7 @@ Data schema (curves_data.json):
              "enc": {worker: mpps, ...}, "dec": {...},
              "enc_cyc": {worker: cyc/pkt}, "dec_cyc": {...}}, ... ],
   "p4":   {"tapless_mpps": 1.00, "tap_mpps": 0.132, "dpdk_tap_mpps": 0.252,
-           "note": "..."},
+           "sweep": {box: {pmd: {size: (mpps, cyc)}}}, "note": "..."},
 }
 """
 import argparse, json, os, subprocess, sys
@@ -195,27 +195,43 @@ def plot(data, out):
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    # (c) tap-free vs real-I/O: BOTH engines tap-free AND tap
+    # (c) P4 tap-free sweep: Mpps vs packet size, per box/PMD (single instance)
     ax = fig.add_subplot(gs[1, 1])
-    # representative DPDK tap-free points: W=1 openssl .165, W=1 aesni .179
-    dpdk_tapfree = {}
-    for s in dpdk:
-        if "1" in s["enc"]:
-            pm = "aesni" if s["pmd"] == "aesni_mb" else s["pmd"]
-            box = "12c" if "179" in s["box"] else "4c"
-            dpdk_tapfree[f"DPDK {box} {pm}"] = s["enc"]["1"]
-    labels = ["P4 tap-free"] + list(dpdk_tapfree) + ["P4 net_tap", "DPDK net_tap"]
-    vals = [p4_tapfree] + list(dpdk_tapfree.values()) + [p4_tap, dpdk_tap]
-    colors = (["#4C72B0"] + ["#55A868"]*len(dpdk_tapfree) + ["#4C72B0", "#DD8452"])
-    ax.bar(labels, vals, color=colors)
-    for i, v in enumerate(vals):
-        # honest label: axis is Mpps, so a 1.00 value is "1.00", NOT "1000K"
-        ax.text(i, v, f"{v:.2f}" if v >= 1 else f"{v*1e3:.0f}K",
-                ha="center", va="bottom", fontsize=9)
-    ax.set_ylabel("Mpps")
-    ax.set_title("Tap-free dataplane vs real I/O via shared net_tap (64B)")
-    ax.grid(True, axis="y", alpha=0.3)
-    plt.setp(ax.get_xticklabels(), rotation=20, ha="right")
+    p4sweep = p4.get("sweep", {})
+    if p4sweep:
+        styles4 = {"openssl": "o-", "aesni_mb": "^-"}
+        for box, pms in p4sweep.items():
+            for pmd, sizes in pms.items():
+                xs = sorted(int(k) for k in sizes)
+                ys = [sizes[str(x)][0] for x in xs]   # Mpps
+                ax.plot(xs, ys, styles4.get(pmd, "o-"), ms=6,
+                        label=f"P4 {box} {pmd}")
+        ax.set_xlabel("inner frame size (B)")
+        ax.set_ylabel("Mpps (tap-free)")
+        ax.set_title("P4 tap-free, single instance (size sweep)")
+        ax.ticklabel_format(axis="x", style="plain")
+    else:
+        # fall back to the tap-free-vs-tap bar wall
+        dpdk_tapfree = {}
+        for s in dpdk:
+            if "1" in s["enc"]:
+                pm = "aesni" if s["pmd"] == "aesni_mb" else s["pmd"]
+                box = "12c" if "179" in s["box"] else "4c"
+                dpdk_tapfree[f"DPDK {box} {pm}"] = s["enc"]["1"]
+        labels = (["P4 tap-free"] + list(dpdk_tapfree) +
+                  ["P4 net_tap", "DPDK net_tap"])
+        vals = [p4_tapfree] + list(dpdk_tapfree.values()) + [p4_tap, dpdk_tap]
+        colors = (["#4C72B0"] + ["#55A868"]*len(dpdk_tapfree) +
+                  ["#4C72B0", "#DD8452"])
+        ax.bar(labels, vals, color=colors)
+        for i, v in enumerate(vals):
+            ax.text(i, v, f"{v:.2f}" if v >= 1 else f"{v*1e3:.0f}K",
+                    ha="center", va="bottom", fontsize=9)
+        ax.set_ylabel("Mpps")
+        ax.set_title("Tap-free dataplane vs real I/O via shared net_tap (64B)")
+        plt.setp(ax.get_xticklabels(), rotation=20, ha="right")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
 
     fig.suptitle("r2dp dataplane performance - measured, both engines, both boxes, all PMDs",
                  fontsize=13)
