@@ -262,10 +262,11 @@ and the delegated `deleg_8f37ef0b` review):
 - **SPD binding contract (rounds 4+5):** the control plane may install an
   OUT PROTECT policy with no egress SA yet (spmd loads SPD at startup, then
   GETSPI/SA_ADD) — so `p4_sp_add` **accepts an unbound policy** (programs it
-  fail-closed to `spd_discard`, never bypass).  The one refusal is a
+  fail-closed to `spd_discard`, never bypass).  The primary refusal is a
   selector the table cannot name: `p4_pol_row_conflicts` rejects an OUT policy
   that would share an existing ACL row with a *different* full selector
-  (port/scope/host-bits) via `-E2BIG`, so ctl never commits a policy whose
+  (port/scope/host-bits) via `-E2BIG` (a full mirror is `-ENOSPC`; bind can
+  fail `-EAFNOSUPPORT`/commit), so ctl never commits a policy whose
   later `SP_DEL` would drop the shared row for both (fail-open).  It keeps a
   policy mirror (`pr->spd[]`) and programs an unbound OUT PROTECT to
   **`spd_discard` (FAIL CLOSED)**, never bypass (DPDK drops a matched OUT
