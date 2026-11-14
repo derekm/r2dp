@@ -344,8 +344,13 @@ sa_slot_free(struct dpdk_priv *d, struct dp_sa *ds)
 		rte_ipsec_sa_fini(ds->sa);
 	rte_free(ds->sa);
 	{
+		/* zero around `used` (already 0 via the release store in
+		 * sa_slot_retire): a stale binding may still load it */
 		uint32_t idx = ds->idx;
-		memset(ds, 0, sizeof(*ds));
+		memset(ds, 0, offsetof(struct dp_sa, used));
+		memset((uint8_t *)ds + offsetof(struct dp_sa, used) + 1, 0,
+		    sizeof(*ds) - offsetof(struct dp_sa, used) - 1);
+		__atomic_store_n(&ds->used, 0, __ATOMIC_RELEASE);
 		ds->idx = idx;
 	}
 }
@@ -497,10 +502,15 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 			return ret;
 		}
 		/* dp_sa_init marks scratch used; publish only after every
-		 * field below is written (release store), never via this copy */
-		scratch.used = 0;
+		 * field below is written (release store), never via this copy.
+		 * A stale snapshot binding may still acquire-load nd->used, so
+		 * copy around that byte instead of plain-storing it; it is
+		 * already 0 on a free slot (ATOMICS A2). */
 		scratch.idx = (uint32_t)newidx;
-		*nd = scratch;
+		memcpy(nd, &scratch, offsetof(struct dp_sa, used));
+		memcpy((uint8_t *)nd + offsetof(struct dp_sa, used) + 1,
+		    (const uint8_t *)&scratch + offsetof(struct dp_sa, used) + 1,
+		    sizeof(*nd) - offsetof(struct dp_sa, used) - 1);
 	}
 	nd->spi = ntohl(rsa->spi);
 	nd->proto = rsa->proto;
@@ -514,10 +524,12 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	    rte_cpu_to_be_16(NATT_PORT);
 	nd->natt_dport = rsa->natt_dport ? rsa->natt_dport :
 	    rte_cpu_to_be_16(NATT_PORT);
-	nd->hard_bytes = rsa->lft_hard_bytes;
-	nd->hard_deadline = rsa->lft_hard_time ?
-	    (uint64_t)time(NULL) + rsa->lft_hard_time : 0;
-	nd->expire_kicked = 0;
+	/* fields workers access atomically are written atomically */
+	__atomic_store_n(&nd->bytes, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&nd->hard_bytes, rsa->lft_hard_bytes, __ATOMIC_RELAXED);
+	__atomic_store_n(&nd->hard_deadline, rsa->lft_hard_time ?
+	    (uint64_t)time(NULL) + rsa->lft_hard_time : 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&nd->expire_kicked, 0, __ATOMIC_RELAXED);
 	nd->gen = ++d->sa_gen;
 	/* publish last: the worker only proceeds past `used` == 1 */
 	__atomic_store_n(&nd->used, 1, __ATOMIC_RELEASE);
