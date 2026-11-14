@@ -36,7 +36,9 @@ by the Limit 4 implementation in `p4/r2dp.p4` + `fwd/dp_p4.c` (`a8aedd2`).
   RFC 3948 ESP-in-UDP (NAT-T) for the SWX ipsec extern.  0003 and 0004
   together are the full DPDK extern patch series (0004 applies on top of
   0003; both verified by `git apply --check` against pristine + the live P4
-  harness).  NAT-T changes: (1) add `udp_encap` + `udp.sport/dport` to
+  harness).  Note: 0004 is cumulative -- it already contains 0003's
+  flush and applies to pristine DPDK; apply 0004 then 0005, not 0003.
+  NAT-T changes: (1) add `udp_encap` + `udp.sport/dport` to
   `rte_swx_ipsec_sa_params` and plumb them into `ipsec_xform_get`; (2) set
   the tunnel IPv4 outer `next_proto_id` to UDP (17) when `udp_encap` is set
   (was hardcoded ESP/50, so the UDP ports were misread as the ESP SPI on
@@ -69,6 +71,28 @@ by the Limit 4 implementation in `p4/r2dp.p4` + `fwd/dp_p4.c` (`a8aedd2`).
   backend).  Verified on `.165` P4 backend, full harness: replay of an
   accepted seq, far-old seq, and the dist-63/64 boundary all behave
   identically to DPDK (37/37 PASS).  Applies on top of `0004`.
+
+## Building the patched DPDK (reproducible from this repo)
+
+`build-dpdk-p4.sh [PREFIX]` downloads DPDK 24.11 from fast.dpdk.org,
+verifies the pinned SHA-256, applies `0004` and `0005`, and installs a
+minimal build (vdev/ring/memif/tap/null/openssl) to `PREFIX` (default
+`./dpdk-p4`), together with the internal `lib/pipeline` headers the P4
+backend's start-up SWX codegen includes.  Then:
+
+    PKG_CONFIG_PATH=PREFIX/lib/pkgconfig meson setup build \
+        -Denable_dpdk=enabled -Denable_p4=enabled
+    LD_LIBRARY_PATH=PREFIX/lib meson test -C build
+
+CI's `p4` job does exactly this (cached on the script and patch hashes).
+
+Against stock DPDK, `-Denable_p4=enabled` still builds: meson checks
+`rte_swx_ipsec.h` for `replay_win_sz` and `udp_encap`, warns when they are
+missing, and the backend then refuses (`-EOPNOTSUPP`) any SA that asks for
+an anti-replay window or NAT-T instead of installing it without them
+(`fwd/p4_map.h`).  ESN SAs are refused on every DPDK (the extern builds
+ESN-off transforms).  Without the 0004 flush a sparse flow can sit in the
+extern's partial batch; that is a liveness limit, not a security one.
 
 ## Submission route (upstream)
 

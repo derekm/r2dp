@@ -54,7 +54,23 @@
 #include <rte_malloc.h>
 
 #include "dp.h"
+#include "p4_map.h"
 #include <r2dp/proto.h>   /* r2dp_sa / r2dp_sp layouts */
+
+/* Extern features meson found in this DPDK's rte_swx_ipsec.h (COMMITS
+ * C2): the anti-replay window and NAT-T come from the patch series in
+ * contrib/upstream (build-dpdk-p4.sh).  Without them the backend still
+ * builds and runs, and refuses SAs that need them. */
+#ifdef R2DP_P4_SWX_REPLAY
+#define P4_HAVE_REPLAY 1
+#else
+#define P4_HAVE_REPLAY 0
+#endif
+#ifdef R2DP_P4_SWX_NATT
+#define P4_HAVE_NATT 1
+#else
+#define P4_HAVE_NATT 0
+#endif
 
 /* Compiled PNA program + where the codegen .so lands. */
 #ifndef R2DP_P4_SPEC
@@ -1211,12 +1227,16 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 	}
 
 	/* Compile the codegen C to a shared object (the .so step). */
-	snprintf(cmd, sizeof(cmd),
+	rc = snprintf(cmd, sizeof(cmd),
 		"gcc -shared -fPIC -O2 -o '%s' '%s' -I'%s' -I'%s/lib/pipeline' "
 		"-L'%s' -lrte_pipeline -lrte_ipsec -lrte_eal -lrte_mbuf "
 		"-lrte_mempool -lrte_ring 2>%s.err",
 		code_so, code_c, R2DP_RTE_INCLUDE, swx_src,
 		R2DP_RTE_LIB, code_c);
+	if (rc < 0 || (size_t)rc >= sizeof(cmd)) {
+		P4_LOG("codegen compile command too long");
+		return -ENAMETOOLONG;
+	}
 	rc = system(cmd);
 	if (rc) {
 		P4_LOG("compile .so failed rc=%d (see %s.err)", rc, code_c);
@@ -1656,6 +1676,24 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	 * outbound SA is the encrypt leg the SPD references via sa_id. */
 	inbound = (add & FWD_DP_SA_INBOUND) != 0;
 	deleting = !(add & 1);
+	/* Refuse what the extern cannot enforce before touching any state:
+	 * a requested replay window must not be installed as "off", ESN
+	 * and NAT-T must not be acknowledged and then ignored (P2/C6). */
+	if (!deleting) {
+		uint32_t w_sz;
+		int r = p4_sa_supported(inbound, r2dp_sa_window(sa),
+		    (sa->saflags & R2DP_SAF_ESN) != 0,
+		    sa->natt_type == R2DP_NATT_ESPINUDP, P4_HAVE_REPLAY,
+		    P4_HAVE_NATT, &w_sz);
+		if (r < 0) {
+			P4_LOG("SA spi=0x%08x refused: %s%s%s unsupported by this "
+			       "SWX extern (see contrib/upstream)", ntohl(sa->spi),
+			       (sa->saflags & R2DP_SAF_ESN) ? "ESN " : "",
+			       sa->natt_type == R2DP_NATT_ESPINUDP ? "NAT-T " : "",
+			       inbound && r2dp_sa_window(sa) ? "replay-window" : "");
+			return r;
+		}
+	}
 
 	/* Host-order key from the wire (matches dpdk_sad.c conventions). */
 	if (sa->dst.family != R2DP_AF_INET4)
@@ -1874,7 +1912,12 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		 * (a 64-window holds dist 0..63, rejects dist >= 64).  Pass
 		 * window-1 so rte_ipsec's inclusive top equals r2dp's strict
 		 * window and both backends agree on the farthest-accepted slot. */
-		sp.replay_win_sz = r2dp_sa_window(sa) ? r2dp_sa_window(sa) - 1 : 0;
+#if P4_HAVE_REPLAY
+		/* p4_replay_win: w -> inclusive W = w - 1 (checked above) */
+		if (inbound)
+			(void)p4_replay_win(r2dp_sa_window(sa), 1,
+			    &sp.replay_win_sz);
+#endif
 		/* RFC 3948 ESP-in-UDP (NAT-T): carry the ctl SA's natt params to
 		 * the extern.  udp_encap is set for BOTH directions so the
 		 * extern/xform build the NAT-T headers.  How udp_encap is
@@ -1889,6 +1932,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		 *   via the extern sa_add copy, so esp_inb does not also strip).
 		 * natt_sport/dport are network order from ctl; the extern takes
 		 * host-order ports (rte_cpu_to_be_16 in sa.c). */
+#if P4_HAVE_NATT
 		if (sa->natt_type == R2DP_NATT_ESPINUDP) {
 			sp.encap.udp_encap = 1;
 			sp.encap.udp.sport = ntohs(sa->natt_sport);
@@ -1898,6 +1942,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 			if (!sp.encap.udp.dport)
 				sp.encap.udp.dport = 4500;
 		}
+#endif
 		if (sa->src.family == R2DP_AF_INET4)
 			memcpy(&sp.encap.tunnel.ipv4.src_addr,
 			       sa->src.addr, sizeof(struct in_addr));
@@ -2497,7 +2542,6 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	 * an inbound PROTECT/DISCARD policy is dropped, not forwarded). */
 	if (sp->dir != R2DP_DIR_OUT && sp->dir != R2DP_DIR_IN)
 		return 0;
-
 	p = p4_pol_find(pr, sp);
 	if (!p) {
 		int ghost = -1;

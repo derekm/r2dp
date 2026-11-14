@@ -6,6 +6,9 @@ test('test_proto',
     link_with: libr2dp),
   is_parallel: false)
 
+# p4_map: ctl -> SWX extern parameter mapping (pure, every build)
+test('p4_map', executable('p4_map', 'p4_map.c'))
+
 # test_mock and shim_contract both spawn r2dp-mockfwd on a temp socket.
 test('test_mock',
   executable('test_mock', 'test_mock.c',

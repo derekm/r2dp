@@ -33,9 +33,34 @@ endif
 
 # P4/SWX backend: needs the DPDK SWX pipeline (librte_pipeline bundles the
 # rte_swx_* codegen/ctl/ipsec in 24.11) + a compiled p4/r2dp.out spec.
+p4_args = []
 if dpdk.found() and get_option('enable_p4').enabled()
   fwd_o += files('dp_p4.c')
   p4_inc = dpdk
+  # COMMITS C2: the anti-replay window and NAT-T fields exist only in a
+  # DPDK carrying contrib/upstream's extern series (build-dpdk-p4.sh).
+  # Detect them; without them the backend builds with reduced features and
+  # refuses SAs that need them (fwd/p4_map.h).
+  cc = meson.get_compiler('c')
+  swx_pre = '#include <rte_config.h>\n#include <rte_swx_ipsec.h>'
+  if cc.has_member('struct rte_swx_ipsec_sa_params', 'replay_win_sz',
+      prefix: swx_pre, dependencies: dpdk, args: '-DALLOW_EXPERIMENTAL_API')
+    p4_args += '-DR2DP_P4_SWX_REPLAY=1'
+  endif
+  if cc.has_member('struct rte_swx_ipsec_sa_encap_params', 'udp_encap',
+      prefix: swx_pre, dependencies: dpdk, args: '-DALLOW_EXPERIMENTAL_API')
+    p4_args += '-DR2DP_P4_SWX_NATT=1'
+  endif
+  # where the start-up SWX codegen finds DPDK (headers, libs, and the
+  # internal lib/pipeline headers build-dpdk-p4.sh keeps)
+  p4_args += ['-DR2DP_RTE_INCLUDE="' + dpdk.get_variable(pkgconfig: 'includedir') + '"',
+    '-DR2DP_RTE_LIB="' + dpdk.get_variable(pkgconfig: 'libdir') + '"',
+    '-DR2DP_SWX_SRC="' + dpdk.get_variable(pkgconfig: 'prefix') + '/share/dpdk-swx-src"']
+  if not p4_args.contains('-DR2DP_P4_SWX_REPLAY=1') or not p4_args.contains('-DR2DP_P4_SWX_NATT=1')
+    warning('P4: this DPDK lacks the contrib/upstream SWX extern series; ' +
+      'SAs with a replay window or NAT-T will be refused.  Build the full ' +
+      'feature set with contrib/upstream/build-dpdk-p4.sh')
+  endif
 else
   p4_inc = []
 endif
@@ -48,6 +73,6 @@ r2dp_fwd = executable('r2dp-fwd',
   install: false,
   c_args: (dpdk.found() ? ['-DR2DP_HAVE_DPDK=1'] : []) +
     (get_option('enable_p4').enabled() ?
-      ['-DR2DP_HAVE_P4=1', '-DALLOW_EXPERIMENTAL_API'] : []) +
+      ['-DR2DP_HAVE_P4=1', '-DALLOW_EXPERIMENTAL_API'] + p4_args : []) +
     ['-DDP_MAX_WK=' + get_option('dp_max_wk').to_string()],
 )
