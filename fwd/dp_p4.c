@@ -1577,6 +1577,9 @@ static int p4_start(struct fwd_dp *dp)
 		int mac_is_zero = 1;
 		for (int i = 0; i < RTE_ETHER_ADDR_LEN; i++)
 			mac_is_zero &= pr->our_inner_mac[i] == 0;
+		if (mac_is_zero)
+			P4_LOG("inner leg reported a zero MAC: decrypted frames "
+			       "keep a zero destination MAC (C9/P7)");
 		for (uint32_t s = 0; s < pr->n_inst && !mac_is_zero; s++) {
 			struct rte_swx_table_entry en;
 			int rid = p4_table_action_id(pr->inst[s].p, pr->inst[s].tid_nhop, 0);
