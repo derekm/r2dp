@@ -1597,7 +1597,7 @@ static int p4_start(struct fwd_dp *dp)
 		int mac_is_zero = 1;
 		for (int i = 0; i < RTE_ETHER_ADDR_LEN; i++)
 			mac_is_zero &= pr->our_inner_mac[i] == 0;
-		for (int s = 0; s < pr->n_inst && !mac_is_zero; s++) {
+		for (uint32_t s = 0; s < pr->n_inst && !mac_is_zero; s++) {
 			struct rte_swx_table_entry en;
 			int rid = p4_table_action_id(pr->inst[s].p, pr->inst[s].tid_nhop, 0);
 			uint8_t k1[4] = { 1, 0, 0, 0 };
@@ -2592,7 +2592,7 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 
 static int64_t p4_sa_bytes(struct fwd_dp *dp, uint32_t spi, uint32_t dip)
 {
-	(void)spi; (void)dip;
+	(void)dp; (void)spi; (void)dip;
 	return -1;    /* SWX per-SA byte counters exposed when available */
 }
 

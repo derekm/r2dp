@@ -47,6 +47,7 @@ r2dp_fwd = executable('r2dp-fwd',
   link_with: libr2dp,
   install: false,
   c_args: (dpdk.found() ? ['-DR2DP_HAVE_DPDK=1'] : []) +
-    (get_option('enable_p4').enabled() ? ['-DR2DP_HAVE_P4=1'] : []) +
+    (get_option('enable_p4').enabled() ?
+      ['-DR2DP_HAVE_P4=1', '-DALLOW_EXPERIMENTAL_API'] : []) +
     ['-DDP_MAX_WK=' + get_option('dp_max_wk').to_string()],
 )
