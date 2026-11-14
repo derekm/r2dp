@@ -297,11 +297,24 @@ static void *p4_worker(void *arg)
  * counting what the data plane accepts and egresses and reporting pps and
  * cycles/pkt from TSC.  No ethdev, no tap, no memif. */
 #define P4_BENCH_WAIT_HZ 120     /* wait up to 120s for a bound OUT PROTECT
-				  * (the control plane installs SA+SP after
-				  * the forwarder is up, so this must cover
-				  * bring-up + a real policy install) */
+				* (the control plane installs SA+SP after
+				* the forwarder is up, so this must cover
+				* bring-up + a real policy install) */
 #define P4_BENCH_SECS    3      /* timed window per trial */
 #define P4_BENCH_TRIALS  5
+/* Frame size for the tap-free sweep.  Default 64B (matches the originally
+ * measured point); override with $R2DP_P4_BENCH_SIZE to sweep packet length.
+ * The plaintext IPv4/UDP template is sized accordingly (total-len + UDP len
+ * fields kept consistent so ESP encrypts a well-formed inner packet). */
+static unsigned
+p4_bench_size(void)
+{
+	const char *s = getenv("R2DP_P4_BENCH_SIZE");
+	long v = s ? strtol(s, NULL, 10) : 64;
+	if (v < 46) v = 46;          /* 14 eth + 20 ip + 8 udp + 4 min */
+	if (v > 1500) v = 1500;
+	return (unsigned)v;
+}
 static void *p4_bench_worker(void *arg)
 {
 	struct p4_priv *pr = arg;
@@ -329,9 +342,15 @@ armed:
 	 * not, so create a local one here). */
 	{
 		struct rte_mempool *pool = pr->pool;
+		unsigned fsz = p4_bench_size();   /* inner frame length */
+		unsigned totlen, udplen;
 		uint64_t t0, t1, min_c, best = 0, tot_pkt = 0;
 		int trial;
 
+		/* IPv4 total len = 20 (hdr) + 8 (udp) + payload; UDP len = 8 + payload.
+		 * fsz = 14 eth + ip; payload = fsz - 14 - 20 - 8. */
+		totlen = fsz - 14;             /* ip hdr + udp + payload */
+		udplen = fsz - 14 - 20;        /* udp hdr + payload */
 		if (!pool)
 			pool = rte_pktmbuf_pool_create("p4bench_pool",
 						       P4_POOL_SIZE,
@@ -370,29 +389,33 @@ armed:
 					uint8_t *f;
 					if (!m)
 						break;
-					f = (uint8_t *)rte_pktmbuf_append(m, 64);
+					f = (uint8_t *)rte_pktmbuf_append(m, fsz);
 					if (!f) {
 						rte_pktmbuf_free(m);
 						break;
 					}
-					memset(f, 0, 64);
+					memset(f, 0, fsz);
 					/* eth dst6 src6 + 0x0800 */
 					f[0]=0x02; f[5]=0x01;
 					f[6]=0x02; f[11]=0x02;
 					f[12]=0x08; f[13]=0x00;
-					/* IPv4 hdr @14 (ver/ihl, total len
-					 * 0x32=50, ttl 64, proto 17 udp) */
-					f[14]=0x45; f[15]=0x00; f[19]=0x32;
+					/* IPv4 hdr @14: ver/ihl, total len
+					 * (be u16 @15), id, ttl 64, proto 17 udp */
+					f[14]=0x45; f[15]=0x00;
+					f[16]=(uint8_t)(totlen>>8);
+					f[17]=(uint8_t)totlen;
+					f[18]=0x00; f[19]=0x00;
 					f[22]=0x40; f[23]=0x11;
 					/* src 10.0.0.1 @26, dst 10.0.0.2 @30 */
 					f[26]=0x0a; f[27]=0x00; f[28]=0x00;
 					f[29]=0x01;
 					f[30]=0x0a; f[31]=0x00; f[32]=0x00;
 					f[33]=0x02;
-					/* UDP @34: sport 1024, dport 9 */
+					/* UDP @34: sport 1024, dport 9, len be */
 					f[34]=0x04; f[35]=0x00;
 					f[36]=0x00; f[37]=0x09;
-					f[38]=0x00; f[39]=0x08;
+					f[38]=(uint8_t)(udplen>>8);
+					f[39]=(uint8_t)udplen;
 					mk[n++] = m;
 				}
 				if (!n)
