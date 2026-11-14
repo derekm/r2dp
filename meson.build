@@ -42,6 +42,14 @@ r2dp_ctl_probe = executable('r2dp-ctl-probe',
   link_with: libr2dp,
   install: false)
 
+# SPD<->SA bind probe: proves the OUT PROTECT hit path (direct-bind and
+# SP-before-SA rebind) against a running p4 forwarder.  Needs +dp p4.
+r2dp_p4_bind_probe = executable('r2dp-p4-bind-probe',
+  'tools/p4_bind_probe.c',
+  include_directories: r2dp_inc,
+  link_with: libr2dp,
+  install: false)
+
 subdir('fwd')
 
 subdir('tests')
