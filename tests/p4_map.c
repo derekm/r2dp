@@ -6,6 +6,16 @@ static int fails;
 #define CHECK(c, msg) do { if (c) printf("ok   %s\n", msg); \
 	else { printf("FAIL %s\n", msg); fails++; } } while (0)
 
+/* Fake regarray writer: records writes, fails the fail_at-th one. */
+static unsigned nwr, fail_at;
+static int fake_rc;
+static int
+fake_wr(void *ctx, const char *name, uint32_t idx, uint64_t val)
+{
+	(void)ctx; (void)name; (void)idx; (void)val;
+	return nwr++ == fail_at ? fake_rc : 0;
+}
+
 int
 main(void)
 {
@@ -40,6 +50,22 @@ main(void)
 	CHECK(p4_sp_supported(0, 500) == -EOPNOTSUPP &&
 	    p4_sp_supported(4500, 0) == -EOPNOTSUPP,
 	    "port-qualified selector refused, never widened to all ports");
+	nwr = 0; fail_at = ~0u;
+	{
+		unsigned bad = 99;
+		CHECK(p4_regs_program(fake_wr, NULL, &bad) == 0 && nwr == P4_NREGS,
+		    "every classification regarray is written");
+		ok = 1;
+		for (unsigned i = 0; i < P4_NREGS; i++) {
+			int want = i & 1 ? -EINVAL : -EIO;
+			nwr = 0; fail_at = i; fake_rc = i & 1 ? -EINVAL : 1;
+			bad = 99;
+			if (p4_regs_program(fake_wr, NULL, &bad) != want ||
+			    bad != i || nwr != i + 1)
+				ok = 0;
+		}
+		CHECK(ok, "a failed regarray write stops setup and names the entry");
+	}
 	if (fails) { printf("p4_map: %d failures\n", fails); return 1; }
 	puts("p4_map: OK");
 	return 0;

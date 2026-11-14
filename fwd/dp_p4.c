@@ -1335,6 +1335,12 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 	return 0;
 }
 
+/* p4_regs_program's writer: one SWX regarray write on pipeline ctx. */
+static int p4_regwr(void *ctx, const char *name, uint32_t idx, uint64_t val)
+{
+	return rte_swx_ctl_pipeline_regarray_write(ctx, name, idx, val);
+}
+
 static int p4_start(struct fwd_dp *dp)
 {
 	struct p4_priv *pr = dp->priv;
@@ -1474,18 +1480,15 @@ static int p4_start(struct fwd_dp *dp)
 		 * read (they default to 0).  See the pre-loop comment block in
 		 * the original single-instance text: direction per port,
 		 * ipsec_port_* = the extern port (2). */
-		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
-			"direction", 0, 0);
-		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
-			"direction", 1, 1);
-		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
-			"ipsec_port_in_inbound", 0, 2);
-		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
-			"ipsec_port_in_outbound", 0, 2);
-		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
-			"ipsec_port_out_inbound", 0, 2);
-		(void)rte_swx_ctl_pipeline_regarray_write(pr->inst[s].p,
-			"ipsec_port_out_outbound", 0, 2);
+		{
+			unsigned bad = 0;
+			rc = p4_regs_program(p4_regwr, pr->inst[s].p, &bad);
+			if (rc) {
+				P4_LOG("slice %u regarray %s[%u] write failed: %d",
+				    s, p4_regs[bad].name, p4_regs[bad].idx, rc);
+				return -EIO;
+			}
+		}
 
 		/* next_hop id0 -> outer leg (port 0), id1 -> inner (port 1). */
 		{
@@ -1504,15 +1507,22 @@ static int p4_start(struct fwd_dp *dp)
 			en.action_data = ab;
 			en.key = k0;
 			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
-				 "next_hop_table_0", &en))
+				 "next_hop_table_0", &en)) {
 				P4_LOG("slice %u next_hop id0 add failed", s);
+				return -EIO;
+			}
 			ab[14] = 0x01; ab[15] = 0x00;
 			ab[16] = 0x00; ab[17] = 0x00;
 			en.key = k1;
 			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
-				 "next_hop_table_0", &en))
+				 "next_hop_table_0", &en)) {
 				P4_LOG("slice %u next_hop id1 add failed", s);
-			(void)rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
+				return -EIO;
+			}
+			if (rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1)) {
+				P4_LOG("slice %u next_hop commit failed", s);
+				return -EIO;
+			}
 			P4_LOG("slice %u next_hop (id0->outer, id1->inner)", s);
 		}
 
@@ -1645,8 +1655,10 @@ static int p4_start(struct fwd_dp *dp)
 			int rid = p4_table_action_id(pr->inst[s].p, pr->inst[s].tid_nhop, 0);
 			uint8_t k1[4] = { 1, 0, 0, 0 };
 			uint8_t ab[18];
-			if (rid < 0)
-				continue;
+			if (rid < 0) {
+				P4_LOG("slice %u inner-hop action lookup failed", s);
+				return -EIO;
+			}
 			memset(&en, 0, sizeof(en));
 			memset(ab, 0, sizeof(ab));
 			memcpy(&ab[0], pr->our_inner_mac, RTE_ETHER_ADDR_LEN); /* dst */
@@ -1657,10 +1669,12 @@ static int p4_start(struct fwd_dp *dp)
 			en.action_data = ab;
 			en.key = k1;
 			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
-				 "next_hop_table_0", &en))
-				P4_LOG("slice %u inner-hop MAC add failed", s);
-			else
-				(void)rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
+				 "next_hop_table_0", &en) ||
+			    rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1)) {
+				/* Without it decrypted frames go to a zero MAC. */
+				P4_LOG("slice %u inner-hop MAC program failed", s);
+				return -EIO;
+			}
 		}
 	}
 

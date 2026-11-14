@@ -60,4 +60,35 @@ p4_sp_supported(uint16_t sport, uint16_t dport)
 	return (sport || dport) ? -EOPNOTSUPP : 0;
 }
 
+/* The classification regarrays the spec's parser/apply read: direction
+ * per input port (0 outer, 1 inner) and the extern's port (2) for each
+ * leg.  They default to 0, so a lost write misclassifies traffic; every
+ * write is required (P4 review P10).  p4_regs_program stops at the first
+ * failure, reports which entry through *bad, and returns its error. */
+struct p4_reg { const char *name; uint32_t idx; uint64_t val; };
+
+static const struct p4_reg p4_regs[] = {
+	{ "direction",               0, 0 },
+	{ "direction",               1, 1 },
+	{ "ipsec_port_in_inbound",   0, 2 },
+	{ "ipsec_port_in_outbound",  0, 2 },
+	{ "ipsec_port_out_inbound",  0, 2 },
+	{ "ipsec_port_out_outbound", 0, 2 },
+};
+#define P4_NREGS (sizeof(p4_regs) / sizeof(p4_regs[0]))
+
+static inline int
+p4_regs_program(int (*wr)(void *ctx, const char *name, uint32_t idx,
+    uint64_t val), void *ctx, unsigned *bad)
+{
+	for (unsigned i = 0; i < P4_NREGS; i++) {
+		int rc = wr(ctx, p4_regs[i].name, p4_regs[i].idx, p4_regs[i].val);
+		if (rc) {
+			*bad = i;
+			return rc < 0 ? rc : -EIO;
+		}
+	}
+	return 0;
+}
+
 #endif
