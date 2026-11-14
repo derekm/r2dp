@@ -206,16 +206,12 @@ static void p4_pin(unsigned s)
 		P4_LOG("slice %u: sched_setaffinity failed", s);
 }
 
-/* Packet-path worker: drain the pipeline's input, execute the PNA program,
- * run the ipsec extern head-of-line, then loop.  Mirrors examples/pipeline
+/* Per-slice data-plane worker: run THIS slice's pipeline + ipsec extern.
+ * The ethdev legs (RX distributor + TX) are owned by the single p4_io_worker
+ * thread, so per-slice workers never touch rte_eth_* directly (an ethdev
+ * queue is not multi-producer/multi-consumer).  Mirrors examples/pipeline
  * thread_main: run each pipeline then each block (the ipsec extern) with no
- * sleep so the pipeline saturates.
-
- * Packets are bridged between the ethdev legs and the pipeline rings
- * (R2DP_IN0/IN1 in, R2DP_OUT0/OUT1 out): RX a burst off a leg and enqueue it
- * to that leg's input ring; the pipeline's `rx`/`tx` instructions move it
- * through the PNA program; dequeue the output ring and TX to the matching
- * leg.  An empty ring or PMD is a no-op. */
+ * sleep so the pipeline saturates. */
 static void *p4_worker(void *arg)
 {
 	struct p4_inst *it = arg;
@@ -225,37 +221,19 @@ static void *p4_worker(void *arg)
 	uint64_t last_dump = 0;
 
 	while (atomic_load_explicit(&it->running, __ATOMIC_RELAXED)) {
-		/* RX is owned by the single p4_rx_worker distributor thread
-		 * (it hashes each frame to this slice's input ring); the
-		 * per-slice worker only runs the data plane and TXes. */
+		/* Both ethdev legs are owned by the single p4_io_worker
+		 * (RX distributor + TX), so the RX queue is a single consumer
+		 * and the TX queue a single producer -- a DPDK ethdev queue is
+		 * single-producer, so N per-slice workers must NOT each call
+		 * rte_eth_tx_burst on queue 0.  This per-slice worker only runs
+		 * the pipeline + ipsec extern, then the io worker drains the
+		 * slice's egress rings to the NIC. */
 
 		/* Run the pipeline + ipsec extern. */
 		if (it->p)
 			rte_swx_pipeline_run(it->p, P4_RUN_QUANTA);
 		if (it->ipsec)
 			rte_swx_ipsec_run(it->ipsec);
-
-		/* Bridge TX: out0 -> outer, out1 -> inner. */
-		if (pr->outer_port >= 0 && it->out0) {
-			struct rte_mbuf *pkts[P4_BURST_SZ];
-			uint16_t n = rte_ring_dequeue_burst(it->out0,
-							    (void **)pkts,
-							    P4_BURST_SZ, NULL);
-			if (n) {
-				it->c_out0 += n;
-				rte_eth_tx_burst(pr->outer_port, 0, pkts, n);
-			}
-		}
-		if (pr->inner_port >= 0 && it->out1) {
-			struct rte_mbuf *pkts[P4_BURST_SZ];
-			uint16_t n = rte_ring_dequeue_burst(it->out1,
-							    (void **)pkts,
-							    P4_BURST_SZ, NULL);
-			if (n) {
-				it->c_out1 += n;
-				rte_eth_tx_burst(pr->inner_port, 0, pkts, n);
-			}
-		}
 
 		/* Periodic activity dump (every ~1s) so ingress/egress is
 		 * visible even with no signal handler wired. */
@@ -267,7 +245,7 @@ static void *p4_worker(void *arg)
 			uint32_t qo0 = rte_ring_count(it->out0);
 			uint32_t qo1 = rte_ring_count(it->out1);
 			struct rte_swx_table_stats ts1;
-			static uint64_t act1[16];
+			uint64_t act1[16];
 			char ipn[64], ipon[64];
 			struct rte_ring *ipin, *ipout;
 			snprintf(ipn, sizeof(ipn), s ? "IP_IN_%u" : "IP_IN", s);
@@ -287,7 +265,7 @@ static void *p4_worker(void *arg)
 			ts1.n_pkts_action = act1;
 			{
 				struct rte_swx_table_stats ibs;
-				static uint64_t iba[16];
+				uint64_t iba[16];
 				memset(&ibs, 0, sizeof(ibs));
 				ibs.n_pkts_action = iba;
 				if (rte_swx_ctl_pipeline_table_stats_read(it->p,
@@ -369,14 +347,18 @@ static uint32_t p4_flow_slice(struct p4_priv *pr, const struct rte_mbuf *m)
 		uint8_t proto = ip[9];
 		uint32_t dst;
 		memcpy(&dst, ip + 16, 4);
-		if (proto == 50) {             /* ESP: pin on (dst,spi) */
-			/* SPI is the first 4 bytes of the ESP header,
-			 * immediately after the IP header. */
-			if (l < 14 + 20 + 4)
-				return p4_xor((const uint8_t *)&dst, 4)
-				       % pr->n_inst;
-			memcpy(bb, &dst, 4);
-			memcpy(bb + 4, ip + 20, 4);
+		if (proto == 50) {
+			/* ESP: pin on the outer IP flow (src, dst) -- NOT
+			 * (dst + SPI).  Fragments arrive as separate outer
+			 * IP packets and only the FIRST carries the ESP
+			 * header/SPI; a non-first fragment has no SPI at
+			 * ip+20, so a (dst,SPI) hash would scatter one SA's
+			 * fragments across slices.  All fragments of one SA
+			 * must land on one slice (reassembly + per-SA replay
+			 * are per-slice and single-owner), so hash every ESP
+			 * frame on the fragment-invariant outer src+dst. */
+			memcpy(bb, ip + 12, 4);          /* src */
+			memcpy(bb + 4, ip + 16, 4);      /* dst */
 			n = 8;
 		} else if (l >= 14 + 20 + 8) {  /* 5-tuple incl. TCP/UDP */
 			/* src(4) proto(1) dst(4) sport(2) dport(2) = 13B */
@@ -402,11 +384,13 @@ static uint32_t p4_flow_slice(struct p4_priv *pr, const struct rte_mbuf *m)
  * like a NIC RX engine fanning flows out to N pipelines.  The per-slice
  * workers (p4_worker) then only run pipeline+extern and TX.
  */
-static void *p4_rx_worker(void *arg)
+static void *p4_io_worker(void *arg)
 {
 	struct p4_priv *pr = arg;
 
 	while (atomic_load_explicit(&pr->inst[0].running, __ATOMIC_RELAXED)) {
+		/* RX: one thread drains both legs and fans frames out to
+		 * slices, so each RX queue is a single consumer. */
 		if (pr->outer_port >= 0) {
 			struct rte_mbuf *pkts[P4_BURST_SZ];
 			uint16_t n = rte_eth_rx_burst(pr->outer_port, 0,
@@ -431,6 +415,45 @@ static void *p4_rx_worker(void *arg)
 				pr->inst[s].c_inner++;
 				if (rte_ring_enqueue(pr->inst[s].in1,
 						     pkts[k]) != 0)
+					rte_pktmbuf_free(pkts[k]);
+			}
+		}
+
+		/* TX: drain EVERY slice's egress rings to the ethdev.  One
+		 * thread owns the TX queues (single producer), so N workers
+		 * never call rte_eth_tx_burst on queue 0 concurrently (that
+		 * is a DPDK data race).  Count with the tx_burst RETURN (not
+		 * the dequeue count: an unsent mbuf is a leak, and a full TX
+		 * queue must not be counted as transmitted). */
+		if (pr->outer_port >= 0) {
+			unsigned s;
+			for (s = 0; s < pr->n_inst; s++) {
+				struct rte_mbuf *pkts[P4_BURST_SZ];
+				uint16_t n = rte_ring_dequeue_burst(
+					pr->inst[s].out0, (void **)pkts,
+					P4_BURST_SZ, NULL), k, tx;
+				if (!n)
+					continue;
+				tx = rte_eth_tx_burst(pr->outer_port, 0,
+						      pkts, n);
+				pr->inst[s].c_out0 += tx;
+				for (k = tx; k < n; k++)
+					rte_pktmbuf_free(pkts[k]);
+			}
+		}
+		if (pr->inner_port >= 0) {
+			unsigned s;
+			for (s = 0; s < pr->n_inst; s++) {
+				struct rte_mbuf *pkts[P4_BURST_SZ];
+				uint16_t n = rte_ring_dequeue_burst(
+					pr->inst[s].out1, (void **)pkts,
+					P4_BURST_SZ, NULL), k, tx;
+				if (!n)
+					continue;
+				tx = rte_eth_tx_burst(pr->inner_port, 0,
+						      pkts, n);
+				pr->inst[s].c_out1 += tx;
+				for (k = tx; k < n; k++)
 					rte_pktmbuf_free(pkts[k]);
 			}
 		}
@@ -1429,7 +1452,7 @@ static int p4_start(struct fwd_dp *dp)
 	 * slice by flow, giving per-SA replay affinity and keeping the
 	 * ethdev RX queue a single consumer. */
 	if (!getenv("R2DP_P4_BENCH") && pr->outer_port >= 0) {
-		if (pthread_create(&pr->rx_th, NULL, p4_rx_worker, pr) != 0) {
+		if (pthread_create(&pr->rx_th, NULL, p4_io_worker, pr) != 0) {
 			P4_LOG("rx distributor create failed");
 			return -EIO;
 		}
@@ -1520,6 +1543,34 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 				e->in_use = 1;   /* keep the live SA for ctl's retry */
 				return rc;
 			}
+			/* Commit EVERY slice's scheduled rebind FIRST.  Only after all
+			 * succeed do we delete the crypto SAs / clear the slot: a
+			 * failed commit must leave the slot findable (in_use=1) and
+			 * the crypto SA still present so ctl's retry is not -ENOENT
+			 * with the SA gone.  With abort_on_fail=1 a failed commit
+			 * rolls that slice's rebind back, keeping the old policy. */
+			{
+				unsigned s;
+				for (s = 0; s < pr->n_inst; s++) {
+					rc = rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
+					if (rc) {
+						/*
+						 * Some slices committed the rebind,
+						 * others did not.  Restore the slot
+						 * so ctl's retry can find it; the
+						 * committed slices' crypto SA is
+						 * untouched (we have not deleted it
+						 * yet), so retry is safe.
+						 */
+						e->in_use = 1;
+						P4_LOG("slice %u out sa-del commit %d; "
+						       "keeping SA", s, rc);
+						return rc;
+					}
+				}
+			}
+			/* All commits succeeded: now safe to tear down the crypto
+			 * SA on every slice and release the slot. */
 			{
 				unsigned s;
 				for (s = 0; s < pr->n_inst; s++) {
@@ -1527,16 +1578,9 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 						rte_swx_ipsec_sa_delete(pr->inst[s].ipsec,
 								 e->sl_id[s]);
 					e->sl_id[s] = 0;
-					rc = rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
-					if (rc)
-						return rc;
 				}
 			}
-			/* Outbound delete done: the crypto SA is removed from every
-			 * slice's extern and each slice committed.  MUST return here
-			 * (the inbound block below is for IN SAD only) -- falling
-			 * through would re-delete this slice's (now zeroed) sl_id,
-			 * i.e. SA id 0, on every slice. */
+			e->in_use = 0;   /* already 0; keep for clarity */
 			return 0;
 		}
 		/* Inbound delete: the (dip,spi) table delete is already scheduled.
@@ -2277,8 +2321,21 @@ int fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	 * model.  Default/absent = 1 (the historical single pipeline). */
 	{
 		const char *w = getenv("R2DP_P4_WORKERS");
-			long n = w ? strtol(w, NULL, 10) : 1;
-			if (n < 1) n = 1;
+			long n = 1;
+			if (w) {
+				char *end = NULL;
+				n = strtol(w, &end, 10);
+				/* Refuse empty/non-numeric and <1 exactly like
+				 * >MAX: a nonsense worker count must not silently
+				 * become 1 (the operator asked for a specific
+				 * shard topology; guessing is under-provisioning). */
+				if (!end || *end != '\0' || n < 1) {
+					P4_LOG("R2DP_P4_WORKERS='%s' refused "
+					       "(need 1..%d)", w,
+					       R2DP_P4_MAX_INST);
+					return -EINVAL;
+				}
+			}
 			if (n > R2DP_P4_MAX_INST) {
 				/* Fail closed, do not silently clamp: N slices must map 1:1
 				 * to cryptodev queue pairs and to CPU cores, and a request
