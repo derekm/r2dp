@@ -218,7 +218,7 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
                 // Pre-decrypt: an inbound ESP frame -> SAD -> ipsec extern.
                 if (hdrs.ipv4.isValid() && hdrs.esp.isValid()) {
                     inbound_table.apply();
-                    if (meta.bypass) {
+                    if (meta.bypass == 1) {
                         routing_table.apply();
                         next_hop_table.apply();
                     }
@@ -242,7 +242,7 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
             if (!ipsec.from_ipsec(status)) {
                 if (hdrs.ipv4.isValid()) {
                     outbound_table.apply();
-                    if (meta.bypass) {
+                    if (meta.bypass == 1) {
                         routing_table.apply();
                         next_hop_table.apply();
                     }
