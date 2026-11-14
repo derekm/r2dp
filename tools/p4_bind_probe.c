@@ -13,9 +13,10 @@
  *
  * Honest scope: this proves the TABLE INSTALL action from the log, NOT that a
  * real packet hits spd_discard.  It installs R2DP_PROTO_ANY and /24 selectors
- * (like spmd), and the SPD table is exact (src,dst,proto)-only — so a concrete
- * packet misses the entry and falls to the spd_bypass default.  See PLAN §8
- * limit 4: fail-closed is exact-hit-only, not DR_NO_SA_OUT parity.
+ * (like spmd) — the SPD table is now a WILDCARD (ternary) table (`a8aedd2`) so
+ * these DO collapse to a prefix/ANY entry that matches; still assert spd_discard
+ * on a hit and never claim packet-hit or DR_NO_SA_OUT parity without a wire
+ * proof.  This probe checks the bind log only.
  *
  * Usage: p4_bind_probe [sock] [fwd-log-path]
  *   fwd-log-path (optional) enables the log-action assertions; without it

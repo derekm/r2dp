@@ -179,7 +179,7 @@ crypto layer even though the P4 `status` branch is unwritten.
   failure path that returns bad frames exists.
 - **Limit 4 (SPD prefix/ANY) — DONE on the P4/SWX path (proven on `.165`).**
   `outbound_table` is now a WILDCARD (ternary) table on (protocol, src, dst);
-  the runtime (`p4_spd_bind`/`p4_spd_del`) programs key + key_mask +
+  the runtime (`p4_spd_bind`/`p4_sp_del`) programs key + key_mask +
   key_priority at runtime.  How it works: p4c-dpdk lowers `ternary` to the SWX
   `wildcard` (ACL) match type; `rte_swx_table_wildcard_match_ops` has .add/.del
   NULL only because it has no *incremental* update — SWX updates such tables
@@ -230,10 +230,10 @@ and the delegated `deleg_8f37ef0b` review):
      pipeline, so the drop already happens; the P4 status branch is
      dead-but-harmless.  Do not "fix" the P4 status until a path that
      returns bad frames exists.
-  4. **SPD is exact `(src,dst,proto)` only** — no prefix/ports/proto-ANY, so an
-     r2dp OUT policy / IKE bypass SP does not collapse to one entry.  Outbound
-     miss -> `spd_bypass` matches DPDK; inbound miss -> `drop` is NOT
-     `DR_NO_SA_IN`.
+  4. **SPD is exact `(src,dst,proto)` only** — no prefix/ports/proto-ANY.  FIXED
+     `a8aedd2`: now a WILDCARD (ternary) table with prefix/ANY selectors and
+     per-rule priority (see §8 Limit 4 above).  Outbound miss -> `spd_bypass`;
+     inbound miss -> `drop` is NOT `DR_NO_SA_IN`.
 - **Runtime `fwd/dp_p4.c`** (`88ec62d`, `497952c`, `77551a8` … SPD-bind fix in
   the round-4 follow-up) implements `fwd_dp_ops` and now **loads and runs the
   SWX pipeline** end-to-end: `r2dp-fwd --dp p4` brings up
