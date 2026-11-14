@@ -35,6 +35,10 @@
  *     same-MAC one -- is queued behind it, and the queue applies them in
  *     order, so a deferred older MAC never overwrites a newer one.  Learns
  *     racing on two lcores have no defined order either way.
+ *   - Lifetimes: r2dp_nh_del leaves a tombstone (ip, delete sequence)
+ *     while learns are queued, and maintenance discards a learn queued
+ *     before its peer's delete even if the address is a peer again by
+ *     then (stats: n_stale).  Unrelated peers' learns are kept.
  *   - Deleted key slots are recycled only after a grace period
  *     (rte_hash_rcu_qsbr_add, defer-queue mode, on the forwarder's QSBR).
  */
@@ -58,8 +62,15 @@
 
 struct r2dp_nh_req {
 	uint32_t ip;
-	uint32_t pad;
+	uint32_t dseq;  /* t->dseq when queued: older than a later delete */
 	uint64_t mac;   /* packed data word */
+};
+
+/* A delete of ip that happened (dseq) while learns of its bucket were
+ * still queued: those older learns belong to the deleted lifetime. */
+struct r2dp_nh_tomb {
+	uint32_t ip;
+	uint32_t dseq;
 };
 
 struct r2dp_nh_tab {
@@ -93,6 +104,14 @@ struct r2dp_nh_tab {
 	 * never overwrite a newer direct one (NH-2).  Producers increment
 	 * before enqueue; the maintenance side decrements as it resolves. */
 	uint32_t            outstanding[R2DP_NH_OBUCKETS];
+	/* NH-3: deletes since the oldest queued learn (t->lock). */
+	uint32_t            dseq;
+	struct r2dp_nh_tomb *tomb;
+	uint32_t            ntomb, tomb_cap;
+	uint32_t            tomb_all;     /* tombstone list full: every learn */
+	int                 tomb_all_set; /* queued before tomb_all is stale */
+	uint32_t            nout;         /* sum of outstanding[] */
+	uint64_t            n_stale;      /* queued learns of a deleted lifetime */
 	/* test hook: fail this many growth attempts as if out of memory */
 	uint32_t            inject_grow_fail;
 };

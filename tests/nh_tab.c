@@ -193,6 +193,61 @@ ordering(void)
 	r2dp_nh_free(&t);
 }
 
+/* NH-3: a learn queued in a peer's previous lifetime must not come back
+ * after delete + re-add of the same address. */
+static int want_all = 1;
+static int
+want_cb(void *arg, uint32_t ip)
+{
+	(void)arg; (void)ip;
+	return want_all;
+}
+
+static void
+lifetimes(void)
+{
+	struct r2dp_nh_tab t;
+	const uint8_t OLD[6] = { 0x02, 0, 0, 0, 0, 0x01 };
+	const uint8_t NEW[6] = { 0x02, 0, 0, 0, 0, 0x02 };
+	const uint8_t OTH[6] = { 0x02, 0, 0, 0, 0, 0x03 };
+	uint32_t P = 21, Q = 0;
+	uint8_t mo[6];
+
+	if (r2dp_nh_init(&t, "nh_life", 0, NULL, SOCKET_ID_ANY)) {
+		CHECK(0, "table init"); return;
+	}
+	t.wanted = want_cb;
+	/* a different peer sharing P's outstanding bucket */
+	for (uint32_t c = P + 1; !Q; c++)
+		if (((c * 2654435761u) >> 22) == ((P * 2654435761u) >> 22))
+			Q = c;
+	CHECK(r2dp_nh_learn(&t, P, NEW) == 1, "peer learned");
+	rte_spinlock_lock(&t.lock);
+	CHECK(r2dp_nh_learn(&t, P, OLD) == 4 && r2dp_nh_learn(&t, Q, OTH) == 4,
+	    "old-lifetime learn and a same-bucket peer queued");
+	rte_spinlock_unlock(&t.lock);
+	CHECK(r2dp_nh_del(&t, P) == 1 && t.ntomb == 1,
+	    "delete with a learn still queued leaves a tombstone");
+	/* the address is a tunnel peer again before maintenance runs */
+	r2dp_nh_maint(&t);
+	CHECK(!r2dp_nh_lookup(&t, P, mo), "old-lifetime MAC not resurrected");
+	CHECK(r2dp_nh_lookup(&t, Q, mo) && !memcmp(mo, OTH, 6),
+	    "same-bucket peer's queued learn still applied (no collateral loss)");
+	CHECK(t.n_stale == 1 && t.ntomb == 0 && obucket_sum(&t) == 0,
+	    "stale learn counted, tombstones pruned once drained");
+	CHECK(r2dp_nh_learn(&t, P, NEW) == 1 && r2dp_nh_lookup(&t, P, mo) &&
+	    !memcmp(mo, NEW, 6), "new lifetime learns its own MAC");
+	/* a learn queued AFTER the delete belongs to the new lifetime */
+	r2dp_nh_del(&t, P);
+	rte_spinlock_lock(&t.lock);
+	r2dp_nh_learn(&t, P, NEW);
+	rte_spinlock_unlock(&t.lock);
+	r2dp_nh_maint(&t);
+	CHECK(r2dp_nh_lookup(&t, P, mo) && !memcmp(mo, NEW, 6),
+	    "a learn queued after the delete is applied");
+	r2dp_nh_free(&t);
+}
+
 static void
 many(unsigned n)
 {
@@ -399,6 +454,7 @@ main(void)
 	}
 	basic();
 	ordering();
+	lifetimes();
 	many(65);
 	many(1000);
 	grow_alloc_failure();

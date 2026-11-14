@@ -3,6 +3,7 @@
  */
 #ifdef R2DP_HAVE_DPDK
 #include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -94,6 +95,9 @@ r2dp_nh_free(struct r2dp_nh_tab *t)
 	rte_hash_free(t->h);
 	rte_ring_free(t->req);
 	rte_free(t->pend);
+	free(t->tomb);
+	t->tomb = NULL;
+	t->ntomb = t->tomb_cap = 0;
 	t->h = NULL;
 	t->req = NULL;
 	t->pend = NULL;
@@ -142,6 +146,7 @@ static inline void
 nh_resolved(struct r2dp_nh_tab *t, uint32_t ip)
 {
 	__atomic_fetch_sub(nh_obucket(t, ip), 1, __ATOMIC_RELEASE);
+	__atomic_fetch_sub(&t->nout, 1, __ATOMIC_RELEASE);
 }
 
 static int
@@ -150,8 +155,12 @@ nh_enqueue(struct r2dp_nh_tab *t, uint32_t ip, uint64_t m)
 	struct r2dp_nh_req q = { .ip = ip, .mac = m };
 
 	/* count it before it is visible, so a later learn of this peer
-	 * sees it and queues behind it rather than writing past it */
-	__atomic_fetch_add(nh_obucket(t, ip), 1, __ATOMIC_ACQ_REL);
+	 * sees it and queues behind it rather than writing past it; then
+	 * stamp it with the delete sequence (r2dp_nh_del orders the other
+	 * way round, so one of the two always sees the other) */
+	__atomic_fetch_add(&t->nout, 1, __ATOMIC_SEQ_CST);
+	__atomic_fetch_add(nh_obucket(t, ip), 1, __ATOMIC_SEQ_CST);
+	q.dseq = __atomic_load_n(&t->dseq, __ATOMIC_SEQ_CST);
 	if (rte_ring_mp_enqueue_elem(t->req, &q, sizeof(q)) == 0)
 		return 4;
 	nh_resolved(t, ip);
@@ -191,6 +200,30 @@ r2dp_nh_del(struct r2dp_nh_tab *t, uint32_t ip)
 	int ret = 0;
 
 	rte_spinlock_lock(&t->lock);
+	{
+		/* Learns of ip still in the ring are from the lifetime being
+		 * deleted: leave a tombstone so maintenance discards them even
+		 * if ip is a wanted peer again by then (NH-3).  If the
+		 * tombstone cannot be stored, discard every learn queued
+		 * before now for this bucket instead (never resurrect). */
+		uint32_t ds = __atomic_add_fetch(&t->dseq, 1, __ATOMIC_SEQ_CST);
+		if (__atomic_load_n(nh_obucket(t, ip), __ATOMIC_SEQ_CST)) {
+			if (t->ntomb == t->tomb_cap) {
+				uint32_t nc = t->tomb_cap ? t->tomb_cap * 2 : 16;
+				void *nt = realloc(t->tomb, nc * sizeof(*t->tomb));
+				if (nt) {
+					t->tomb = nt;
+					t->tomb_cap = nc;
+				}
+			}
+			if (t->ntomb < t->tomb_cap)
+				t->tomb[t->ntomb++] = (struct r2dp_nh_tomb){ ip, ds };
+			else {
+				t->tomb_all = ds;
+				t->tomb_all_set = 1;
+			}
+		}
+	}
 	d = t->h ? rte_hash_del_key(t->h, &ip) : -ENOENT;
 	if (d >= 0) {
 		/* LF tables never free on delete: with QSBR the slot is
@@ -251,6 +284,38 @@ nh_grow(struct r2dp_nh_tab *t, uint32_t *ncap)
 	return NULL;
 }
 
+/* Wrap-safe "a happened before b" on the delete sequence. */
+static inline int
+nh_before(uint32_t a, uint32_t b)
+{
+	return (int32_t)(a - b) < 0;
+}
+
+/* Is a dequeued learn from a lifetime of its peer that was deleted after
+ * it was queued?  (t->lock held.) */
+static int
+nh_stale(const struct r2dp_nh_tab *t, const struct r2dp_nh_req *q)
+{
+	if (t->tomb_all_set && nh_before(q->dseq, t->tomb_all))
+		return 1;
+	for (uint32_t i = 0; i < t->ntomb; i++)
+		if (t->tomb[i].ip == q->ip && nh_before(q->dseq, t->tomb[i].dseq))
+			return 1;
+	return 0;
+}
+
+/* Tombstones matter only while some learn is queued or pending; once
+ * nothing is outstanding (a producer counts itself before it reads dseq)
+ * no older learn can still arrive.  t->lock held. */
+static void
+nh_tomb_prune(struct r2dp_nh_tab *t)
+{
+	if (__atomic_load_n(&t->nout, __ATOMIC_SEQ_CST))
+		return;
+	t->ntomb = 0;
+	t->tomb_all_set = 0;
+}
+
 void
 r2dp_nh_maint(struct r2dp_nh_tab *t)
 {
@@ -266,6 +331,11 @@ r2dp_nh_maint(struct r2dp_nh_tab *t)
 	    RTE_DIM(q), NULL)) != 0)
 		for (unsigned j = 0; j < nq; j++) {
 			uint32_t i;
+			if (nh_stale(t, &q[j])) {
+				t->n_stale++;
+				nh_resolved(t, q[j].ip);
+				continue;
+			}
 			if (t->wanted && !t->wanted(t->wanted_arg, q[j].ip)) {
 				t->n_unwanted++;
 				nh_resolved(t, q[j].ip);
@@ -311,6 +381,7 @@ r2dp_nh_maint(struct r2dp_nh_tab *t)
 		if (!t->npend || old)
 			break;
 	}
+	nh_tomb_prune(t);
 	rte_spinlock_unlock(&t->lock);
 	if (old) {
 		/* readers that loaded the old pointer finish with it before
