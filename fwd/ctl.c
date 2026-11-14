@@ -804,6 +804,9 @@ fwd_ctl_run(struct fwd_ctl *c, const char *sockpath)
 
 	if (lfd < 0) {
 		fprintf(stderr, "r2dp: listen %s: %s\n", sockpath, strerror(-lfd));
+		/* the dataplane may already be running: stop its workers */
+		if (C->dp.ops && C->dp.ops->stop)
+			C->dp.ops->stop(&C->dp);
 		return -1;
 	}
 	fprintf(stderr, "r2dp: serving %s (epoch=%llu)\n", sockpath,

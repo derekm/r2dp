@@ -150,6 +150,9 @@ main(int argc, char **argv)
 	}
 	free(eal_base);   /* rte_eal_init advanced eal_argv; free the calloc base */
 
-	fwd_ctl_run(&ctl, sockpath);
+	/* A control socket that cannot be served is a failed start: exit
+	 * non-zero so a supervisor sees it (CONFIG CF1). */
+	if (fwd_ctl_run(&ctl, sockpath) < 0)
+		return 1;
 	return 0;
 }

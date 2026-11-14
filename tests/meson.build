@@ -162,3 +162,10 @@ test('kfwd_test',
   args: [r2dp_fwd.full_path(), r2dpctl.full_path()],
   depends: [r2dp_fwd, r2dpctl],
   is_parallel: false)
+
+# r2dp-fwd start-up exit status: bad -n / socket path / EAL config is fatal.
+test('fwd_cli',
+  find_program('fwd_cli_test.sh'),
+  args: [r2dp_fwd.full_path()],
+  depends: [r2dp_fwd],
+  is_parallel: false, timeout: 60)
