@@ -166,6 +166,19 @@ sess_create(struct dpdk_priv *d, struct rte_crypto_sym_xform *x)
 	return rte_cryptodev_sym_session_create(d->cdev_id, x, mp);
 }
 
+/* SAD keys are the 4-byte-aligned (spi, dip) head of rte_ipsec_sadv4_key;
+ * rte_hash_crc in DPDK 23.11 reads them with a direct 8-byte load, which
+ * is misaligned (UBSan) -- copy the key out first. */
+static uint32_t
+dp_sad_hash(const void *key, uint32_t len, uint32_t init)
+{
+	uint64_t v;
+
+	(void)len;      /* always DP_SAD_KEY_LEN */
+	memcpy(&v, key, sizeof(v));
+	return rte_hash_crc_8byte(v, init);
+}
+
 struct rte_hash *
 dp_sad_create(const char *name, uint32_t cap)
 {
@@ -175,7 +188,7 @@ dp_sad_create(const char *name, uint32_t cap)
 	hp.name = name;
 	hp.entries = cap < 8 ? 8 : cap;
 	hp.key_len = DP_SAD_KEY_LEN;
-	hp.hash_func = rte_hash_crc;
+	hp.hash_func = dp_sad_hash;
 	hp.socket_id = SOCKET_ID_ANY;
 	hp.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF |
 	    RTE_HASH_EXTRA_FLAGS_EXT_TABLE;
