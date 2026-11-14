@@ -70,14 +70,11 @@ natt_class(const uint8_t *p, uint32_t len)
 /* RFC 4303 s3.4.3 / App. A anti-replay on an authenticated packet's 32-bit
  * sequence number: 1 = accept (and record), 0 = replay / too old.  A zero
  * window means the SA was installed with anti-replay disabled. */
-int
-replay_accept(struct dp_sa *ds, uint32_t lo)
+static uint64_t
+replay_sqn(const struct dp_sa *ds, uint32_t lo)
 {
 	uint64_t t = ds->rp_top, sqn = lo;
 	uint32_t w = ds->rp_w, tl = (uint32_t)t;
-
-	if (!w)
-		return 1;
 
 	if (ds->rp_esn) {                /* RFC 4303 App. A2.2 reconstruction */
 		uint64_t hi = t >> 32;
@@ -88,6 +85,33 @@ replay_accept(struct dp_sa *ds, uint32_t lo)
 		}
 		sqn = (hi << 32) | lo;
 	}
+	return sqn;
+}
+
+/* Read-only: 1 if our window already refuses lo (zero, too old or seen).
+ * Used to give prepare-stage rejections their real reason. */
+static int
+replay_refused(const struct dp_sa *ds, uint32_t lo)
+{
+	uint64_t t = ds->rp_top, sqn;
+
+	if (!ds->rp_w)
+		return 0;
+	sqn = replay_sqn(ds, lo);
+	return sqn == 0 || (sqn <= t && (t - sqn >= ds->rp_w ||
+	    (ds->rp_map[(sqn % RP_BITS) / 64] & (1ull << (sqn % 64)))));
+}
+
+int
+replay_accept(struct dp_sa *ds, uint32_t lo)
+{
+	uint64_t t = ds->rp_top, sqn;
+	uint32_t w = ds->rp_w;
+
+	if (!w)
+		return 1;
+
+	sqn = replay_sqn(ds, lo);
 	if (sqn == 0)
 		return 0;
 	if (sqn > t) {                   /* advance: clear the slots passed over */
@@ -180,8 +204,15 @@ crypto_run(struct dp_wk *w, struct rte_ipsec_session *ss,
 	 * lksd_none_cop_prepare), so no attach pass of our own; it moves the
 	 * mbufs it rejected to the tail */
 	k = rte_ipsec_pkt_crypto_prepare(ss, mb, cop, n);
+	ds = rp && k < n ? sa_of_sess(d, ss) : NULL;
 	for (uint16_t i = k; i < n; i++) {
-		DROP(w, DR_IPSEC_REJECT, 1);
+		/* librte_ipsec's own inbound window may refuse a duplicate
+		 * here, before ours sees it; count it as the replay it is
+		 * whichever window caught it (COMMITS C11). */
+		const struct rte_esp_hdr *eh = ds ? rte_pktmbuf_mtod_offset(mb[i],
+		    const struct rte_esp_hdr *, mb[i]->l2_len + mb[i]->l3_len) : NULL;
+		DROP(w, eh && replay_refused(ds, rte_be_to_cpu_32(eh->seq)) ?
+		    DR_REPLAY : DR_IPSEC_REJECT, 1);
 		rte_pktmbuf_free(mb[i]);
 	}
 	enq = k ? rte_cryptodev_enqueue_burst(d->cdev_id, w->cqp, cop, k) : 0;
