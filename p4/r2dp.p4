@@ -1,181 +1,277 @@
-/* r2dp P4 backend — first behavior (PNA arch, p4c --target dpdk --arch pna).
+/* r2dp P4 backend — first behavior (PNA arch on p4c '--target dpdk').
  *
- * This models the SWX pipeline engine that DPDK already builds (examples/
- * pipeline/examples/ipsec.spec + rte_swx_ipsec), expressed as a portable PNA
- * program so the same source can compile to the DPDK soft-switch now and, once
- * the P4 abstraction is kept, to a switch ASIC later.
+ * Modeled on p4c's own backends/dpdk/examples/ipsec.p4, which is the canonical
+ * PNA IPsec program for the DPDK soft-switch (rte_swx_pipeline + the
+ * rte_swx_ipsec extern).  It expresses the same SPD/SAD behaviour as the r2dp
+ * DPDK backend (fwd/dp_dpdk.c) behind the same r2dp socket: inbound ESP ->
+ * SAD (dst, spi) -> ipsec extern decap; outbound -> SPD -> ipsec extern encap;
+ * bypass/discard otherwise.  The same source can later target a switch ASIC
+ * once the P4 abstraction is kept (see p4/PLAN.md).
  *
- * The SWX ipsec block (rte_swx_ipsec) does the actual ESP crypto + replay and
- * is driven solely by an sa_id written into the ipsec_internal header; the
- * tables below classify and select that sa_id / policy, exactly mirroring the
- * vtable contract (fwd_dp_ops) the DPDK backend already satisfies.
- *
- * NOTE: this is the source-of-truth .p4; compiling it needs p4c (not installed
- * on .179 — see p4/PLAN.md §3).  The loadable artifact for today is emitted
- * from the hand-written .spec path, which this program documents/derives from.
+ * The tables below are populated from the r2dp control plane (SA_ADD/SP_ADD ->
+ * rte_swx_ctl_* table entries + rte_swx_ipsec_sa_add), exactly mapping
+ * fwd_dp_ops: sa_add/sp_add/sa_del/sp_del/start/stop (see fwd/dp.h).
  */
 #include <core.p4>
-#include <pna.p4>
+#include <dpdk/pna.p4>
 
-/* -------------------------------------------------------------------- */
-/* Let the outer parse accept either raw IPv4 or IPv4-in-UDP carrying ESP */
-/* -------------------------------------------------------------------- */
-header ethernet_h {
+// Direction: the NIC reports whether a frame arrived from the wire (NET_TO_HOST
+// == inbound / decrypt) or is being transmitted (HOST_TO_NET == outbound /
+// encrypt).  Both legs live in the one control block, split on this.
+#define inbound(meta)  (istd.direction == PNA_Direction_t.NET_TO_HOST)
+#define outbound(meta) (istd.direction == PNA_Direction_t.HOST_TO_NET)
+
+// ------------------------------------------------------------------ headers
+header ethernet_t {
     bit<48> dst_addr;
     bit<48> src_addr;
-    bit<16> ethertype;
+    bit<16> ether_type;
 }
 
-header ipv4_h {
+#define ETHERNET_ETHERTYPE_IPV4 0x0800
+
+header ipv4_t {
     bit<4>  version;
     bit<4>  ihl;
-    bit<8>  diffserv;
-    bit<16> total_len;
+    bit<6>  dscp;
+    bit<2>  ecn;
+    bit<16> total_length;
     bit<16> identification;
     bit<3>  flags;
-    bit<13> frag_offset;
+    bit<13> fragment_offset;
     bit<8>  ttl;
     bit<8>  protocol;
-    bit<16> hdr_checksum;
+    bit<16> header_checksum;
     bit<32> src_addr;
     bit<32> dst_addr;
 }
 
-header udp_h {
+#define IP_PROTOCOL_ESP 0x32
+#define IP_PROTOCOL_UDP 0x11
+
+// ESP-in-UDP (NAT-T): the outer UDP header carries ESP on UDP/4500.
+header udp_t {
     bit<16> src_port;
     bit<16> dst_port;
     bit<16> length;
     bit<16> checksum;
 }
 
-header esp_h {
+#define UDP_DST_ESP 4500
+
+header esp_t {
     bit<32> spi;
     bit<32> seq;
 }
 
-/* The SWX ipsec extern's side-band: written by the ingress table to name the
- * SA the block must run against; consumed off the data plane. */
-header ipsec_internal_h {
-    bit<32> sa_id;
-}
-
 struct headers_t {
-    ethernet_h        ethernet;
-    ipv4_h            ipv4;
-    udp_h             udp;
-    esp_h             esp;
-    ipsec_internal_h  ipsec_internal;
+    ethernet_t ethernet;
+    ipv4_t     ipv4;
+    udp_t      udp;
+    esp_t      esp;
 }
 
+// ----------------------------------------------------------------- metadata
 struct metadata_t {
-    bit<32> port_in;
-    bit<32> port_out;
-
-    bit<32> src_addr;
-    bit<32> dst_addr;
-    bit<8>  protocol;
-    bit<16> src_port;
-    bit<16> dst_port;
+    bit<32> next_hop_id;
+    bit<32> bypass;    /* 1 = forward clear (IKE/plaintext), not IPSEC */
 }
 
-parser r2dp_parser(packet_in pkt, out headers_t hdr, inout metadata_t meta,
-                   in pna_main_parser_input_metadata_t istd) {
+// ------------------------------------------------------------------ extern
+ipsec_accelerator() ipsec;
+
+// ------------------------------------------------------------------ parser
+parser MainParserImpl(packet_in pkt, out headers_t hdrs, inout metadata_t meta,
+                      in pna_main_parser_input_metadata_t istd) {
+    bool from_ipsec;
+    ipsec_status status;
+
     state start {
-        pkt.extract(hdr.ethernet);
-        transition select(hdr.ethernet.ethertype) {
-            0x0800: parse_ipv4;
-            default: accept;
+        from_ipsec = ipsec.from_ipsec(status);
+        transition select(from_ipsec) {
+            true   : parse_ipv4;       /* post-decrypt inner packet */
+            default: parse_ethernet;   /* wire frame */
         }
     }
+
+    state parse_ethernet {
+        pkt.extract(hdrs.ethernet);
+        transition select(hdrs.ethernet.ether_type) {
+            ETHERNET_ETHERTYPE_IPV4 : parse_ipv4;
+            default                 : accept;
+        }
+    }
+
     state parse_ipv4 {
-        pkt.extract(hdr.ipv4);
-        meta.src_addr = hdr.ipv4.src_addr;
-        meta.dst_addr = hdr.ipv4.dst_addr;
-        meta.protocol = hdr.ipv4.protocol;
-        transition select(hdr.ipv4.protocol) {
-            50:  parse_esp;        /* ESP over IPv4 */
-            17:  parse_udp;        /* ESP-in-UDP (NAT-T) */
-            default: accept;       /* IKE / ARP / cleartext -> exception */
+        pkt.extract(hdrs.ipv4);
+        transition select(hdrs.ipv4.protocol) {
+            IP_PROTOCOL_ESP : parse_esp;
+            IP_PROTOCOL_UDP : parse_udp;
+            default         : accept;
         }
     }
+
     state parse_udp {
-        pkt.extract(hdr.udp);
-        meta.src_port = hdr.udp.src_port;
-        meta.dst_port = hdr.udp.dst_port;
-        transition select(hdr.udp.dst_port) {
-            4500: parse_esp;       /* IKE/ESP floats to 4500 under NAT-T */
-            default: accept;
+        pkt.extract(hdrs.udp);
+        transition select(hdrs.udp.dst_port) {
+            UDP_DST_ESP : parse_esp;   /* NAT-T ESP on 4500 */
+            default     : accept;      /* IKE / plaintext UDP */
         }
     }
+
     state parse_esp {
-        pkt.extract(hdr.esp);
-        accept;
+        pkt.extract(hdrs.esp);
+        transition accept;
     }
 }
 
-control r2dp_ingress(inout headers_t hdr, inout metadata_t meta,
-                     in pna_main_parser_input_metadata_t istd,
-                     inout pna_main_input_metadata_t imeta,
-                     inout pna_main_output_metadata_t ometa) {
+// ---------------------------------------------------------------- precontrol
+control PreControlImpl(in headers_t hdr, inout metadata_t meta,
+                       in pna_pre_input_metadata_t istd,
+                       inout pna_pre_output_metadata_t ostd) {
+    apply { }
+}
 
-    /* Inbound SAD: (spi, outer dst) -> the inbound SA, whose sa_id the ipsec
-     * extern runs.  A miss is NoAction (drop), matching DR_NO_SA_IN. */
-    action SAD_HIT(bit<32> sa_id) {
-        hdr.ipsec_internal.setValid();
-        hdr.ipsec_internal.sa_id = sa_id;
-        meta.port_out = 1;           /* decrypted inner exits the inner net */
+// ------------------------------------------------------------ main control
+control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
+                        in pna_main_input_metadata_t istd,
+                        inout pna_main_output_metadata_t ostd) {
+
+    action ipsec_enable(bit<32> sa_index) {
+        ipsec.enable();
+        ipsec.set_sa_index<bit<32>>(sa_index);
+        hdrs.ethernet.setInvalid();
     }
-    table sad {
-        key = {
-            hdr.esp.spi      : exact;
-            hdr.ipv4.dst_addr: exact;
-        }
-        actions = { SAD_HIT; NoAction; }
-        const default_action = NoAction();
+    action ipsec_bypass() {
+        meta.bypass = 1;
+        ipsec.disable();
+    }
+    action drop() {
+        drop_packet();
     }
 
-    /* SPD (egress / exception): bind the OUT PROTECT policy to its egress SA,
-     * or bypass (IKE/clear), or discard.  Mirrors SP_ADD/SP_DEL -> the
-     * policy_table in DPDK's ipsec.spec. */
-    action SPD_PROTECT(bit<32> sa_id) {
-        hdr.ipsec_internal.setValid();
-        hdr.ipsec_internal.sa_id = sa_id;
-        meta.port_out = 0;           /* encrypted egress on the outer net */
-    }
-    action SPD_BYPASS() {
-        meta.port_out = 1;           /* forward clear on the inner net */
-    }
-    action SPD_DISCARD() {
-        mark_to_drop(istd, imeta);
-    }
-    table spd {
+    /* Inbound SAD: (outer dst, esp spi) -> the SA the ipsec extern decrypts
+     * with.  A miss drops (DR_NO_SA_IN). */
+    table inbound_table {
         key = {
-            meta.src_addr : exact;
-            meta.dst_addr : exact;
-            meta.protocol : exact;
-            meta.src_port : ternary;
-            meta.dst_port : ternary;
+            hdrs.ipv4.dst_addr : exact;
+            hdrs.esp.spi       : exact;
         }
-        actions = { SPD_PROTECT; SPD_BYPASS; SPD_DISCARD; }
-        const default_action = SPD_BYPASS();
+        actions = { ipsec_enable; ipsec_bypass; drop; }
+        const default_action = drop;
+    }
+
+    /* SPD (outbound): bind the OUT PROTECT policy (selector -> egress SA) or
+     * bypass/discard.  Mirrors SP_ADD/SP_DEL -> policy_table in ipsec.spec. */
+    action ipsec_protect(bit<32> sa_index) {
+        ipsec.enable();
+        ipsec.set_sa_index<bit<32>>(sa_index);
+        hdrs.ethernet.setInvalid();
+    }
+    action spd_bypass() {
+        meta.bypass = 1;
+        ipsec.disable();
+    }
+    action spd_discard() {
+        drop_packet();
+    }
+    table outbound_table {
+        key = {
+            hdrs.ipv4.src_addr : exact;
+            hdrs.ipv4.dst_addr : exact;
+            hdrs.ipv4.protocol : exact;
+        }
+        actions = { ipsec_protect; spd_bypass; spd_discard; drop; }
+        const default_action = spd_bypass;
+    }
+
+    /* Routing / next hop: send the (possibly IPSEC-processed) frame out the
+     * right port with the outer L2 header.  port 0 = outer (encrypted) net,
+     * port 1 = inner (plaintext) net; the runtime maps this to a ring/port. */
+    action next_hop_set(bit<48> dst_addr, bit<48> src_addr,
+                        bit<16> ether_type, bit<32> port_id) {
+        hdrs.ethernet.setValid();
+        hdrs.ethernet.dst_addr   = dst_addr;
+        hdrs.ethernet.src_addr   = src_addr;
+        hdrs.ethernet.ether_type = ether_type;
+        send_to_port((PortId_t)port_id);
+    }
+    action next_hop_id_set(bit<32> next_hop_id) {
+        meta.next_hop_id = next_hop_id;
+    }
+    table routing_table {
+        key = { hdrs.ipv4.dst_addr : lpm; }
+        actions = { next_hop_id_set; drop; }
+        const default_action = next_hop_id_set(0);
+    }
+    table next_hop_table {
+        key = { meta.next_hop_id : exact; }
+        actions = { next_hop_set; drop; }
+        const default_action = drop;
     }
 
     apply {
-        if (hdr.esp.isValid())
-            sad.apply();             /* inbound: SAD -> ipsec extern */
-        else
-            spd.apply();             /* egress/exception: SPD decision  */
+        if (inbound(meta)) {
+            ipsec_status status;
+
+            if (!ipsec.from_ipsec(status)) {
+                // Pre-decrypt: an inbound ESP frame -> SAD -> ipsec extern.
+                if (hdrs.ipv4.isValid() && hdrs.esp.isValid()) {
+                    inbound_table.apply();
+                    if (meta.bypass) {
+                        routing_table.apply();
+                        next_hop_table.apply();
+                    }
+                    // else: ipsec extern consumes the frame (decrypt).
+                } else {
+                    drop_packet();
+                }
+            } else {
+                // Post-decrypt: the plaintext inner exits on the inner net.
+                if (status == ipsec_status.IPSEC_SUCCESS) {
+                    routing_table.apply();
+                    next_hop_table.apply();
+                } else {
+                    drop_packet();       /* crypto / replay failure */
+                }
+            }
+        } else {
+            // Outbound (egress): SPD -> encrypt if PROTECT, else clear.
+            ipsec_status status;
+
+            if (!ipsec.from_ipsec(status)) {
+                if (hdrs.ipv4.isValid()) {
+                    outbound_table.apply();
+                    if (meta.bypass) {
+                        routing_table.apply();
+                        next_hop_table.apply();
+                    }
+                } else {
+                    drop_packet();
+                }
+            } else {
+                // Post-encrypt: give the outer frame its L2 + port.
+                if (status == ipsec_status.IPSEC_SUCCESS) {
+                    routing_table.apply();
+                    next_hop_table.apply();
+                } else {
+                    drop_packet();
+                }
+            }
+        }
     }
 }
 
-control r2dp_deparser(packet_out pkt, inout headers_t hdr) {
+// -------------------------------------------------------------- deparser
+control MainDeparserImpl(packet_out pkt, in headers_t hdrs, in metadata_t meta,
+                         in pna_main_output_metadata_t ostd) {
     apply {
-        pkt.emit(hdr.ethernet);
-        pkt.emit(hdr.ipv4);
-        pkt.emit(hdr.udp);
-        pkt.emit(hdr.esp);
-        pkt.emit(hdr.ipsec_internal);
+        pkt.emit(hdrs.ethernet);
+        pkt.emit(hdrs.ipv4);
+        pkt.emit(hdrs.udp);
+        pkt.emit(hdrs.esp);
     }
 }
 
-PNA_Main(r2dp_parser(), r2dp_ingress(), r2dp_deparser(), pna_main_imem_t(), pna_main_emem_t());
+// ------------------------------------------------------------------ package
+PNA_NIC(MainParserImpl(), PreControlImpl(), MainControlImpl(), MainDeparserImpl()) main;
