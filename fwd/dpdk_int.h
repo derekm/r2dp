@@ -147,7 +147,7 @@ enum dp_drop {
 	DR_CRYPTO_FAIL,     /* crypto op failed: ICV/auth failure, PMD error */
 	DR_REPLAY,          /* authenticated, but a replay or left of the window */
 	DR_IPSEC_REJECT,    /* rte_ipsec prepare/process rejected (window, ...) */
-	DR_CRYPTO_ENQ,      /* cryptodev queue full */
+	DR_CRYPTO_ENQ,      /* cryptodev queue full past the spin budget */
 	DR_NOMEM,           /* op pool, headroom, output array */
 	DR_NO_NEXTHOP,      /* egress ESP with no learned peer MAC */
 	DR_CLEAR_OUTER,     /* non-IKE/ARP cleartext on the outer side */
@@ -335,6 +335,9 @@ struct dpdk_priv {
 	/* Test hooks: cryptodev dequeue override and the drain spin bound
 	 * (NULL / 0 = rte_cryptodev_dequeue_burst / DP_CRYPTO_SPIN_DEFAULT). */
 	uint16_t (*cdeq)(uint8_t dev, uint16_t qp, struct rte_crypto_op **ops,
+	    uint16_t n);
+	/* Test hook: cryptodev enqueue override (NULL = enqueue_burst). */
+	uint16_t (*cenq)(uint8_t dev, uint16_t qp, struct rte_crypto_op **ops,
 	    uint16_t n);
 	uint32_t            spin_max;
 };

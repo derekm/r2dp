@@ -21,6 +21,24 @@ test_deq(uint8_t dev, uint16_t qp, struct rte_crypto_op **ops, uint16_t n)
 	return deq_stuck ? 0 : rte_cryptodev_dequeue_burst(dev, qp, ops, n);
 }
 
+/* A queue pair under back-pressure: each call accepts at most the next
+ * entry of enq_plan[] (then everything); enq_full refuses every op. */
+static int enq_full;
+static const uint16_t *enq_plan;
+static unsigned enq_plan_n, enq_calls;
+
+static uint16_t
+test_enq(uint8_t dev, uint16_t qp, struct rte_crypto_op **ops, uint16_t n)
+{
+	unsigned c = enq_calls++;
+
+	if (enq_full)
+		return 0;
+	if (enq_plan && c < enq_plan_n && enq_plan[c] < n)
+		n = enq_plan[c];
+	return n ? rte_cryptodev_enqueue_burst(dev, qp, ops, n) : 0;
+}
+
 static int fails;
 #define CHECK(c, m) do { if (c) printf("ok   %s\n", m); \
 	else { printf("FAIL %s\n", m); fails++; } } while (0)
@@ -44,6 +62,7 @@ mk_priv(const char *tag)
 	d->cdev_id = (uint8_t)cdev;
 	d->have_cdev = 1;
 	d->cdeq = test_deq;
+	d->cenq = test_enq;
 	d->spin_max = 1000;
 	snprintf(n, sizeof(n), "%s_sess", tag);
 	d->sess_mp = rte_cryptodev_sym_session_pool_create(n, 64,
@@ -500,6 +519,70 @@ main(void)
 			rte_pktmbuf_free(dec[k]);
 		}
 		CHECK(good, "burst: decrypted in order, byte-identical");
+	}
+
+	/* Back-pressure (CRYPTOQ CQ1): a queue pair that takes nothing, then
+	 * part of the burst, must not lose packets; they go out in sequence
+	 * order and decrypt byte-identical, and every op and mbuf returns.
+	 * A queue pair that stays full sheds the burst, counted, leak-free. */
+	{
+		enum { N = 16 };
+		static const uint16_t plan[] = { 0, 3, 0, 0, 5, 1 };
+		static uint8_t w[N][64];
+		struct rte_mbuf *in[N], *esp[N], *dec[BURST_SZ];
+		uint16_t nout = 0, nb = 0, ndec = 0, good = 1, inorder = 1;
+		uint64_t enqd = a->wk[0].n_dropr[DR_CRYPTO_ENQ];
+		unsigned cops = rte_mempool_avail_count(a->cop_mp);
+		unsigned mbs = rte_mempool_avail_count(mp);
+		uint32_t prev = 0;
+
+		for (int k = 0; k < N; k++) {
+			char src[32];
+			snprintf(src, sizeof(src), "10.0.1.%d", k + 1);
+			in[k] = inner_frame(src, "10.0.2.5", 17, 2000 + k, w[k]);
+		}
+		enq_plan = plan; enq_plan_n = RTE_DIM(plan); enq_calls = 0;
+		esp_outbound(&a->wk[0], in, N, esp, &nout, &nb);
+		enq_plan = NULL;
+		CHECK(nout == N && a->wk[0].n_dropr[DR_CRYPTO_ENQ] == enqd &&
+		    enq_calls > RTE_DIM(plan) - 1,
+		    "back-pressure: partial enqueues retried, no packet lost");
+		for (int k = 0; k < N; k++)
+			if (in[k]) rte_pktmbuf_free(in[k]);
+		for (uint16_t k = 0; k < nout; k++) {
+			const uint8_t *e = rte_pktmbuf_mtod(esp[k], const uint8_t *);
+			uint32_t sq = (uint32_t)e[24] << 24 | (uint32_t)e[25] << 16 |
+			    (uint32_t)e[26] << 8 | e[27];   /* ESP seq after IPv4 20 + SPI 4 */
+			if (sq <= prev) inorder = 0;
+			prev = sq;
+			uint8_t *f = (uint8_t *)rte_pktmbuf_prepend(esp[k], 14);
+			memset(f, 0, 14); f[12] = 0x08;
+		}
+		CHECK(inorder, "back-pressure: sequence numbers leave in order");
+		esp_inbound(&b->wk[0], esp, nout, dec, &ndec);
+		for (uint16_t k = 0; k < ndec; k++) {
+			if (k >= N || memcmp(rte_pktmbuf_mtod(dec[k], uint8_t *), w[k], 64))
+				good = 0;
+			rte_pktmbuf_free(dec[k]);
+		}
+		CHECK(ndec == N && good, "back-pressure: all decrypt in order, byte-identical");
+
+		for (int k = 0; k < 4; k++) {
+			char src[32];
+			snprintf(src, sizeof(src), "10.0.1.%d", k + 1);
+			in[k] = inner_frame(src, "10.0.2.5", 17, 3000 + k, w[k]);
+		}
+		enq_full = 1; nout = nb = 0;
+		esp_outbound(&a->wk[0], in, 4, esp, &nout, &nb);
+		enq_full = 0;
+		for (int k = 0; k < 4; k++)
+			if (in[k]) rte_pktmbuf_free(in[k]);
+		CHECK(nout == 0 && a->wk[0].n_dropr[DR_CRYPTO_ENQ] == enqd + 4 &&
+		    a->wk[0].cq_stale == 0,
+		    "queue pair stays full: burst shed and counted, nothing quarantined");
+		CHECK(rte_mempool_avail_count(a->cop_mp) == cops &&
+		    rte_mempool_avail_count(mp) == mbs,
+		    "back-pressure: no crypto op or mbuf leaked");
 	}
 
 	/* port-specific DISCARD (TCP/23) overrides the covering PROTECT */

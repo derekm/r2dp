@@ -151,6 +151,16 @@ crypto_deq(struct dp_wk *w, struct rte_crypto_op **ops, uint16_t n)
 	return rte_cryptodev_dequeue_burst(d->cdev_id, w->cqp, ops, n);
 }
 
+static inline uint16_t
+crypto_enq(struct dp_wk *w, struct rte_crypto_op **ops, uint16_t n)
+{
+	struct dpdk_priv *d = w->d;
+
+	if (unlikely(d->cenq != NULL))
+		return d->cenq(d->cdev_id, w->cqp, ops, n);
+	return rte_cryptodev_enqueue_burst(d->cdev_id, w->cqp, ops, n);
+}
+
 /* Reclaim ops a stuck device has since completed: their packets belong to
  * an abandoned batch (already counted as dropped), so free them.  Returns
  * the number still outstanding. */
@@ -215,20 +225,41 @@ crypto_run(struct dp_wk *w, struct rte_ipsec_session *ss,
 		    DR_REPLAY : DR_IPSEC_REJECT, 1);
 		rte_pktmbuf_free(mb[i]);
 	}
-	enq = k ? rte_cryptodev_enqueue_burst(d->cdev_id, w->cqp, cop, k) : 0;
-	for (uint16_t i = enq; i < k; i++) {
-		DROP(w, DR_CRYPTO_ENQ, 1);
-		rte_pktmbuf_free(mb[i]);
-	}
-	if (enq < n)
-		rte_mempool_put_bulk(d->cop_mp, (void **)&cop[enq], n - enq);
-	/* own every op before touching any mbuf again (async PMDs) */
-	while (dq < enq) {
-		uint16_t got = crypto_deq(w, &cop[dq], enq - dq);
-		dq += got;
-		if (!got && ++spins > (d->spin_max ? d->spin_max : DP_CRYPTO_SPIN_DEFAULT))
+	if (k < n)
+		rte_mempool_put_bulk(d->cop_mp, (void **)&cop[k], n - k);
+	/* A full queue pair is back-pressure, not a verdict (CRYPTOQ CQ1):
+	 * re-offer the unaccepted tail, in order, while the device completes
+	 * what it took -- within the same bounded spin budget the drain
+	 * already uses, so the worker never waits unboundedly.  Outbound ops
+	 * already carry their sequence numbers and IVs; offering cop[enq..k)
+	 * strictly in order keeps them in order on the wire.  Dequeued ops
+	 * land in cop[dq..enq), slots the device already owns, never in the
+	 * not-yet-offered tail. */
+	enq = 0;
+	while (dq < k) {
+		uint16_t got = 0, put = 0;
+
+		if (enq < k) {
+			put = crypto_enq(w, &cop[enq], k - enq);
+			enq += put;
+		}
+		if (dq < enq) {
+			/* own every op before touching any mbuf again */
+			got = crypto_deq(w, &cop[dq], enq - dq);
+			dq += got;
+		}
+		if (!put && !got && ++spins > (d->spin_max ? d->spin_max :
+		    DP_CRYPTO_SPIN_DEFAULT))
 			break;
 	}
+	/* Never accepted within the budget: the queue pair stayed full.
+	 * Those ops are still ours; shed them, counted. */
+	for (uint16_t i = enq; i < k; i++) {
+		DROP(w, DR_CRYPTO_ENQ, 1);
+		rte_pktmbuf_free(cop[i]->sym->m_src);
+	}
+	if (enq < k)
+		rte_mempool_put_bulk(d->cop_mp, (void **)&cop[enq], k - enq);
 	if (dq < enq) {
 		/* Stuck device: the undequeued ops (and their mbufs) still belong
 		 * to it.  Quarantine them -- never back to cop_mp, never touched --
