@@ -185,7 +185,7 @@ crypto_enq(struct dp_wk *w, struct rte_crypto_op **ops, uint16_t n)
 /* Reclaim ops a stuck device has since completed: their packets belong to
  * an abandoned batch (already counted as dropped), so free them.  Returns
  * the number still outstanding. */
-static uint32_t
+uint32_t
 crypto_drain_stale(struct dp_wk *w)
 {
 	struct dpdk_priv *d = w->d;
@@ -200,6 +200,11 @@ crypto_drain_stale(struct dp_wk *w)
 			rte_pktmbuf_free(cop[i]->sym->m_src);
 		rte_mempool_put_bulk(d->cop_mp, (void **)cop, got);
 		w->cq_stale -= got;
+	}
+	if (!w->cq_stale && w->cq_stale_sa) {
+		/* the device holds nothing of this session any more */
+		__atomic_sub_fetch(&w->cq_stale_sa->pins, 1, __ATOMIC_RELEASE);
+		w->cq_stale_sa = NULL;
 	}
 	return w->cq_stale;
 }
@@ -285,6 +290,17 @@ crypto_run(struct dp_wk *w, struct rte_ipsec_session *ss,
 		/* Stuck device: the undequeued ops (and their mbufs) still belong
 		 * to it.  Quarantine them -- never back to cop_mp, never touched --
 		 * until crypto_drain_stale reclaims them. */
+		/* Pin the session too: the PMD may still dereference it
+		 * when it finally processes these ops, so the SA must not be
+		 * freed until they come back, whatever the grace period
+		 * says (WORKER W2).  cq_stale was 0 on entry (the gate
+		 * above), so one session at a time. */
+		if (!w->cq_stale_sa) {
+			w->cq_stale_sa = sa_of_sess(d, ss);
+			if (w->cq_stale_sa)
+				__atomic_add_fetch(&w->cq_stale_sa->pins, 1,
+				    __ATOMIC_RELEASE);
+		}
 		w->cq_stale += enq - dq;
 		w->n_crypto_stuck++;
 		DROP(w, DR_CRYPTO_STUCK, enq - dq);

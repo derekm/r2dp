@@ -111,6 +111,12 @@ struct dp_sa {
 	uint32_t           rp_w;     /* window (packets), 0 = off, <= RP_BITS */
 	uint8_t            rp_esn;   /* SA uses extended sequence numbers */
 	uint32_t           idx;      /* own slot number (sa_at(d, idx) == this) */
+	/* Crypto ops a stuck device still holds for this SA's session (one
+	 * per worker quarantine, worker-written).  A retired SA whose session
+	 * is pinned is not freed: it stays a zombie slot (ctl-only flag) until
+	 * the device has handed every op back (WORKER W2). */
+	uint32_t           pins;
+	uint8_t            zombie;
 };
 
 /* SPD entry mirror for the egress (outbound) worker: populated by dpd_sp_add/
@@ -190,6 +196,8 @@ struct dp_wk {
 	 * mbufs) before it enqueues anything new, so a late completion can
 	 * never be mistaken for the current batch. */
 	uint32_t            cq_stale;
+	struct dp_sa       *cq_stale_sa; /* the SA whose session cq_stale's ops
+	                              * use (pinned while cq_stale > 0) */
 	uint64_t            n_crypto_stuck;  /* times the device stopped completing */
 	uint64_t            n_natt_keepalive; /* RFC 3948 keepalives consumed */
 	uint64_t            n_misplaced; /* outer ESP that arrived on a queue
@@ -299,6 +307,7 @@ struct dpdk_priv {
 				       * workers acquire-load it */
 	uint32_t            sad_cap;  /* SAs it was sized for; 0 = fixed */
 	uint32_t            sad_n;    /* inbound SAs in it */
+	uint32_t            n_zombie; /* retired SA slots awaiting unpin (ctl) */
 	struct rte_cryptodev_info cdev_info;
 	uint8_t             cdev_id;
 	int                 have_cdev;
@@ -581,6 +590,15 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 uint16_t
 dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
     uint8_t t[], unsigned self);
+/* Reclaim a stuck device's late completions (worker; also polled while
+ * idle).  Returns the ops it still holds. */
+uint32_t
+crypto_drain_stale(struct dp_wk *w);
+/* Free retired SA slots whose sessions are no longer pinned (ctl, under
+ * d->lock). */
+void
+sa_reap(struct dpdk_priv *d);
+
 void
 dp_steer_inner(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
     uint8_t t[]);

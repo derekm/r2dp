@@ -642,6 +642,43 @@ main(void)
 		    "drops: stats dump names each reason");
 	}
 
+	/* A session a stuck device still holds outlives its SA's deletion
+	 * (WORKER W2): the slot stays a zombie, is not handed to a new SA,
+	 * and is freed only after the device returns the op -- which the
+	 * idle drain collects with no new traffic. */
+	{
+		static uint8_t w[64], g[64];
+		unsigned cops = rte_mempool_avail_count(a->cop_mp);
+		unsigned mbs = rte_mempool_avail_count(mp);
+		struct rte_mbuf *m;
+		struct dp_sa *x;
+		struct r2dp_sa r;
+
+		deq_stuck = 1;
+		m = inner_frame("10.0.1.5", "10.0.2.5", 1, 0, w);
+		(void)run(a, b, m, &enc, g);
+		x = a->wk[0].cq_stale_sa;
+		CHECK(x && x->pins == 1 && a->wk[0].cq_stale == 1,
+		    "stuck op pins its SA's session");
+		mk_sa(&r, 0x5001); r.dir = R2DP_DIR_OUT;
+		CHECK(sa_install(a, &r, NULL, 0, 1, 0) == 0 && x && x->zombie &&
+		    x->cses != NULL && !x->used && a->n_zombie == 1,
+		    "SA deleted under a pinned session: slot kept as a zombie, session alive");
+		CHECK(sa_install(a, &r, key, 20, 0, 0) == 0 && x && x->zombie &&
+		    x->cses != NULL, "a new SA does not take the zombie slot");
+		sa_reap(a);
+		CHECK(x && x->zombie && a->n_zombie == 1, "reap leaves a still-pinned zombie");
+		deq_stuck = 0;
+		CHECK(crypto_drain_stale(&a->wk[0]) == 0 && x && x->pins == 0 &&
+		    !a->wk[0].cq_stale_sa, "idle drain reclaims the op with no new traffic");
+		sa_reap(a);
+		CHECK(x && !x->zombie && !x->cses && a->n_zombie == 0,
+		    "unpinned zombie reaped, session freed");
+		CHECK(rte_mempool_avail_count(a->cop_mp) == cops &&
+		    rte_mempool_avail_count(mp) == mbs,
+		    "pinned-session recovery: no crypto op or mbuf leaked");
+	}
+
 	free_priv(a); free_priv(b);
 	rte_mempool_free(mp);
 	rte_cryptodev_stop(cdev);

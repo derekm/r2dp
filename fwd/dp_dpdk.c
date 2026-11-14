@@ -660,6 +660,10 @@ worker_main(void *arg)
 			if (d->inner_port >= 0)
 				rx_owned(w, (uint16_t)d->inner_port, 0);
 		}
+		/* hand a stuck device's late completions back even when no
+		 * traffic arrives to trigger it (WORKER W2) */
+		if (unlikely(w->cq_stale))
+			(void)crypto_drain_stale(w);
 		if (d->rcu)
 			rte_rcu_qsbr_quiescent(d->rcu, w->lcore);
 		if (w->id == 0)
@@ -1002,7 +1006,14 @@ ports_find(struct dpdk_priv *d)
 static void
 dpd_idle(struct fwd_dp *dp)
 {
-	spd_idle(dp->priv);
+	struct dpdk_priv *d = dp->priv;
+
+	spd_idle(d);
+	if (__atomic_load_n(&d->n_zombie, __ATOMIC_RELAXED)) {
+		rte_spinlock_lock(&d->lock);
+		sa_reap(d);
+		rte_spinlock_unlock(&d->lock);
+	}
 }
 
 int

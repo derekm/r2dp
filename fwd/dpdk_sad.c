@@ -111,7 +111,7 @@ sa_free_slot(struct dpdk_priv *d)
 	if ((uint64_t)(d->sa_n + 1) * 4 > (uint64_t)d->sa_cap * 3)
 		(void)dp_sa_grow(d);
 	for (uint32_t i = 0; i < d->sa_cap; i++)
-		if (!sa_at(d, i)->used)
+		if (!sa_at(d, i)->used && !sa_at(d, i)->zombie)
 			return (int)i;
 	if (dp_sa_grow(d) < 0)
 		return -ENOMEM;
@@ -381,7 +381,28 @@ sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds, int sad_del)
 	 * that might still hold it have passed the grace period above */
 	if (pos >= 0)
 		(void)rte_hash_free_key_with_position(d->sad, pos);
+	/* Past the grace period no worker can newly pin this session; one
+	 * that already did (a stuck device holds its ops) keeps it alive.
+	 * Don't wait for the device: leave a zombie for sa_reap. */
+	if (__atomic_load_n(&ds->pins, __ATOMIC_ACQUIRE)) {
+		ds->zombie = 1;
+		d->n_zombie++;
+		return;
+	}
 	sa_slot_free(d, ds);
+}
+
+void
+sa_reap(struct dpdk_priv *d)
+{
+	for (uint32_t i = 0; d->n_zombie && i < d->sa_cap; i++) {
+		struct dp_sa *ds = sa_at(d, i);
+
+		if (ds->zombie && !__atomic_load_n(&ds->pins, __ATOMIC_ACQUIRE)) {
+			sa_slot_free(d, ds);    /* clears zombie */
+			d->n_zombie--;
+		}
+	}
 }
 
 /* Least-loaded worker for a new tunnel.  An existing tunnel (either
