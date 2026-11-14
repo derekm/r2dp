@@ -238,6 +238,13 @@ static void *p4_worker(void *arg)
 		/* Run the pipeline + ipsec extern. */
 		if (it->p)
 			rte_swx_pipeline_run(it->p, P4_RUN_QUANTA);
+		/* rte_swx_pipeline_run only DOES work; ring output ports buffer
+		 * to bsz and only enqueue on a full batch or an explicit
+		 * rte_swx_pipeline_flush().  A lone live frame (sparse peer,
+		 * 1 pkt per round trip) never fills a 32-batch, so flush after
+		 * every run or it silently never leaves the pipeline. */
+		if (it->p)
+			rte_swx_pipeline_flush(it->p);
 		if (it->ipsec)
 			rte_swx_ipsec_run(it->ipsec);
 

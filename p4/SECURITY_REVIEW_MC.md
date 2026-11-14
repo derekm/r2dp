@@ -267,35 +267,43 @@ per-slice best_cyc_pkt pps):**
     bytes `00 00 20 00` (tcpdump decodes `ESP(spi=0x00002000)`), with
     `ob_hit=300, a6=300, crypto enq=deq=288, out0=288` -- the ntohl fix
     also produces the correct outbound wire SPI, not a double-swap.
-  - **Real independent-peer e2e on P4 is NOT yet verified.** The scapy
-    gateway on the same binary SAD-hits (`ib hit=15`) but `crypto enq=0`;
-    the synthetic stimulus that decrypts is not yet matched by the real
-    peer.  Two independent blockers, one now fixed:
-    - (a) **Real-peer `crypto enq=0` despite `ib hit / a0` moving** on the
-      same binary that decrypts replayed synthetic *and* the captured
-      real-peer bytes.  Session isolation (not re-run by review): the
-      exact captured real-peer ESP frame, replayed over raw `AF_PACKET`
-      into the same forwarder (same binary/spec/SA/K1) decrypts
-      (`crypto enq=288`, `inner-out/out1=288`); key, SPI, the 4-SA/4-SP
-      config, launch flags, netns, MAC and an AsyncSniffer socket were
-      each reported ruled out by A/B.  CAVEAT on that isolation, per a
-      later independent review: on this spec an `inbound_table_0`
-      action-0 (`a0`) hit is `ipsec_enable`, which validates
-      `h.ipsec_hdr` and routes via `ipsec_port_out_inbound` at
-      `LABEL_END_1` -- so an `a0` hit in the same process means the frame
-      WAS tx'd to whatever `ipsec_port_out_inbound` held (2), and the
-      pre-ipsec `IP_IN` reading was an instantaneous `rte_ring_count`
-      (0 after the extern drains), not a cumulative enqueue.  `crypto
-      enq=0` is `rte_cryptodev_stats_get` (prepare/cryptodev result), not
-      proof the ring was never written.  The "never reaches IP_IN" half
-      of the isolation is therefore NOT established; treat it as
-      unverified.  The concrete unresolved question is whether
-      `ipsec_port_out_inbound` was 2 in the live peer's process and why
-      `crypto enq` stayed 0 (prepare failing vs cryptodev vs SA session).
-      N=1 reproduces it, so it is not slicing.
-    - (b) **`next_hop_set` installs all-zero MACs -- FIXED (`8cfc4b6`).**
-      `p4_start` had programmed `next_hop_table_0` id0/id1 with zeroed
-      `ab[]` except ether_type/port, so both hop dst/src were
+  - **Real independent-peer e2e on P4 — POSITIVE PHASE NOW CLOSED (`0003`).**
+    The prior failure is fully root-caused and fixed: it is NOT SPI/bytes/
+    prepare/the SA session.  With `fwd/dp_p4.c` flushing the pipeline
+    output ports AND `0003-rte_swx_ipsec-batching-flush.patch` flushing the
+    extern's crypto-op and decrypted-packet buffers, the real scapy peer
+    passes **all 15 positive round trips plus the decrypted inner-reply TTL
+    check** on `BACKEND=p4` (`tests/e2e/fwd_e2e.sh`, positive phase:
+    `ok ... round trip payload=0..1400`, `ok ... inner reply ttl 64 (got 64)`;
+    fwd log `portout[2]=57`, decrypted inner `out1=26`, outbound `a6=25`).
+    The concrete mechanism (missing BEFORE): SWX batching is everywhere and
+    never flushed for a partial batch. (1) ring output ports push to
+    `IP_IN` only on a full `bsz` batch or `rte_swx_pipeline_flush()`; (2)
+    `ipsec_crypto_enqueue` submits crypto ops only on a full
+    `bsz.crypto_wr`; (3) `ipsec_ring_enqueue` pushes decrypted packets to
+    `IP_OUT` only on a full `bsz.ring_wr`.  A peer at ~1 pkt/round trip
+    fills none of them, so its packets were parked and never decrypted /
+    never egressed — while a 32-deep burst chanced to fill them (the
+    "burst works, sparse fails" discriminator).  The old "never reaches
+    IP_IN" reading was an instantaneous post-drain `rte_ring_count` (0
+    after the extern drains), NOT a cumulative enqueue; the ring WAS
+    written, `prepare` returned `ok=1` per packet, and only the batching
+    buffer kept the op off the cryptodev (`crypto enq` stayed 0).  This
+    is a genuine DPDK 24.11 extern defect (fixed at source here, carried as
+    `contrib/upstream/0003-*.patch`), not something the pipeline/SAD could
+    work around.  N=1 reproduces it no longer relevant — the fix is
+    cadence-independent.
+  - **Replay-window and NAT-T phases on P4 remain separate, honestly-open:**
+    `fwd_e2e.sh` window + NAT-T still fail on P4.  window fails because
+    stock DPDK 24.11 extern hardcodes `replay_win_sz=0`/`esn=0`
+    (anti-replay off); a replay/out-of-window seq still gets a reply.  A
+    host `.so` patch is not the product fix (reviewer action, unchanged).
+    NAT-T ESP-in-UDP round trips fail on P4 and are not yet root-caused.
+    These are NOT regressions from the flush; the same forwarder passes
+    the whole DPDK-backend harness.
+  - **(b) `next_hop_set` installs all-zero MACs -- FIXED (`8cfc4b6`).**
+    `p4_start` had programmed `next_hop_table_0` id0/id1 with zeroed
+    `ab[]` except ether_type/port, so both hop dst/src were
       `00:00:00:00:00:00`.  An AF_PACKET sniff/peer (outer leg) sees a
       frame regardless, but the INNER host (real kernel on the inner tap)
       drops a frame dstd to `00:00:00:00:00:00`, so the ICMP reply could
