@@ -42,6 +42,9 @@
 #include <rte_swx_pipeline.h>
 #include <rte_swx_ctl.h>
 #include <rte_swx_ipsec.h>
+#include <rte_ring.h>
+#include <rte_cryptodev.h>
+#include <rte_mbuf.h>
 
 #include "dp.h"
 #include <r2dp/proto.h>   /* r2dp_sa / r2dp_sp layouts */
@@ -51,12 +54,26 @@
 #define R2DP_P4_SPEC "/usr/local/share/r2dp/p4/r2dp.out"
 #endif
 
+/* Default pipeline I/O spec (ports + ipsec rings).  Overridable via
+ * $R2DP_P4_IOSPEC; a minimal ring-based iospec is auto-written to the
+ * scratch dir if none exists. */
+#ifndef R2DP_P4_IOSPEC
+#define R2DP_P4_IOSPEC ""
+#endif
+
 /* DPDK install include/lib dirs (overridable for non-system installs). */
 #ifndef R2DP_RTE_INCLUDE
 #define R2DP_RTE_INCLUDE "/usr/include/dpdk"
 #endif
 #ifndef R2DP_RTE_LIB
 #define R2DP_RTE_LIB "/usr/lib64"
+#endif
+
+/* DPDK source dir whose lib/pipeline holds the internal headers the codegen
+ * .so needs (rte_swx_pipeline_internal.h is NOT in the public include dir).
+ * Set via -DR2DP_SWX_SRC or $R2DP_SWX_SRC at runtime. */
+#ifndef R2DP_SWX_SRC
+#define R2DP_SWX_SRC "/usr/src/dpdk"
 #endif
 
 #define P4_LOG(fmt, ...) \
@@ -79,6 +96,8 @@ struct p4_priv {
 	struct rte_swx_ipsec *ipsec;
 	struct p4_sa sad[P4_SA_MAX];
 	char *spec_path;
+	char iospec_path[PATH_MAX];
+	int cdev_id;           /* cryptodev for the ipsec extern; -1 none */
 
 	/* Cached table key layout from table_info (bytes, big-endian order). */
 	uint32_t inbound_key_size;
@@ -111,6 +130,26 @@ static struct p4_sa *p4_sad_lookup(struct p4_priv *pr, uint32_t dip,
 
 /* ------------------------------------------------------------- ops */
 
+/* Resolve a table's action_id for a given action index (action_ids are
+ * assigned globally per pipeline in spec order, NOT per-table 0..n-1).  We
+ * look the action up by its position in the table's action list, which the
+ * compiled spec fixes (inbound: ipsec_enable, ipsec_bypass, drop; outbound:
+ * ipsec_protect, spd_bypass, spd_discard, drop).  Returns the action_id or a
+ * negative error. */
+static int p4_table_action_id(struct rte_swx_pipeline *p, uint32_t table_id,
+			      uint32_t action_index)
+{
+	struct rte_swx_ctl_table_action_info tai;
+	int rc;
+
+	memset(&tai, 0, sizeof(tai));
+	rc = rte_swx_ctl_table_action_info_get(p, table_id, action_index,
+					       &tai);
+	if (rc)
+		return -EIO;
+	return (int)tai.action_id;
+}
+
 /* Sum a table's match-field bit widths -> key size in bytes. */
 static int p4_table_key_size(struct rte_swx_pipeline *p, uint32_t table_id,
 			     uint32_t *nbytes)
@@ -134,7 +173,67 @@ static int p4_table_key_size(struct rte_swx_pipeline *p, uint32_t table_id,
 	return 0;
 }
 
-/* USC/DSC flow: .spec -> codegen C -> compile to .so -> build_from_lib. */
+/* Find + configure a lookaside cryptodev (the operator adds `--vdev
+ * crypto_openssl0` or crypto_aesni_mb0 on the command line, like the DPDK
+ * backend).  The ipsec extern's crypto_dev_name must resolve to a valid
+ * device id (rte_swx_ipsec_create fails EINVAL without one). */
+static int p4_crypto_init(struct p4_priv *pr)
+{
+	static const char *const names[] = {
+		"crypto_aesni_mb0", "crypto_aesni_mb", "crypto_openssl0",
+		"crypto_openssl",
+	};
+	struct rte_cryptodev_config cconf;
+	struct rte_cryptodev_qp_conf qconf;
+	int id = -1;
+
+	pr->cdev_id = -1;
+	for (size_t i = 0; i < RTE_DIM(names) && id < 0; i++)
+		id = rte_cryptodev_get_dev_id(names[i]);
+	if (id < 0) {
+		P4_LOG("no crypto device; pass --vdev crypto_openssl0 "
+		       "(or crypto_aesni_mb0)");
+		return -ENODEV;
+	}
+	pr->cdev_id = id;
+	memset(&cconf, 0, sizeof(cconf));
+	cconf.socket_id = SOCKET_ID_ANY;
+	cconf.nb_queue_pairs = 1;
+	memset(&qconf, 0, sizeof(qconf));
+	qconf.nb_descriptors = 2048;
+	if (rte_cryptodev_configure(id, &cconf) < 0) {
+		P4_LOG("cryptodev configure failed");
+		return -EIO;
+	}
+	if (rte_cryptodev_queue_pair_setup(id, 0, &qconf, SOCKET_ID_ANY) < 0) {
+		P4_LOG("cryptodev qp0 setup failed");
+		return -EIO;
+	}
+	if (rte_cryptodev_start(id) < 0) {
+		P4_LOG("cryptodev start failed");
+		return -EIO;
+	}
+	P4_LOG("crypto %s ready", rte_cryptodev_name_get(id));
+	return 0;
+}
+
+/* Create an rte_ring the iospec / ipsec extern port will reference (empty or
+ * one already existing is fine; a missing ring makes the port constructor
+ * fail -> build_from_lib ENODEV). */
+static int p4_ring(const char *name)
+{
+	struct rte_ring *r = rte_ring_lookup(name);
+	if (r)
+		return 0;
+	r = rte_ring_create(name, 1024, 0, RING_F_SP_ENQ | RING_F_SC_DEQ);
+	if (!r)
+		return -errno;
+	return 0;
+}
+
+/* USC/DSC flow: .spec -> codegen C -> compile to .so -> build_from_lib.
+ * The iospec's ring ports and the ipsec extern's rings must exist before
+ * build_from_lib (their port constructors look them up by name). */
 static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 {
 	FILE *spec, *code;
@@ -142,10 +241,79 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 	uint32_t err_line = 0;
 	const char *err = NULL;
 	char cmd[PATH_MAX * 2];
+	const char *tmp;
+	const char *base;
+	const char *swx_src;
 	int rc;
 
-	snprintf(code_c,  sizeof(code_c),  "%s.c",  spec_path);
-	snprintf(code_so, sizeof(code_so), "%s.so", spec_path);
+	/* The iospec ring ports and the ipsec extern's rings must pre-exist. */
+	{   const char *ring_names[] = { "R2DP_IN0", "R2DP_IN1", "R2DP_OUT0",
+					"R2DP_OUT1", "IP_IN", "IP_OUT", NULL };
+	    int i;
+	    for (i = 0; ring_names[i]; i++) {
+		int rr = p4_ring(ring_names[i]);
+		if (rr) { P4_LOG("ring %s: %s", ring_names[i],
+				strerror(-rr)); return rr; }
+	    }
+	}
+
+	/* Codegen .c/.so land in a WRITABLE scratch dir (the spec itself may
+	 * sit under a root-owned install path).  Keyed on the spec leaf so two
+	 * pipelines don't clobber each other. */
+	tmp = getenv("R2DP_P4_SCRATCH");
+	if (!tmp || !*tmp)
+		tmp = getenv("TMPDIR");
+	if (!tmp || !*tmp)
+		tmp = "/tmp";
+	base = strrchr(spec_path, '/');
+	base = base ? base + 1 : spec_path;
+	snprintf(code_c,  sizeof(code_c),  "%s/%s.c",  tmp, base);
+	snprintf(code_so, sizeof(code_so), "%s/%s.so", tmp, base);
+
+	/* Ensure the scratch dir exists (best-effort mkdir -p). */
+	{
+		char m[PATH_MAX];
+		snprintf(m, sizeof(m), "mkdir -p '%s'", tmp);
+		(void)system(m);
+	}
+
+	/* DPDK source dir for the internal codegen headers (runtime override of
+	 * the compile-time R2DP_SWX_SRC default). */
+	swx_src = getenv("R2DP_SWX_SRC");
+	if (!swx_src || !*swx_src)
+		swx_src = R2DP_SWX_SRC;
+
+	/* Pipeline I/O spec: ports + the ipsec extern rings.  Auto-write a
+	 * minimal ring-based one (no NIC needed) when none is configured. */
+	{
+		char *iospec = getenv("R2DP_P4_IOSPEC");
+		char io_path[PATH_MAX];
+		FILE *io_f;
+
+		if (iospec && *iospec) {
+			snprintf(pr->iospec_path, sizeof(pr->iospec_path), "%s",
+				 iospec);
+		} else {
+			snprintf(io_path, sizeof(io_path), "%s/%s.io", tmp, base);
+			snprintf(pr->iospec_path, sizeof(pr->iospec_path), "%s",
+				 io_path);
+			io_f = fopen(io_path, "r");
+			if (!io_f) {
+				io_f = fopen(io_path, "w");
+				if (io_f) {
+					fputs("port in 0 ring R2DP_IN0 bsz 32\n",
+					      io_f);
+					fputs("port in 1 ring R2DP_IN1 bsz 32\n",
+					      io_f);
+					fputs("port out 0 ring R2DP_OUT0 bsz 32\n",
+					      io_f);
+					fputs("port out 1 ring R2DP_OUT1 bsz 32\n",
+					      io_f);
+					fclose(io_f);
+				}
+			}
+		}
+	}
 
 	spec = fopen(spec_path, "r");
 	if (!spec)
@@ -164,17 +332,28 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 
 	/* Compile the codegen C to a shared object (the .so step). */
 	snprintf(cmd, sizeof(cmd),
-		"gcc -shared -fPIC -O2 -o '%s' '%s' -I'%s' -L'%s' "
-		"-lrte_pipeline -lrte_ipsec -lrte_eal -lrte_mbuf "
+		"gcc -shared -fPIC -O2 -o '%s' '%s' -I'%s' -I'%s/lib/pipeline' "
+		"-L'%s' -lrte_pipeline -lrte_ipsec -lrte_eal -lrte_mbuf "
 		"-lrte_mempool -lrte_ring 2>%s.err",
-		code_so, code_c, R2DP_RTE_INCLUDE, R2DP_RTE_LIB, spec_path);
+		code_so, code_c, R2DP_RTE_INCLUDE, swx_src,
+		R2DP_RTE_LIB, code_c);
 	rc = system(cmd);
 	if (rc) {
-		P4_LOG("compile .so failed rc=%d (see %s.err)", rc, spec_path);
+		P4_LOG("compile .so failed rc=%d (see %s.err)", rc, code_c);
 		return -EIO;
 	}
 
-	rc = rte_swx_pipeline_build_from_lib(&pr->p, "r2dp", code_so, NULL, 0);
+	{
+		FILE *io_f = fopen(pr->iospec_path, "r");
+		if (!io_f) {
+			P4_LOG("iospec %s: %s", pr->iospec_path,
+			       strerror(errno));
+			return -errno;
+		}
+		rc = rte_swx_pipeline_build_from_lib(&pr->p, "r2dp", code_so,
+						   io_f, 0);
+		fclose(io_f);
+	}
 	if (rc) {
 		P4_LOG("build_from_lib %d", rc);
 		return -EIO;
@@ -215,12 +394,17 @@ static int p4_start(struct fwd_dp *dp)
 	}
 
 	/* ipsec extern instance the spec's ipsec_enable/protect actions
-	 * resolve into; SA ids written to ipsec_hdr.sa_id are looked up here. */
+	 * resolve into; SA ids written to ipsec_hdr.sa_id are looked up here.
+	 * It needs a configured cryptodev (param validation requires one). */
+	rc = p4_crypto_init(pr);
+	if (rc)
+		return rc;
 	rc = rte_swx_ipsec_create(&pr->ipsec, "r2dp-ipsec",
 				  &(struct rte_swx_ipsec_params){
 					.ring_in_name    = "IP_IN",
 					.ring_out_name   = "IP_OUT",
-					.crypto_dev_name = NULL,
+					.crypto_dev_name = rte_cryptodev_name_get(
+					    pr->cdev_id),
 					.n_sa_max        = P4_SA_MAX,
 				  }, 0);
 	if (rc) {
@@ -270,24 +454,28 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		e->in_use = 1;
 	}
 
-	/* Crypto SA in the ipsec extern (spi -> cipher/AEAD params + key). */
+	/* Crypto SA in the ipsec extern (spi -> cipher/AEAD params + key).
+	 * r2dp provisions AES-GCM (see dp_gcm.c); `blob` is the AEAD key+salt
+	 * (enckeylen bytes), and the extern strips the trailing 4 salt bytes. */
 	if (blob && blen) {
 		uint32_t sa_id = 0;
 		struct rte_swx_ipsec_sa_params sp = {0};
 		sp.encrypt = (e->dir == R2DP_DIR_OUT);
-		sp.crypto.is_aead = 0;   /* cipher+auth split; AEAD later */
-		sp.crypto.cipher_auth.cipher.alg =
-		    RTE_CRYPTO_CIPHER_AES_CBC;
+		sp.crypto.is_aead = 1;
+		sp.crypto.aead.alg = RTE_CRYPTO_AEAD_AES_GCM;
 		if (blen > RTE_SWX_IPSEC_KEY_SIZE_MAX)
 			return -E2BIG;
-		memcpy(sp.crypto.cipher_auth.cipher.key, blob, blen);
-		sp.crypto.cipher_auth.cipher.key_size = (uint32_t)blen;
-		sp.crypto.cipher_auth.auth.alg = RTE_CRYPTO_AUTH_SHA1_HMAC;
+		memcpy(sp.crypto.aead.key, blob, blen);
+		sp.crypto.aead.key_size = (uint32_t)blen;   /* key || salt */
 		sp.encap.esp.spi = sa->spi;   /* network order SPI */
 		sp.encap.tunnel_mode = (sa->mode == R2DP_MODE_TUNNEL);
 		sp.encap.tunnel_ipv4 = 1;
-		memcpy(&sp.encap.tunnel.ipv4.dst_addr,
-		       sa->dst.addr, sizeof(struct in_addr));
+		if (sa->src.family == R2DP_AF_INET4)
+			memcpy(&sp.encap.tunnel.ipv4.src_addr,
+			       sa->src.addr, sizeof(struct in_addr));
+		if (sa->dst.family == R2DP_AF_INET4)
+			memcpy(&sp.encap.tunnel.ipv4.dst_addr,
+			       sa->dst.addr, sizeof(struct in_addr));
 		rc = rte_swx_ipsec_sa_add(pr->ipsec, &sp, &sa_id);
 		if (rc) {
 			P4_LOG("ipsec sa_add %d", rc);
@@ -310,7 +498,7 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		memcpy(data, &id_be, 4);
 	}
 	ent.key = key;
-	ent.action_id = 0;      /* ipsec_enable; resolved via action info */
+	ent.action_id = (uint64_t)p4_table_action_id(pr->p, 0, 0); /* ipsec_enable */
 	ent.action_data = data;
 	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "inbound_table_0",
 						  &ent);
@@ -351,17 +539,17 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	ent.key = key;
 	switch (sp->action) {
 	case R2DP_ACT_DISCARD:
-		ent.action_id = 0;   /* spd_discard */
+		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 2); /* spd_discard */
 		break;
 	case R2DP_ACT_PROTECT: {
 		uint32_t id_be = htonl(sp->slid);
 		memcpy(data, &id_be, 4);
-		ent.action_id = 0;   /* ipsec_protect(slid) */
+		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 0); /* ipsec_protect */
 		ent.action_data = data;
 		break;
 	}
 	default:
-		ent.action_id = 0;   /* spd_bypass */
+		ent.action_id = (uint64_t)p4_table_action_id(pr->p, 1, 1); /* spd_bypass */
 		break;
 	}
 	rc = rte_swx_ctl_pipeline_table_entry_add(pr->ctl, "outbound_table_0",
@@ -423,6 +611,11 @@ int fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	pr->spec_path = spec_path ? strdup(spec_path) : NULL;
 	dp->wake_fd = -1;
 
+	/* The SWX pipeline lives in the DPDK EAL heap; init EAL first (the
+	 * r2dp-fwd --dp p4 path passes its leftover args as EAL args). */
+	if (rte_eal_init(argc ? *argc : 1, argv ? *argv : NULL) < 0)
+		return -EIO;
+
 	p4_ops.caps    = p4_caps;
 	p4_ops.sa_add  = p4_sa_add;
 	p4_ops.sa_bytes = p4_sa_bytes;
@@ -437,5 +630,14 @@ int fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
 
 	if (dp->ops->caps)
 		dp->ops->caps(dp);
+
+	/* Bring up the pipeline now (codegen -> .so -> build_from_lib -> ctl).
+	 * On failure roll back: ops = NULL so the control loop never applies
+	 * SAs to a pipeline we could not start (mirrors dp_dpdk.c probe). */
+	if (dp->ops->start(dp) < 0) {
+		dp->ops->stop(dp);
+		dp->ops = NULL;
+		return -EIO;
+	}
 	return 0;
 }
