@@ -126,7 +126,7 @@ main(int argc, char **argv)
 	const char *bin = argc > 1 ? argv[1] : "r2dp-mockfwd";
 	struct r2dp_hello_ack ack;
 	struct r2dp_sa sa;
-	struct r2dp_sp sp;
+	struct r2dp_sp sp = { 0 };
 	struct r2dp_msg reply;
 	uint8_t enckey[32], authkey[32];
 	int fd, r, i;
@@ -206,8 +206,8 @@ main(int argc, char **argv)
 	CHECK(r == -ENOENT, "sa_del again -> ENOENT got=%d", r);
 
 	/* ---- SP lifecycle ---- */
-	r = roundtrip(fd, R2DP_SP_ADD, &sp, sizeof(sp), NULL, 0, NULL, &reply);
-	CHECK(r == 0, "sp_add r=%d", r);
+	/* Build the policy fully before the first send: never put
+	 * indeterminate stack bytes on the wire (MOCKS M4). */
 	memset(&sp, 0, sizeof(sp));
 	sp.dir = R2DP_DIR_IN; sp.ul_proto = R2DP_PROTO_ANY;
 	sp.action = R2DP_ACT_PROTECT; sp.mode = R2DP_MODE_TUNNEL;
@@ -215,7 +215,7 @@ main(int argc, char **argv)
 	sp.sel_src.family = R2DP_AF_INET4; sp.sel_dst.family = R2DP_AF_INET4;
 	sp.pref_src = 32; sp.pref_dst = 32;
 	r = roundtrip(fd, R2DP_SP_ADD, &sp, sizeof(sp), NULL, 0, NULL, &reply);
-	CHECK(r == 0, "sp_add2 r=%d", r);
+	CHECK(r == 0, "sp_add r=%d", r);
 	{
 		uint32_t slid = r2dp_msg_sp(&reply)->slid;
 		CHECK(slid != 0, "sp got slid");
@@ -236,6 +236,15 @@ main(int argc, char **argv)
 		gk.slid = slid;
 		r = roundtrip(fd, R2DP_SP_GET, &gk, sizeof(gk), NULL, 0, NULL, &reply);
 		CHECK(r == 0 && r2dp_msg_sp(&reply)->slid == slid, "sp_get slid match");
+		{
+			const struct r2dp_sp *g = r2dp_msg_sp(&reply);
+			CHECK(g->dir == R2DP_DIR_IN && g->action == R2DP_ACT_PROTECT &&
+			    g->mode == R2DP_MODE_TUNNEL &&
+			    g->sel_src.family == R2DP_AF_INET4 &&
+			    g->sel_dst.family == R2DP_AF_INET4 &&
+			    g->pref_src == 32 && g->pref_dst == 32,
+			    "sp_get returns the stored selectors/action");
+		}
 
 		/* SP_DEL then re-DEL -> ENOENT */
 		r = roundtrip(fd, R2DP_SP_DEL, &gk, sizeof(gk), NULL, 0, NULL, &reply);
