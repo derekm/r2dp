@@ -278,7 +278,7 @@ measure_steer(struct dpdk_priv *a, struct dpdk_priv *b, unsigned sz, int rep,
 		}
 		for (unsigned i = 0; i + BURST <= got; i += BURST) {
 			x = rte_rdtsc_precise();
-			dp_steer_outer(b, &espq[0][i], BURST, t);
+			(void)dp_steer_outer(b, &espq[0][i], BURST, t, 0);
 			co += rte_rdtsc_precise() - x;
 		}
 		if (r >= 0) {

@@ -580,7 +580,7 @@ rx_owned(struct dp_wk *w, uint16_t port, int outer)
 	if (!nk)
 		return;
 	if (outer)
-		dp_steer_outer(d, bufs, nk, tw);
+		w->n_misplaced += dp_steer_outer(d, bufs, nk, tw, w->id);
 	else
 		dp_steer_inner(d, bufs, nk, tw);
 	for (uint16_t i = 0; i < nk; i++) {
@@ -636,9 +636,12 @@ worker_main(void *arg)
 				inner_burst(w, bufs, nr, d->inner_port);
 			}
 		} else {
-			rx_owned(w, (uint16_t)port, 1);
-			if (d->inner_port >= 0)
-				rx_owned(w, (uint16_t)d->inner_port, 0);
+			/* Drain what other workers cross-posted BEFORE this
+			 * worker's own RX burst: those frames arrived earlier,
+			 * so an SA whose packets come in on several queues is
+			 * reordered by at most about one burst, not a ring's
+			 * depth, and in-window packets are not mistaken for
+			 * replays (REPLAY R1). */
 			nr = rte_ring_sc_dequeue_burst(w->ring_o, (void **)bufs,
 			    BURST_SZ, NULL);
 			if (nr)
@@ -648,6 +651,9 @@ worker_main(void *arg)
 			if (nr)
 				inner_burst(w, bufs, nr,
 				    d->inner_port >= 0 ? d->inner_port : port);
+			rx_owned(w, (uint16_t)port, 1);
+			if (d->inner_port >= 0)
+				rx_owned(w, (uint16_t)d->inner_port, 0);
 		}
 		if (d->rcu)
 			rte_rcu_qsbr_quiescent(d->rcu, w->lcore);

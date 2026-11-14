@@ -899,15 +899,16 @@ steer_key(const struct rte_mbuf *m, union rte_ipsec_sad_key *k)
  * distinct consecutive key; everything else (IKE, ARP, clear, SAD misses)
  * goes to worker 0, which forwards or drops it exactly as a single worker
  * would. */
-void
+uint16_t
 dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
-    uint8_t t[])
+    uint8_t t[], unsigned self)
 {
 	union rte_ipsec_sad_key k[BURST_SZ];
 	const union rte_ipsec_sad_key *kp[BURST_SZ];
 	void *sa[BURST_SZ];
 	int16_t ux[BURST_SZ];
 	uint32_t nu = 0;
+	uint16_t away = 0;
 
 	if (n > BURST_SZ)
 		n = BURST_SZ;
@@ -924,7 +925,7 @@ dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
 		ux[i] = (int16_t)(nu - 1);
 	}
 	if (!nu || dp_sad_lookup(sad_load(d), kp, sa, nu) == 0)
-		return;
+		return 0;
 	for (uint16_t i = 0; i < n; i++) {
 		const struct dp_sa *ds;
 
@@ -932,7 +933,9 @@ dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
 			continue;
 		ds = sa_of_sess(d, sa[ux[i]]);
 		t[i] = ds ? (uint8_t)(ds->owner % d->nb_wk) : 0;
+		away += ds && t[i] != self;
 	}
+	return away;
 }
 
 /* Worker for each inner (plaintext) frame: the owner of the egress SA its

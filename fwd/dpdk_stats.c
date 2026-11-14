@@ -30,6 +30,7 @@ dpd_stats_sum(const struct dpdk_priv *d, struct dp_wk *t)
 		t->cq_stale += w->cq_stale;
 		t->n_crypto_stuck += w->n_crypto_stuck;
 		t->n_natt_keepalive += w->n_natt_keepalive;
+		t->n_misplaced += w->n_misplaced;
 	}
 }
 
@@ -51,9 +52,11 @@ dpd_stats_dump(struct dpdk_priv *d, FILE *f)
 	for (int r = 0; r < DR_NUM; r++)
 		fprintf(f, " %s=%llu", dp_drop_name[r],
 		    (unsigned long long)t.n_dropr[r]);
-	fprintf(f, " (crypto_stuck_events=%llu outstanding=%u natt_keepalive=%llu)",
+	fprintf(f, " (crypto_stuck_events=%llu outstanding=%u natt_keepalive=%llu "
+	    "misplaced=%llu)",
 	    (unsigned long long)t.n_crypto_stuck, t.cq_stale,
-	    (unsigned long long)t.n_natt_keepalive);
+	    (unsigned long long)t.n_natt_keepalive,
+	    (unsigned long long)t.n_misplaced);
 	fprintf(f, "\n");
 	fprintf(f, "r2dp-fwd: tables sa=%u/%u sp=%u/%u sad=%u/%u sess_pools=%u "
 	    "grows=%llu grow_fail=%llu acl_builds=%llu acl_reuse=%llu\n",

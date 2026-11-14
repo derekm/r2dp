@@ -192,6 +192,9 @@ struct dp_wk {
 	uint32_t            cq_stale;
 	uint64_t            n_crypto_stuck;  /* times the device stopped completing */
 	uint64_t            n_natt_keepalive; /* RFC 3948 keepalives consumed */
+	uint64_t            n_misplaced; /* outer ESP that arrived on a queue
+	                              * other than its SA owner's and was
+	                              * cross-posted: reordering risk (REPLAY R1) */
 } __rte_cache_aligned;
 
 #define PEER_HSZ_MIN 4096 /* peer hash slots: power of two, >= 4x peers */
@@ -573,9 +576,11 @@ void
 esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
     struct rte_mbuf *out[], uint16_t *nout, uint16_t *nbypass);
 
-void
+/* Returns how many frames resolved to an SA owned by a worker other
+ * than `self` (ESP that arrived on the wrong queue, REPLAY R1). */
+uint16_t
 dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
-    uint8_t t[]);
+    uint8_t t[], unsigned self);
 void
 dp_steer_inner(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
     uint8_t t[]);

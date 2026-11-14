@@ -16,6 +16,13 @@ or the kernel's XFRM (`--dp kernel`).  Both interoperate with an
 independent ESP implementation in CI.  See `COVERAGE.md` for what is
 verified and what is not, and `MILESTONES.md` for the plan.
 
+With `-n` > 1, the sender is expected to place each tunnel on its owning
+worker's RX queue.  ESP that arrives on another worker's queue is
+cross-posted to the owner and can trail that SA's other packets by about
+one burst (128 packets); give such SAs a replay window of at least that,
+or in-window packets may be dropped as replays.  The stats dump
+(`SIGUSR1`) counts these frames as `misplaced`.
+
 ## Layout
 | path | what |
 |---|---|
