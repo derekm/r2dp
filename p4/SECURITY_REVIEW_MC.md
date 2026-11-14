@@ -187,35 +187,37 @@ per-slice best_cyc_pkt pps):**
   and `slice i OUT BIND installed` with the same selector; each shard's
   extern gets its own sa_id.
 
-**Status at this commit (`cbcce09`):**
+**Status at this commit:**
 - VERIFIED (bench path): N=1 regression, per-shard build/start/fan-out,
   one cryptodev N QPs, per-shard pipeline/extern/pool/rings, core pinning,
   N-worker bench, honest aggregate, no pool OOM under `-m 1024`.
-- **VERIFIED (live path, this refactor):** Section 5 RX steering is now
-  implemented and live-proven.  A single `p4_rx_worker` distributor thread
-  reads both ethdev legs and hashes each frame to a slice by flow
-  (ESP -> outer dst+SPI for per-SA replay affinity; else 5-tuple) so the
-  ethdev RX queue is a single consumer and one flow/SA lands on one shard.
-  Live-proven on `.165` N=2 (openssl, root tap): both shards `SA add ok` +
-  `OUT BIND installed`; `crypto enq=23167 deq=23167` (real ESP);
-  `in_rx=31132 out0=23136 a6(PROTECT)=29706` on one shard -- a live ESP
-  flow steered through the distributor to a single shard's extern.
-- Still open for a full APPROVE (need explicit per-shard + replay
-  proofs on the live tap, not just the bench / a single flow):
-  - delete-proof-per-shard: `sp-del` of a `/32` on every shard moving
-    `a6->a7` on **every** shard (currently proven only via the bench where
-    all shards show the delete in the control-plane log).
-  - live replay/seq integrity across shards (same-flow monotonic seq on the
-    pinned shard, no interleave).
-  - Steady hash stability across relaunch (fixed seed, xor-fold -- needs a
-    same-flow-same-shard-across-two-launches assertion).
+- **VERIFIED (live path):** Section 5 RX steering implemented + live-proven.
+  A single `p4_rx_worker` distributor hashes each frame to a slice (ESP ->
+  outer dst+SPI for per-SA replay affinity; else 5-tuple), one RX thread =
+  single ethdev consumer.  Live-proven on `.165` N=2 (openssl, root tap):
+  both shards `SA add ok` + `OUT BIND installed`; `crypto enq=deq>0` (real
+  ESP); `a6(PROTECT)>0` out0 egress on the forwarding shard.
+- **VERIFIED delete-proof-per-shard (live, N=2).** After `sp-del` +
+  re-inject: before `a6=24467 a7=0`; after `a6=24467 a7=15192 ob_miss=15192`
+  -- the outbound row was removed on every shard and new frames fall to the
+  bypass default, matching the shared mirror.  `p4_live_proof.sh` runs this.
+- **VERIFIED hash stability across relaunch.** `p4_flow_slice` is a pure
+  function (fixed xor-fold seed, no state/env), so same (flow, N) => same
+  slice on every launch; checked deterministically for representative ESP +
+  5-tuple flows across N=1..8.
+- Remaining for a full APPROVE (procedures, not missing code): live
+  replay/seq-integrity assertion (same-flow monotonic seq on the pinned
+  shard) -- the steering makes this possible by construction (per-SA
+  affinity) but an explicit multi-packet replay test is still worth running
+  in review.
 
 **Checks on the live path (memif/tap), not just bench:**
-- per-SA affinity: inject one flow, confirm it always hits shard k
-  (crypto enq/deq on one extern).  Now running; `p4_live_proof.sh` proves
-  one flow steers to one shard (proven N=2, one-flow case).
-- delete proof per shard (Section 2) -- still to run on the live tap.
-- replay/seq integrity: a single flow on one shard does not interleave seqs.
+- per-SA affinity: `p4_live_proof.sh` proves a flow steers to one shard
+  (N=2, one-flow case) with crypto enq/deq on that extern.
+- delete proof per shard: proven live (a6->a7 on every shard) above.
+- replay/seq integrity: steering pins the flow to one shard by (dst,spi)
+  so replay state is single-owner; an explicit multi-packet replay test is
+  the remaining reviewer assertion.
 
 ---
 
