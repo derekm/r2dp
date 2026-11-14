@@ -154,9 +154,15 @@ and the delegated `deleg_8f37ef0b` review):
      r2dp OUT policy / IKE bypass SP does not collapse to one entry.  Outbound
      miss -> `spd_bypass` matches DPDK; inbound miss -> `drop` is NOT
      `DR_NO_SA_IN`.
-- **Runtime `fwd/dp_p4.c`** (`88ec62d`, `497952c`) implements `fwd_dp_ops` and
-  builds/links against DPDK 24.11 SWX.  Open: `rte_swx_pipeline_build_from_lib`
-  returns `ENODEV` (the `ipsec_accelerator` extern object isn't instantiated by
-  the codegen `.so` — empty `extobjs[]`); the pipeline is not yet load-and-run,
-  and `direction[]`/`ipsec_port_*` regarrays would need programming before the
-  first packet.
+- **Runtime `fwd/dp_p4.c`** (`88ec62d`, `497952c`, `77551a8`) implements
+  `fwd_dp_ops` and now **loads and runs the SWX pipeline** end-to-end:
+  `r2dp-fwd --dp p4` brings up codegen->.so->build_from_lib, a configured
+  cryptodev, and the ipsec extern; `r2dp-ctl-probe` installs an SA + SP and
+  `r2dpctl dump` shows the SA.  Verified live on `.165` (Fedora 44, DPDK
+  24.11, `--vdev crypto_openssl0`).  Runtime gotchas fixed: (a) iospec ring
+  ports + ipsec rings must exist before build_from_lib (else ENODEV);
+  (b) ipsec_create needs a real cryptodev (else EINVAL); (c) r2dp's AEAD
+  blob is key||salt (extern strips trailing 4); (d) table action_ids are
+  global per-pipeline — resolve with rte_swx_ctl_table_action_info_get, never
+  hardcode.  Still open: real packet path (rx/tx rings aren't wired to NIC/VM
+  ports yet) and the §8 limits above (IKE/ARP/NAT-T/SPD expressiveness).
