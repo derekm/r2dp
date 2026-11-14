@@ -368,6 +368,9 @@ static uint32_t p4_xor(const uint8_t *p, size_t n)
 	return h;
 }
 
+/* The one slice that encrypts: owner of every outbound SA's sequence. */
+#define P4_OUT_OWNER 0u
+
 static uint32_t p4_flow_slice(struct p4_priv *pr, const struct rte_mbuf *m)
 {
 	uint8_t bb[16];
@@ -480,7 +483,15 @@ static void *p4_io_worker(void *arg)
 						     pkts, P4_BURST_SZ);
 			uint16_t k;
 			for (k = 0; k < n; k++) {
-				uint32_t s = p4_flow_slice(pr, pkts[k]);
+				/* Every plaintext frame goes to slice 0, the
+				 * single owner of every outbound SA's sequence
+				 * number and GCM IV.  Spreading inner flows by
+				 * 5-tuple ran one SA's encryption on several
+				 * slices, each with its own counter under the
+				 * same key: repeated sequence numbers and IVs
+				 * (P4 review P1).  The outer leg (decrypt) still
+				 * spreads by outer (src, dst). */
+				const uint32_t s = P4_OUT_OWNER;
 				pr->inst[s].c_inner++;
 				if (rte_ring_enqueue(pr->inst[s].in1,
 						     pkts[k]) != 0)
@@ -2272,7 +2283,12 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 			break;
 		case R2DP_ACT_PROTECT:
 			ea = p4_spd_sa_lookup(pr, sp);
-			if (ea) {
+			/* Only slice 0 may encrypt (it owns each outbound
+			 * SA's sequence/IV, see p4_io_worker); any other
+			 * slice that somehow sees this selector drops it
+			 * rather than encrypt with a second counter under the
+			 * same key (P4 review P1). */
+			if (ea && s == P4_OUT_OWNER) {
 				uint32_t id_be = htonl(ea->sl_id[s]);
 				memcpy(data, &id_be, 4);
 				ent.action_id = (uint64_t)
