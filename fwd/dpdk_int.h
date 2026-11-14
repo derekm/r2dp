@@ -590,6 +590,11 @@ esp_outbound(struct dp_wk *w, struct rte_mbuf *bufs[], uint16_t nr,
 uint16_t
 dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
     uint8_t t[], unsigned self);
+/* Configure and start one ethdev with ntxq RX and TX queues (dpdk_port.c).
+ * 0, or the failing ethdev call's negative errno. */
+int
+dp_port_init(struct dpdk_priv *d, uint16_t port, unsigned ntxq);
+
 /* Reclaim a stuck device's late completions (worker; also polled while
  * idle).  Returns the ops it still holds. */
 uint32_t

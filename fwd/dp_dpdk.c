@@ -31,50 +31,6 @@ nh_wanted(void *arg, uint32_t ip)
 }
 
 
-/* ------------------------------------------------------------------ */
-/* nq RX and nq TX queues (net_tap insists they match): one TX queue per
- * worker; with several workers the dispatcher polls every RX queue (a
- * multiqueue tap spreads the kernel's frames over all of them). */
-static int
-port_init(struct dpdk_priv *d, uint16_t port, unsigned ntxq)
-{
-	struct rte_eth_conf conf;
-	struct rte_eth_dev_info dev_info;
-
-	if (port >= RTE_MAX_ETHPORTS)
-		return -1;
-	memset(&conf, 0, sizeof(conf));
-	if (rte_eth_dev_info_get(port, &dev_info) < 0) {
-		fprintf(stderr, "r2dp-fwd: dev_info_get(port %u) failed\n", port);
-		return -1;
-	}
-	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
-		conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
-
-	uint16_t nrxq = (uint16_t)ntxq;
-	if (ntxq > dev_info.max_tx_queues) {
-		fprintf(stderr, "r2dp-fwd: port %u has %u tx queues, need %u\n",
-		    port, dev_info.max_tx_queues, ntxq);
-		return -1;
-	}
-	/* No RSS.  A hash onto a queue is not the worker tun_owner()
-	 * assigned, so it would cross-post every packet.  Queue q is
-	 * worker q.  The sender places a tunnel on that queue. */
-	if (rte_eth_dev_configure(port, nrxq, (uint16_t)ntxq, &conf) < 0)
-		return -rte_errno;
-	for (uint16_t q = 0; q < nrxq; q++)
-		if (rte_eth_rx_queue_setup(port, q, 1024, rte_eth_dev_socket_id(port),
-		    NULL, d->pool) < 0)
-			return -rte_errno;
-	for (uint16_t q = 0; q < (uint16_t)ntxq; q++)
-		if (rte_eth_tx_queue_setup(port, q, 1024, rte_eth_dev_socket_id(port),
-		    NULL) < 0)
-			return -rte_errno;
-	if (rte_eth_dev_start(port) < 0)
-		return -rte_errno;
-	rte_eth_promiscuous_enable(port);
-	return 0;
-}
 
 static inline int
 is_esp(struct rte_mbuf *mb)
@@ -717,10 +673,9 @@ dpd_start(struct fwd_dp *dp)
 		ret = -EAGAIN;
 		goto rollback;
 	}
-	if (port_init(d, d->port_id, d->nb_wk) < 0) {
-		ret = -rte_errno;
+	ret = dp_port_init(d, d->port_id, d->nb_wk);
+	if (ret < 0)
 		goto rollback;
-	}
 	{
 		uint16_t mtu = 0;
 		if (rte_eth_dev_get_mtu(d->port_id, &mtu) == 0)
@@ -728,9 +683,13 @@ dpd_start(struct fwd_dp *dp)
 	}
 	/* inner (plaintext) tap is optional: single-tap mode (interop lab,
 	 * control-only) has only the outer port */
-	if (d->inner_port >= 0 && port_init(d, d->inner_port, d->nb_wk) < 0) {
-		fprintf(stderr, "r2dp-fwd: inner port init failed\n");
-		d->inner_port = -1;
+	if (d->inner_port >= 0) {
+		int r = dp_port_init(d, d->inner_port, d->nb_wk);
+		if (r < 0) {
+			fprintf(stderr, "r2dp-fwd: inner port %d init failed (%s); "
+			    "running single-port\n", d->inner_port, rte_strerror(-r));
+			d->inner_port = -1;
+		}
 	}
 	/* H5: QSBR so the ctl (main) thread can free SA/SP memory only after
 	 * every reader has passed a grace period -- the workers read
@@ -849,7 +808,7 @@ rollback:
 		rte_eth_dev_stop(d->inner_port);
 		d->inner_port = -1;
 	}
-	return ret;
+	return ret < 0 ? ret : -EIO;    /* a rollback is never a success */
 }
 
 static void

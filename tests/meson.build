@@ -64,6 +64,15 @@ if dpdk.found()
       c_args: ['-DR2DP_HAVE_DPDK=1']),
     is_parallel: false, timeout: 60)
 
+  # dp_port: ethdev setup propagates each stage's own error (PORTIO P1)
+  test('dp_port',
+    executable('dp_port', 'dp_port.c', '../fwd/dpdk_port.c',
+      include_directories: [include_directories('../include'),
+                            include_directories('../fwd')],
+      dependencies: dpdk,
+      c_args: ['-DR2DP_HAVE_DPDK=1']),
+    is_parallel: false, timeout: 60)
+
   # dp_path: outbound encrypt -> inbound decrypt through the production
   # data path, with policy dispositions (CI data-path coverage).
   test('dp_path',
