@@ -187,21 +187,34 @@ per-slice best_cyc_pkt pps):**
   and `slice i OUT BIND installed` with the same selector; each shard's
   extern gets its own sa_id.
 
-**Status at this commit (`fab9236`):**
+**Status at this commit (`cbcce09`):**
 - VERIFIED (bench path): N=1 regression, per-shard build/start/fan-out,
   one cryptodev N QPs, per-shard pipeline/extern/pool/rings, core pinning,
   N-worker bench, honest aggregate, no pool OOM under `-m 1024`.
-- **NOT YET VERIFIED / still open:** live-path steering (Section 5) — the
-  bench self-injects per shard so it never exercises RX steering; the
-  tap/memif live path has not been proved to give per-flow/per-SA affinity
-  across shards.  Delete-proof-per-shard (Section 2) and live replay/seq
-  integrity across shards also need a live-path proof.  These require the
-  live-path tests in the next section and are the gate for a full APPROVE.
+- **VERIFIED (live path, this refactor):** Section 5 RX steering is now
+  implemented and live-proven.  A single `p4_rx_worker` distributor thread
+  reads both ethdev legs and hashes each frame to a slice by flow
+  (ESP -> outer dst+SPI for per-SA replay affinity; else 5-tuple) so the
+  ethdev RX queue is a single consumer and one flow/SA lands on one shard.
+  Live-proven on `.165` N=2 (openssl, root tap): both shards `SA add ok` +
+  `OUT BIND installed`; `crypto enq=23167 deq=23167` (real ESP);
+  `in_rx=31132 out0=23136 a6(PROTECT)=29706` on one shard -- a live ESP
+  flow steered through the distributor to a single shard's extern.
+- Still open for a full APPROVE (need explicit per-shard + replay
+  proofs on the live tap, not just the bench / a single flow):
+  - delete-proof-per-shard: `sp-del` of a `/32` on every shard moving
+    `a6->a7` on **every** shard (currently proven only via the bench where
+    all shards show the delete in the control-plane log).
+  - live replay/seq integrity across shards (same-flow monotonic seq on the
+    pinned shard, no interleave).
+  - Steady hash stability across relaunch (fixed seed, xor-fold -- needs a
+    same-flow-same-shard-across-two-launches assertion).
 
 **Checks on the live path (memif/tap), not just bench:**
 - per-SA affinity: inject one flow, confirm it always hits shard k
-  (crypto enq/deq on one extern).  <-- NOT YET RUN: steering unimplemented
-- delete proof per shard (Section 2).
+  (crypto enq/deq on one extern).  Now running; `p4_live_proof.sh` proves
+  one flow steers to one shard (proven N=2, one-flow case).
+- delete proof per shard (Section 2) -- still to run on the live tap.
 - replay/seq integrity: a single flow on one shard does not interleave seqs.
 
 ---
