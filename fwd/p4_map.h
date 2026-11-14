@@ -48,4 +48,16 @@ p4_sa_supported(int inbound, uint32_t window, int esn, int natt,
 	return p4_replay_win(window, have_replay, win_sz);
 }
 
+/* The P4 SPD tables (OUT and IN) key on protocol and address prefixes
+ * only.  A port-qualified selector would be widened to every port: for a
+ * BYPASS that forwards cleartext a broader PROTECT/DISCARD should have
+ * caught, for PROTECT/DISCARD it captures unrelated traffic.  Refuse any
+ * nonzero selector port rather than install a different policy than the
+ * one asked for (COMMITS C7, P4 review P4). */
+static inline int
+p4_sp_supported(uint16_t sport, uint16_t dport)
+{
+	return (sport || dport) ? -EOPNOTSUPP : 0;
+}
+
 #endif

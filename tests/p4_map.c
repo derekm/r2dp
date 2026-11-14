@@ -36,6 +36,10 @@ main(void)
 	    "outbound SA ignores the receive window");
 	CHECK(p4_sa_supported(1, 64, 0, 0, 1, 1, &W) == 0 && W == 63,
 	    "inbound SA with window 64 -> W 63");
+	CHECK(p4_sp_supported(0, 0) == 0, "address/protocol-only selector accepted");
+	CHECK(p4_sp_supported(0, 500) == -EOPNOTSUPP &&
+	    p4_sp_supported(4500, 0) == -EOPNOTSUPP,
+	    "port-qualified selector refused, never widened to all ports");
 	if (fails) { printf("p4_map: %d failures\n", fails); return 1; }
 	puts("p4_map: OK");
 	return 0;

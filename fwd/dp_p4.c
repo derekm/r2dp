@@ -2542,6 +2542,14 @@ static int p4_sp_add(struct fwd_dp *dp, struct r2dp_sp *sp)
 	 * an inbound PROTECT/DISCARD policy is dropped, not forwarded). */
 	if (sp->dir != R2DP_DIR_OUT && sp->dir != R2DP_DIR_IN)
 		return 0;
+	rc = p4_sp_supported(sp->sel_src.port, sp->sel_dst.port);
+	if (rc) {
+		P4_LOG("SP slid=%u refused: port selectors (%u, %u) are not "
+		       "representable in the P4 SPD", sp->slid,
+		       ntohs(sp->sel_src.port), ntohs(sp->sel_dst.port));
+		return rc;
+	}
+
 	p = p4_pol_find(pr, sp);
 	if (!p) {
 		int ghost = -1;
