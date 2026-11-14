@@ -246,15 +246,14 @@ static void *p4_worker(void *arg)
 				       "| rings in0=%u in1=%u out0r=%u out1r=%u "
 				       "| ipsec ipin=%u ipout=%u "
 				       "| ob_hit=%llu ob_miss=%llu "
-				       "| ob_act[0]=%llu[1]=%llu[2]=%llu[3]=%llu",
+				       "| act a5=%llu a6=%llu a7=%llu",
 				       pr->c_outer, pr->c_inner, pr->c_out0,
 				       pr->c_out1, q0, q1, qo0, qo1, qi, qo,
 				       (unsigned long long)ts1.n_pkts_hit,
 				       (unsigned long long)ts1.n_pkts_miss,
-				       (unsigned long long)act1[0],
-				       (unsigned long long)act1[1],
-				       (unsigned long long)act1[2],
-				       (unsigned long long)act1[3]);
+				       (unsigned long long)act1[5],
+				       (unsigned long long)act1[6],
+				       (unsigned long long)act1[7]);
 			else
 				P4_LOG("pkt: out_rx=%lu in_rx=%lu out0=%lu out1=%lu "
 				       "| rings in0=%u in1=%u out0r=%u out1r=%u",
@@ -584,28 +583,32 @@ static int p4_build_from_spec(struct p4_priv *pr, const char *spec_path)
 			snprintf(io_path, sizeof(io_path), "%s/%s.io", tmp, base);
 			snprintf(pr->iospec_path, sizeof(pr->iospec_path), "%s",
 				 io_path);
-			io_f = fopen(io_path, "r");
-			if (!io_f) {
-				io_f = fopen(io_path, "w");
-				if (io_f) {
-					fputs("port in 0 ring R2DP_IN0 bsz 32\n",
-					      io_f);
-					fputs("port in 1 ring R2DP_IN1 bsz 32\n",
-					      io_f);
-					fputs("port out 0 ring R2DP_OUT0 bsz 32\n",
-					      io_f);
-					fputs("port out 1 ring R2DP_OUT1 bsz 32\n",
-					      io_f);
-					/* ipsec extern wiring (matches the DPDK
-					 * ipsec example: the extern's return ring
-					 * is a pipeline INPUT port and its consume
-					 * ring is a pipeline OUTPUT port). */
-					fputs("port in 2 ring IP_OUT bsz 32\n",
-					      io_f);
-					fputs("port out 2 ring IP_IN bsz 32\n",
-					      io_f);
-					fclose(io_f);
-				}
+			/* Always regenerate the DEFAULT iospec: it must include the
+			 * ipsec extern rings (port in 2 = IP_OUT, port out 2 =
+			 * IP_IN) or the pipeline's tx-to-port-2 is a no-op and
+			 * no framed ESP can ever reach the extern.  A stale .io
+			 * left over from an earlier build (4 ports only) would
+			 * otherwise be reused forever and silently break the
+			 * ipsec path. */
+			io_f = fopen(io_path, "w");
+			if (io_f) {
+				fputs("port in 0 ring R2DP_IN0 bsz 32\n",
+				      io_f);
+				fputs("port in 1 ring R2DP_IN1 bsz 32\n",
+				      io_f);
+				fputs("port out 0 ring R2DP_OUT0 bsz 32\n",
+				      io_f);
+				fputs("port out 1 ring R2DP_OUT1 bsz 32\n",
+				      io_f);
+				/* ipsec extern wiring (matches the DPDK
+				 * ipsec example: the extern's return ring
+				 * is a pipeline INPUT port and its consume
+				 * ring is a pipeline OUTPUT port). */
+				fputs("port in 2 ring IP_OUT bsz 32\n",
+				      io_f);
+				fputs("port out 2 ring IP_IN bsz 32\n",
+				      io_f);
+				fclose(io_f);
 			}
 		}
 	}
@@ -703,11 +706,17 @@ static int p4_start(struct fwd_dp *dp)
 					.crypto_dev_name = rte_cryptodev_name_get(
 					    pr->cdev_id),
 					.n_sa_max        = P4_SA_MAX,
+					/* burst sizes must be non-zero or the
+					 * extern never drains its input ring
+					 * (bsz all 0 -> read 0 frames).  Reference
+					 * ipsec.cli uses 32 32 32 32. */
+					.bsz = { 32, 32, 32, 32 },
 				  }, 0);
 	if (rc) {
 		P4_LOG("ipsec_create %d", rc);
 		return -EIO;
 	}
+	/* ipsec extern drains IP_IN; see create() bsz */
 
 	/* Program the classification regarrays the spec's parser/apply read
 	 * (they default to 0).  PNA direction: 0 = NET_TO_HOST (inbound /
