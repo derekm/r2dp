@@ -238,10 +238,19 @@ control MainControlImpl(inout headers_t hdrs, inout metadata_t meta,
         drop_packet();
     }
     table outbound_table {
+        /* WILDCARD (ternary) SPD.  p4c-dpdk lowers `ternary` to the SWX
+         * `wildcard`/ACL match type.  The ACL image the runtime must build is
+         * [protocol(1)][src(4)][dst(4)] in NETWORK byte order — same layout as
+         * the routing 10/8 LPM entry ({0a,0,0,0}/ff,0,0,0) which is proven to
+         * match on this same wildcard path.  Full-mask entries (all-ones
+         * key_mask, priority 0) are equivalent to the previous exact table;
+         * prefix/ANY entries mask bits off and set priority src_plen+dst_plen
+         * so the most-specific rule wins.  key field order must match the ACL
+         * [1][4][4] split, hence protocol FIRST. */
         key = {
-            hdrs.ipv4.src_addr : exact;
-            hdrs.ipv4.dst_addr : exact;
-            hdrs.ipv4.protocol : exact;
+            hdrs.ipv4.protocol : ternary;
+            hdrs.ipv4.src_addr : ternary;
+            hdrs.ipv4.dst_addr : ternary;
         }
         actions = { ipsec_protect; spd_bypass; spd_discard; drop; }
         const default_action = spd_bypass;

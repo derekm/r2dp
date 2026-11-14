@@ -91,9 +91,6 @@ struct metadata_t {
 	bit<32> pna_main_output_metadata_output_port
 	bit<32> MainControlImpl_inbound_table_0_ipv4_dst_addr
 	bit<32> MainControlImpl_inbound_table_0_esp_spi
-	bit<32> MainControlImpl_outbound_table_0_ipv4_src_addr
-	bit<32> MainControlImpl_outbound_table_0_ipv4_dst_addr
-	bit<8> MainControlImpl_outbound_table_0_ipv4_protocol
 	bit<8> MainParserT_parser_from_ipsec
 	bit<32> MainParserT_parser_status
 	bit<8> MainParserT_parser_tmp_0
@@ -202,9 +199,9 @@ table inbound_table_0 {
 
 table outbound_table_0 {
 	key {
-		m.MainControlImpl_outbound_table_0_ipv4_src_addr exact
-		m.MainControlImpl_outbound_table_0_ipv4_dst_addr exact
-		m.MainControlImpl_outbound_table_0_ipv4_protocol exact
+		h.ipv4.protocol wildcard
+		h.ipv4.src_addr wildcard
+		h.ipv4.dst_addr wildcard
 	}
 	actions {
 		ipsec_protect
@@ -325,9 +322,6 @@ apply {
 	LABEL_FALSE_7 :	drop
 	jmp LABEL_END_1
 	LABEL_FALSE_6 :	jmpnv LABEL_FALSE_8 h.ipv4
-	mov m.MainControlImpl_outbound_table_0_ipv4_src_addr h.ipv4.src_addr
-	mov m.MainControlImpl_outbound_table_0_ipv4_dst_addr h.ipv4.dst_addr
-	mov m.MainControlImpl_outbound_table_0_ipv4_protocol h.ipv4.protocol
 	table outbound_table_0
 	jmpneq LABEL_END_1 m.local_metadata_bypass 0x1
 	table routing_table_0

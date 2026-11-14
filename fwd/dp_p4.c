@@ -397,6 +397,27 @@ static struct p4_sa *p4_sad_lookup(struct p4_priv *pr, uint32_t dip,
 	return NULL;
 }
 
+/* Write a NETWORK byte-order prefix mask for the top N bits of a 32-bit
+ * field into out[4] (big-endian, byte0 = MSB): pref=32 -> ff ff ff ff,
+ * pref=24 -> ff ff ff 00, pref=8 -> ff 00 00 00, pref=0 (ANY) -> 00 00 00 00.
+ * The outbound SPD is a WILDCARD (ternary, SWX ACL) table; the ACL reads
+ * header fields big-endian (acl_table_rule_field32, byte0=MSB), so the mask
+ * must be the raw network-order prefix — same convention as the proven
+ * routing 10/8 entry ({0xff,0,0,0}).  Emit MSB-first directly from the host
+ * int (no htonl: that would byte-swap the MSB-first bytes below). */
+static void pref2mask_bytes(uint8_t pref, uint8_t *out)
+{
+	uint32_t v = 0;
+	int i;
+
+	if (pref >= 32)
+		v = 0xffffffffu;
+	else if (pref > 0)
+		v = 0xffffffffu << (32 - pref);
+	for (i = 0; i < 4; i++)
+		out[i] = (v >> (24 - 8 * i)) & 0xff;
+}
+
 /* Find the egress (encrypt) SA for an OUT PROTECT policy, binding by tunnel
  * endpoint like the DPDK backend's sa_by_policy (dpdk_spd.c): the policy's
  * tun_src/tun_dst must equal an outbound SA's src/dst; among overlaps take the
@@ -1155,6 +1176,23 @@ static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 	return NULL;
 }
 
+/* SPD rule priority for the wildcard (ACL) outbound table.  rte_swx_table_wm.c
+ * sets acl_rule->data.priority = RTE_ACL_MAX_PRIORITY - entry->key_priority,
+ * and rte_acl returns the HIGHEST-priority matching rule.  So the rule that
+ * should win (most specific: longest src+dst prefix, concrete proto) must have
+ * the LOWEST key_priority.  p4_spd_prio returns 0 for /32,/32 concrete-proto
+ * and grows as the selector broadens (ANY proto, /0), so a /32,/32 PROTECT
+ * beats a /0,/0 ANY that also matches. */
+static uint32_t p4_spd_prio(const struct r2dp_sp *sp)
+{
+	uint32_t v = 0;
+
+	v += (32u - sp->pref_src) + (32u - sp->pref_dst);
+	if (sp->ul_proto == R2DP_PROTO_ANY)
+		v += 1;
+	return v;
+}
+
 /* Write one OUT policy to outbound_table_0.  PROTECT binds to the newest
  * matching egress SA (highest gen).  If no egress SA exists YET we still
  * accept the policy (spmd installs SPD before IKE) but program it to
@@ -1164,7 +1202,7 @@ static struct p4_pol *p4_pol_find(struct p4_priv *pr, const struct r2dp_sp *sp)
 static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 {
 	struct r2dp_sp *sp = &p->sp;
-	uint8_t key[16], data[4];
+	uint8_t key[16], mask[16], data[4];
 	struct rte_swx_table_entry ent;
 	uint32_t ssrc, sdst;
 	struct p4_sa *ea;
@@ -1181,18 +1219,27 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 	memset(&ent, 0, sizeof(ent));
 	memset(key, 0, sizeof(key));
 	{
-		/* Explicitly test the REVERSE byte order (host integer LE bytes):
-		 * key bytes 01 00 00 0a for sel_src=10.0.0.1. */
-		uint32_t s_le, d_le;
-		memcpy(&s_le, sp->sel_src.addr, 4);
-		memcpy(&d_le, sp->sel_dst.addr, 4);
-		s_le = ntohl(s_le);   /* now 0x0a000001 host int -> LE bytes 01 00 00 0a */
-		d_le = ntohl(d_le);
-		memcpy(&key[0], &s_le, 4);
-		memcpy(&key[4], &d_le, 4);
-		key[8] = sp->ul_proto;
+		/* outbound_table_0 is a WILDCARD (ternary) table keyed on the IPv4
+		 * header fields (protocol, src_addr, dst_addr).  The SWX ACL
+		 * (rte_swx_table_wm.c) does NOT pack the key contiguously: it
+		 * preserves the ACTUAL header byte gaps between match fields via
+		 * key_mask0 (set from real header bit-offsets in table_params_get).
+		 * Relative to the first field (protocol @ IPv4 byte 9): proto@0,
+		 * then a 2-byte gap (IPv4 checksum @ bytes 10-11), src@3-6, dst@7-10
+		 * => key_size=11, key_offset=9.  The routing 10/8 (single dst field,
+		 * key_size=4) has no gap, which is why it works while a contiguous
+		 * SPD image misses.  Key/mask bytes are NETWORK order (big-endian,
+		 * acl_table_rule_field32 reads header fields that way). */
+		key[0] = sp->ul_proto;            /* protocol */
+		memcpy(&key[3], sp->sel_src.addr, 4);  /* src @ byte3 */
+		memcpy(&key[7], sp->sel_dst.addr, 4);  /* dst @ byte7 */
+		mask[0] = (sp->ul_proto == R2DP_PROTO_ANY) ? 0x00 : 0xff;
+		pref2mask_bytes(sp->pref_src, &mask[3]);
+		pref2mask_bytes(sp->pref_dst, &mask[7]);
+		ent.key = key;
+		ent.key_mask = mask;
+		ent.key_priority = p4_spd_prio(sp);
 	}
-	ent.key = key;
 
 	switch (sp->action) {
 	case R2DP_ACT_DISCARD:
@@ -1286,7 +1333,7 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 {
 	struct p4_priv *pr = dp->priv;
 	struct p4_pol *p;
-	uint8_t key[16];
+	uint8_t key[16], mask[16];
 	struct rte_swx_table_entry ent;
 	int rc;
 
@@ -1299,22 +1346,21 @@ static int p4_sp_del(struct fwd_dp *dp, const struct r2dp_sp *sp)
 
 	memset(&ent, 0, sizeof(ent));
 	memset(key, 0, sizeof(key));
+	memset(mask, 0, sizeof(mask));
 	{
-		/* The SPD table key is the LITTLE-ENDIAN host bytes of the
-		 * selector, SAME layout p4_spd_bind installs (exactly-matched
-		 * `bit<32>` metadata fields hash as host-order in SWX).  A
-		 * network-order key here would never match the installed entry
-		 * and the delete would silently no-op, orphaning the row. */
-		uint32_t s_le, d_le;
-		memcpy(&s_le, p->sp.sel_src.addr, 4);
-		memcpy(&d_le, p->sp.sel_dst.addr, 4);
-		s_le = ntohl(s_le);
-		d_le = ntohl(d_le);
-		memcpy(&key[0], &s_le, 4);
-		memcpy(&key[4], &d_le, 4);
-		key[8] = p->sp.ul_proto;
+		/* Same wildcard key image p4_spd_bind installs: [proto][src][dst]
+		 * NETWORK order + matching key_mask + priority.  A delete with any
+		 * other key/mask would silently no-op and orphan the row. */
+		key[0] = p->sp.ul_proto;
+		memcpy(&key[1], p->sp.sel_src.addr, 4);
+		memcpy(&key[5], p->sp.sel_dst.addr, 4);
+		mask[0] = (p->sp.ul_proto == R2DP_PROTO_ANY) ? 0x00 : 0xff;
+		pref2mask_bytes(p->sp.pref_src, &mask[1]);
+		pref2mask_bytes(p->sp.pref_dst, &mask[5]);
 	}
 	ent.key = key;
+	ent.key_mask = mask;
+	ent.key_priority = p4_spd_prio(&p->sp);
 	rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl, "outbound_table_0",
 					     &ent);
 	if (rc) {
