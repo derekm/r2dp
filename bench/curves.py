@@ -160,14 +160,24 @@ def plot(data, out):
 
     # (a) DPDK tap-free scaling (enc) per series
     ax = fig.add_subplot(gs[0, :])
+    # Stable color keyed by (box, pmd); reused verbatim in the P4 sweep panel
+    # so a series keeps its color across panels (review: colors were inverted
+    # between the DPDK and P4 panels).
+    sc = {
+        ".179 (12-core)|aesni_mb": "#1f77b4",
+        ".165 (4-core)|openssl":  "#ff7f0e",
+        ".179 (12-core)|openssl": "#2ca02c",
+    }
+    def color(box, pmd):
+        return sc.get(f"{box}|{pmd}", "#333333")
     styles = {"openssl": "o-", "aesni_mb": "^-"}
     for s in dpdk:
         xs = sorted(int(k) for k in s["enc"])
         label = f"{s['box']} {s['pmd']}"
         ax.plot(xs, [s["enc"][str(x)] for x in xs], styles.get(s["pmd"], "o-"),
-                label=label, ms=6)
+                label=label, color=color(s["box"], s["pmd"]), ms=6)
     ax.axhline(p4_tapfree, color="gray", ls=":", lw=1.5,
-               label=f"P4 single instance (tap-free ~{p4_tapfree:.2f})")
+               label=f"P4 .165 openssl 64B, tap-free (~{p4_tapfree:.2f})")
     ax.axvspan(7.6, 12, color="green", alpha=0.07)
     ylo, yhi = ax.get_ylim()
     ax.text(8.1, ylo + (yhi - ylo) * 0.06,
@@ -188,7 +198,8 @@ def plot(data, out):
         xs = sorted(int(k) for k in s["enc_cyc"])
         ax.plot(xs, [s["enc_cyc"][str(x)] for x in xs],
                 styles.get(s["pmd"], "o-"),
-                label=f"{s['box']} {s['pmd']}", ms=6)
+                label=f"{s['box']} {s['pmd']}",
+                color=color(s["box"], s["pmd"]), ms=6)
     ax.set_xlabel("packet workers (-n)")
     ax.set_ylabel("enc cyc/pkt (per-worker, lower=better)")
     ax.set_title("Per-worker efficiency (fwd_bench enc_cyc_pkt)")
@@ -205,11 +216,24 @@ def plot(data, out):
                 xs = sorted(int(k) for k in sizes)
                 ys = [sizes[str(x)][0] for x in xs]   # Mpps
                 ax.plot(xs, ys, styles4.get(pmd, "o-"), ms=6,
-                        label=f"P4 {box} {pmd}")
+                        label=f"P4 {box} {pmd}",
+                        color=color(box, pmd))
+                for xi, yi in zip(xs, ys):
+                    ax.annotate(f"{yi:.2f}", (xi, yi),
+                                textcoords="offset points", xytext=(0, 7),
+                                ha="center", fontsize=8,
+                                color=color(box, pmd))
+        ax.set_ylim(0, None)          # keep the .165 1400B (0.66) on the floor
         ax.set_xlabel("inner frame size (B)")
         ax.set_ylabel("Mpps (tap-free)")
         ax.set_title("P4 tap-free, single instance (size sweep)")
         ax.ticklabel_format(axis="x", style="plain")
+        # tap wall (was the only place the shared net_tap numbers were on the
+        # figure; keep them as a caption so the wall isn't lost from the chart)
+        ax.text(0.02, 0.98,
+                f"for reference (shared net_tap, .165, 64B): P4 {p4_tap*1e3:.0f}K "
+                f"pps, DPDK {dpdk_tap*1e3:.0f}K pps -- tap is the I/O wall",
+                transform=ax.transAxes, va="top", fontsize=7, color="#555555")
     else:
         # fall back to the tap-free-vs-tap bar wall
         dpdk_tapfree = {}

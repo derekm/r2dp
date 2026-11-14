@@ -139,7 +139,7 @@
   "tapless_mpps": 1.0,
   "tap_mpps": 0.132,
   "dpdk_tap_mpps": 0.252,
-  "note": "P4 tap-free = R2DP_P4_BENCH single SWX instance (.165, openssl, 64B). P4/DPDK net_tap = bench/p4_bench.sh shared I/O path (.165, 64B); the tap is the wall. DPDK series from bench/fwd_bench both PMDs both boxes (tap-free). P4 is one SWX pipeline (single instance); tap-free P4 sweep above is per packet size x crypto PMD,",
+  "note": "P4 tap-free = R2DP_P4_BENCH single SWX instance. P4/DPDK net_tap = bench/p4_bench.sh shared I/O path (.165, 64B); the tap is the wall. DPDK series from bench/fwd_bench (both PMDs, both boxes, tap-free). P4 runs one SWX pipeline (single instance); the 'sweep' map below is per packet size x crypto PMD (tap-free). tapless_mpps is the historical .165 openssl 64B anchor (0.99 in sweep).",
   "sweep": {
    ".179 (12-core)": {
     "openssl": {
@@ -162,7 +162,7 @@
       1860
      ],
      "512": [
-      1.5,
+      1.51,
       2117
      ],
      "1400": [
@@ -178,7 +178,7 @@
       2528
      ],
      "512": [
-      0.85,
+      0.86,
       2918
      ],
      "1400": [
