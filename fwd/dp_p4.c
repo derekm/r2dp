@@ -48,6 +48,9 @@
 #include <rte_ring.h>
 #include <rte_cryptodev.h>
 #include <rte_mbuf.h>
+#include <rte_mempool.h>
+#include <rte_ethdev.h>
+#include <rte_malloc.h>
 
 #include "dp.h"
 #include <r2dp/proto.h>   /* r2dp_sa / r2dp_sp layouts */
@@ -103,6 +106,13 @@ struct p4_priv {
 	char iospec_path[PATH_MAX];
 	int cdev_id;           /* cryptodev for the ipsec extern; -1 none */
 
+	/* I/O legs: outer = ciphertext/wire side, inner = plaintext side.
+	 * Each maps an ethdev port to a pipeline input ring and an output
+	 * ring (see the iospec / port_in_* names). */
+	int outer_port, inner_port;
+	struct rte_mempool *pool;
+	struct rte_ring *in0, *in1, *out0, *out1;
+
 	/* Cached table key layout from table_info (bytes, big-endian order). */
 	uint32_t inbound_key_size;
 	uint32_t outbound_key_size;
@@ -116,6 +126,11 @@ struct p4_priv {
 	int wake_fd;
 };
 
+/* I/O bridge burst size. */
+#define P4_BURST_SZ 32
+#define P4_POOL_SIZE 8192
+#define P4_POOL_CACHE 256
+
 /* SWX run quanta per burst (arbitrary; bounds how many instructions one
  * rte_swx_pipeline_run call executes before yielding to the ipsec block). */
 #define P4_RUN_QUANTA 1000
@@ -123,18 +138,140 @@ struct p4_priv {
 /* Packet-path worker: drain the pipeline's input, execute the PNA program,
  * run the ipsec extern head-of-line, then loop.  Mirrors examples/pipeline
  * thread_main: run each pipeline then each block (the ipsec extern) with no
- * sleep so the pipeline saturates. */
+ * sleep so the pipeline saturates.
+
+ * Packets are bridged between the ethdev legs and the pipeline rings
+ * (R2DP_IN0/IN1 in, R2DP_OUT0/OUT1 out): RX a burst off a leg and enqueue it
+ * to that leg's input ring; the pipeline's `rx`/`tx` instructions move it
+ * through the PNA program; dequeue the output ring and TX to the matching
+ * leg.  An empty ring or PMD is a no-op. */
 static void *p4_worker(void *arg)
 {
 	struct p4_priv *pr = arg;
 
 	while (atomic_load_explicit(&pr->running, __ATOMIC_RELAXED)) {
+		/* Bridge RX: outer -> in0, inner -> in1. */
+		if (pr->outer_port >= 0 && pr->in0 && pr->pool) {
+			struct rte_mbuf *pkts[P4_BURST_SZ];
+			uint16_t n = rte_eth_rx_burst(pr->outer_port, 0,
+						      pkts, P4_BURST_SZ);
+			if (n)
+				rte_ring_enqueue_bulk(pr->in0, (void **)pkts,
+						      n, NULL);
+		}
+		if (pr->inner_port >= 0 && pr->in1 && pr->pool) {
+			struct rte_mbuf *pkts[P4_BURST_SZ];
+			uint16_t n = rte_eth_rx_burst(pr->inner_port, 0,
+						      pkts, P4_BURST_SZ);
+			if (n)
+				rte_ring_enqueue_bulk(pr->in1, (void **)pkts,
+						      n, NULL);
+		}
+
+		/* Run the pipeline + ipsec extern. */
 		if (pr->p)
 			rte_swx_pipeline_run(pr->p, P4_RUN_QUANTA);
 		if (pr->ipsec)
 			rte_swx_ipsec_run(pr->ipsec);
+
+		/* Bridge TX: out0 -> outer, out1 -> inner. */
+		if (pr->outer_port >= 0 && pr->out0) {
+			struct rte_mbuf *pkts[P4_BURST_SZ];
+			uint16_t n = rte_ring_dequeue_burst(pr->out0,
+							    (void **)pkts,
+							    P4_BURST_SZ, NULL);
+			if (n)
+				rte_eth_tx_burst(pr->outer_port, 0, pkts, n);
+		}
+		if (pr->inner_port >= 0 && pr->out1) {
+			struct rte_mbuf *pkts[P4_BURST_SZ];
+			uint16_t n = rte_ring_dequeue_burst(pr->out1,
+							    (void **)pkts,
+							    P4_BURST_SZ, NULL);
+			if (n)
+				rte_eth_tx_burst(pr->inner_port, 0, pkts, n);
+		}
 	}
 	return NULL;
+}
+
+/* Find + configure the two ethdev legs (tap / memif / vhost, like the DPDK
+ * backend's ports_find): first device = outer, second = inner.  mbuf pool
+ * sized for the burst path. */
+static int p4_io_init(struct p4_priv *pr)
+{
+	static const char *const drv[] = { "tap", "memif", "vhost" };
+	uint16_t port;
+
+	pr->outer_port = pr->inner_port = -1;
+	RTE_ETH_FOREACH_DEV(port) {
+		struct rte_eth_dev_info di;
+		int ok = 0;
+		if (rte_eth_dev_info_get(port, &di) != 0)
+			continue;
+		for (size_t i = 0; i < RTE_DIM(drv); i++)
+			ok |= strstr(di.driver_name, drv[i]) != NULL;
+		if (!ok)
+			continue;
+		if (pr->outer_port < 0)
+			pr->outer_port = port;
+		else if (pr->inner_port < 0)
+			pr->inner_port = port;
+	}
+	if (pr->outer_port < 0) {
+		/* No NIC: run control-only (pipeline loads, no packet I/O). */
+		P4_LOG("no tap/memif/vhost device; serving control-only");
+		pr->outer_port = pr->inner_port = -1;
+		return 0;
+	}
+
+	pr->pool = rte_pktmbuf_pool_create("r2dp_p4_pool", P4_POOL_SIZE,
+					   P4_POOL_CACHE, 0,
+					   RTE_MBUF_DEFAULT_BUF_SIZE,
+					   SOCKET_ID_ANY);
+	if (!pr->pool) {
+		P4_LOG("mbuf pool create failed");
+		return -ENOMEM;
+	}
+
+	/* Configure one RX+TX queue and start each present leg. */
+	{
+		struct rte_eth_conf conf = {0};
+		if (rte_eth_dev_configure((uint16_t)pr->outer_port, 1, 1,
+					  &conf) < 0)
+			return -EIO;
+		if (rte_eth_rx_queue_setup((uint16_t)pr->outer_port, 0, 1024,
+		    rte_eth_dev_socket_id((uint16_t)pr->outer_port), NULL,
+		    pr->pool) < 0)
+			return -EIO;
+		if (rte_eth_tx_queue_setup((uint16_t)pr->outer_port, 0, 1024,
+		    rte_eth_dev_socket_id((uint16_t)pr->outer_port), NULL) < 0)
+			return -EIO;
+		if (rte_eth_dev_start((uint16_t)pr->outer_port) < 0)
+			return -EIO;
+		rte_eth_promiscuous_enable((uint16_t)pr->outer_port);
+		if (pr->inner_port >= 0) {
+			if (rte_eth_dev_configure((uint16_t)pr->inner_port,
+						  1, 1, &conf) < 0)
+				return -EIO;
+			if (rte_eth_rx_queue_setup((uint16_t)pr->inner_port,
+			    0, 1024,
+			    rte_eth_dev_socket_id((uint16_t)pr->inner_port),
+			    NULL, pr->pool) < 0)
+				return -EIO;
+			if (rte_eth_tx_queue_setup((uint16_t)pr->inner_port,
+			    0, 1024,
+			    rte_eth_dev_socket_id((uint16_t)pr->inner_port),
+			    NULL) < 0)
+				return -EIO;
+			if (rte_eth_dev_start((uint16_t)pr->inner_port) < 0)
+				return -EIO;
+			rte_eth_promiscuous_enable((uint16_t)pr->inner_port);
+		}
+	}
+	P4_LOG("I/O: outer=port %d, inner=port %d", pr->outer_port,
+	       pr->inner_port);
+	return 0;
 }
 
 static void p4_caps(struct fwd_dp *dp)
@@ -497,6 +634,19 @@ static int p4_start(struct fwd_dp *dp)
 	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
 		"ipsec_port_in_outbound", 0, (uint64_t)0xffffffffUL);
 
+	/* Find + configure the two ethdev legs (tap/memif/vhost) and the mbuf
+	 * pool; a box with no such NIC runs control-only. */
+	rc = p4_io_init(pr);
+	if (rc)
+		return rc;
+
+	/* Grab the pipeline ring handles (created in p4_build_from_spec) so
+	 * the worker can bridge eth <-> pipeline. */
+	pr->in0  = rte_ring_lookup("R2DP_IN0");
+	pr->in1  = rte_ring_lookup("R2DP_IN1");
+	pr->out0 = rte_ring_lookup("R2DP_OUT0");
+	pr->out1 = rte_ring_lookup("R2DP_OUT1");
+
 	/* Launch the packet-path worker. */
 	atomic_store_explicit(&pr->running, 1, __ATOMIC_RELAXED);
 	if (pthread_create(&pr->th, NULL, p4_worker, pr) != 0) {
@@ -587,10 +737,6 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		e->dir = inbound ? R2DP_DIR_IN : R2DP_DIR_OUT;
 		e->sl_id = (uint32_t)i;      /* stable per-install id */
 		e->in_use = 1;
-		if (sa->src.family == R2DP_AF_INET4) {
-			memcpy(&e->sip, sa->src.addr, 4);
-			e->sip = ntohl(e->sip);
-		}
 	}
 
 	/* Crypto SA in the ipsec extern (spi -> cipher/AEAD params + key).
@@ -780,9 +926,13 @@ static void p4_stop(struct fwd_dp *dp)
 		rte_swx_ipsec_free(pr->ipsec);
 	if (pr->p)
 		rte_swx_pipeline_free(pr->p);
+	if (pr->pool)
+		rte_mempool_free(pr->pool);
 	pr->ctl = NULL;
 	pr->ipsec = NULL;
 	pr->p = NULL;
+	pr->pool = NULL;
+	pr->in0 = pr->in1 = pr->out0 = pr->out1 = NULL;
 	pr->started = 0;
 }
 
