@@ -455,8 +455,10 @@ r2dp_nh_lookup_bulk(const struct r2dp_nh_tab *t, const uint32_t *ip,
 		k[i] = &ip[i];
 	if (rte_hash_lookup_bulk_data(h, k, n, &hit, data) < 0)
 		return 0;
+	/* the hash writes data[] for hits only: never read a miss slot,
+	 * and give a miss a defined zero (NH-5) */
 	for (unsigned i = 0; i < n; i++)
-		mac[i] = (uint64_t)(uintptr_t)data[i];
+		mac[i] = (hit >> i) & 1 ? (uint64_t)(uintptr_t)data[i] : 0;
 	return hit;
 }
 #endif /* R2DP_HAVE_DPDK */

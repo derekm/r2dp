@@ -248,6 +248,46 @@ lifetimes(void)
 	r2dp_nh_free(&t);
 }
 
+/* NH-5: misses in a bulk lookup come back as a defined 0. */
+static void
+bulk_miss(void)
+{
+	struct r2dp_nh_tab t;
+	const uint8_t A[6] = { 0x02, 0, 0, 0, 0, 0x0a };
+	uint32_t ip[RTE_HASH_LOOKUP_BULK_MAX];
+	uint64_t mac[RTE_HASH_LOOKUP_BULK_MAX];
+	static const unsigned ns[] = { 1, 32, RTE_HASH_LOOKUP_BULK_MAX };
+	int ok = 1;
+
+	if (r2dp_nh_init(&t, "nh_bmiss", 0, NULL, SOCKET_ID_ANY)) {
+		CHECK(0, "table init"); return;
+	}
+	for (unsigned z = 0; z < 3; z++) {
+		unsigned n = ns[z];
+		for (unsigned i = 0; i < n; i++) { ip[i] = 100 + i; mac[i] = ~0ull; }
+		if (r2dp_nh_lookup_bulk(&t, ip, n, mac) != 0)
+			ok = 0;
+		for (unsigned i = 0; i < n; i++)
+			ok &= mac[i] == 0;
+	}
+	CHECK(ok, "empty table: all-miss bulk lookups (1, 32, max) give 0");
+	for (unsigned i = 0; i < RTE_HASH_LOOKUP_BULK_MAX; i += 2)
+		r2dp_nh_learn(&t, 100 + i, A);
+	for (unsigned i = 0; i < RTE_HASH_LOOKUP_BULK_MAX; i++) mac[i] = ~0ull;
+	{
+		uint64_t hit = r2dp_nh_lookup_bulk(&t, ip,
+		    RTE_HASH_LOOKUP_BULK_MAX, mac);
+		ok = 1;
+		for (unsigned i = 0; i < RTE_HASH_LOOKUP_BULK_MAX; i++) {
+			int h = (hit >> i) & 1;
+			ok &= h == !(i & 1);
+			ok &= h ? !memcmp(&mac[i], A, 6) : mac[i] == 0;
+		}
+	}
+	CHECK(ok, "mixed batch: hits carry the MAC, misses are 0");
+	r2dp_nh_free(&t);
+}
+
 static void
 many(unsigned n)
 {
@@ -455,6 +495,7 @@ main(void)
 	basic();
 	ordering();
 	lifetimes();
+	bulk_miss();
 	many(65);
 	many(1000);
 	grow_alloc_failure();

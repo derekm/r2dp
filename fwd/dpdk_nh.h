@@ -145,7 +145,7 @@ int r2dp_nh_lookup(const struct r2dp_nh_tab *t, uint32_t ip, uint8_t mac[6]);
 
 /* Look up n (<= RTE_HASH_LOOKUP_BULK_MAX) addresses at once: mac[i] gets
  * ip[i]'s MAC (6 bytes, low bytes of the word in memory order) and bit i
- * of the return value is set when it is known. */
+ * of the return value is set when it is known; a miss gets 0. */
 uint64_t r2dp_nh_lookup_bulk(const struct r2dp_nh_tab *t, const uint32_t *ip,
     unsigned n, uint64_t *mac);
 
