@@ -19,12 +19,15 @@
  * (default 1024).  It is not a limit: the table doubles as it fills.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/file.h>
 
 #include "ctl.h"
 #include "dp.h"
@@ -107,6 +110,41 @@ main(int argc, char **argv)
 
 	signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGPIPE, SIG_IGN);
 	signal(SIGUSR1, on_usr1);   /* dump datapath stats + drop reasons */
+
+	/* One forwarder per control endpoint (SHUTDOWN SH1): r2dp_listen
+	 * replaces an existing socket at the path, so a second instance
+	 * started on the same path would steal a LIVE endpoint.  Take an
+	 * exclusive lock on <sockpath>.lock before probing any backend and
+	 * hold it for the process lifetime; the lock file is never removed
+	 * (removing it would let a third instance lock a fresh inode). */
+	{
+		char lp[PATH_MAX];
+		int lfd;
+		if (snprintf(lp, sizeof(lp), "%s.lock", sockpath) >=
+		    (int)sizeof(lp)) {
+			fprintf(stderr, "r2dp-fwd: listen %s: path too long\n",
+			    sockpath);
+			free(eal_base);
+			return 1;
+		}
+		lfd = open(lp, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+		if (lfd < 0) {
+			fprintf(stderr, "r2dp-fwd: listen %s: instance lock %s: "
+			    "%s\n", sockpath, lp, strerror(errno));
+			free(eal_base);
+			return 1;
+		}
+		if (flock(lfd, LOCK_EX | LOCK_NB) < 0) {
+			int e = errno;
+			fprintf(stderr, "r2dp-fwd: listen %s: %s\n", sockpath,
+			    e == EWOULDBLOCK ? "another r2dp-fwd already serves "
+			    "this control socket" : strerror(e));
+			close(lfd);
+			free(eal_base);
+			return 1;
+		}
+		/* lfd stays open (and locked) until exit */
+	}
 
 	fwd_ctl_init(&ctl, sockpath, verbose);
 

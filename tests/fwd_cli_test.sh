@@ -49,4 +49,36 @@ else
 	else echo "FAIL rc=0: bad EAL option"; cat "$T/out"; fails=$((fails+1)); fi
 fi
 
+# SHUTDOWN SH1: a second forwarder on a live control socket must fail
+# before touching it; the first keeps its endpoint; after the owner dies
+# (even SIGKILL) a new one can take over.
+CTL=${2:-}
+S=$T/one.sock
+"$FWD" -s "$S" $EAL --file-prefix r2dpA$$ >"$T/a.out" 2>&1 & A=$!
+for _ in $(seq 100); do [ -S "$S" ] && break; sleep 0.1; done
+if [ -S "$S" ]; then
+	ino=$(stat -c %i "$S")
+	rc 1 "$FWD" -s "$S" $EAL --file-prefix r2dpB$$;  has "already serves"
+	[ "$(stat -c %i "$S")" = "$ino" ] && kill -0 $A 2>/dev/null &&
+		echo "ok   first instance keeps its socket" ||
+		{ echo "FAIL second instance replaced the live socket"; fails=$((fails+1)); }
+	if [ -n "$CTL" ]; then
+		"$CTL" "$S" hello >"$T/out" 2>&1 && echo "ok   first instance still answers" ||
+			{ echo "FAIL hello to first instance"; cat "$T/out"; fails=$((fails+1)); }
+	fi
+	kill -9 $A; wait $A 2>/dev/null
+	"$FWD" -s "$S" $EAL --file-prefix r2dpC$$ >"$T/c.out" 2>&1 & C=$!
+	ok=0
+	for _ in $(seq 100); do
+		grep -q "serving" "$T/c.out" && { ok=1; break; }
+		kill -0 $C 2>/dev/null || break; sleep 0.1
+	done
+	[ $ok = 1 ] && echo "ok   replacement takes over after the owner is killed" ||
+		{ echo "FAIL no takeover after SIGKILL"; cat "$T/c.out"; fails=$((fails+1)); }
+	kill $C 2>/dev/null; wait $C 2>/dev/null
+else
+	echo "FAIL first instance did not start"; cat "$T/a.out"; fails=$((fails+1))
+	kill $A 2>/dev/null; wait $A 2>/dev/null
+fi
+
 [ $fails = 0 ] && echo "PASS" || { echo "$fails failure(s)"; exit 1; }
