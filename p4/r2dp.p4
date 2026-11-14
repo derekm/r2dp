@@ -15,7 +15,7 @@
 // is demuxed on the RFC 3948 zero marker (non-ESP keepalive/IKE forwarded
 // clear; a non-zero SPI is ESP-in-UDP).  SAD is exact (ipv4.dst_addr, spi);
 // SPD is exact (src_addr, dst_addr, protocol) — SAD's exact key is correct;
-// the SPD exact-only (no prefix/ANY) and the inbound miss action `drop`,
+// the SPD exact-only (no prefix/ANY/ports) and the inbound miss action `drop`,
 // which is NOT the DPDK backend's DR_NO_SA_IN counter, are the known scoped
 // limits, not full parity.  Do not reintroduce the pre-§8 IKE/ARP drops or
 // the blanket "every UDP/4500 is ESP" parse.
