@@ -10,6 +10,9 @@
  *     and that the SAD resolves the new session.
  *  2. sa_by_policy picks the NEWEST outbound SA for a tunnel during a rekey
  *     overlap, regardless of table slot order.
+ *  3. Inbound SAD (ATOMICS A1, SADB S1-S3): a reader resolving a live SA
+ *     never misses it while other inbound SAs churn and the SAD grows by
+ *     swap from a tiny size; no install fails for want of SAD room.
  *
  * SKIP (77) without EAL/crypto_openssl unless R2DP_REQUIRE_DPDK is set.
  */
@@ -28,7 +31,6 @@ mk_priv(void)
 	struct dpdk_priv *d = aligned_alloc(RTE_CACHE_LINE_SIZE, sizeof(*d));
 	struct rte_cryptodev_config cc;
 	struct rte_cryptodev_qp_conf qc;
-	struct rte_ipsec_sad_conf sc;
 	int id;
 
 	if (!d)
@@ -49,11 +51,7 @@ mk_priv(void)
 	d->sess_mp = rte_cryptodev_sym_session_pool_create("t_sess", 64,
 	    rte_cryptodev_sym_get_private_session_size(d->cdev_id), 0, 0,
 	    SOCKET_ID_ANY);
-	memset(&sc, 0, sizeof(sc));
-	sc.socket_id = SOCKET_ID_ANY;
-	sc.max_sa[RTE_IPSEC_SAD_SPI_DIP] = 64;
-	sc.flags = RTE_IPSEC_SAD_FLAG_RW_CONCURRENCY;
-	d->sad = rte_ipsec_sad_create("t_sad", &sc);
+	d->sad = dp_sad_create("t_sad", 64);
 	if (!d->sess_mp || !d->sad)
 		return NULL;
 	rte_spinlock_init(&d->lock);
@@ -128,6 +126,113 @@ reader(void *arg)
 	rte_rcu_qsbr_thread_offline(d->rcu, d->wk[0].lcore);
 	rte_rcu_qsbr_thread_unregister(d->rcu, d->wk[0].lcore);
 	return 0;
+}
+
+/* --- SAD: lock-free lookups stay correct across churn and growth --- */
+static unsigned long sad_rd_iters, sad_rd_miss;
+static union rte_ipsec_sad_key sad_rd_key;
+
+static int
+sad_reader(void *arg)
+{
+	struct dpdk_priv *d = arg;
+	const union rte_ipsec_sad_key *kp[1] = { &sad_rd_key };
+
+	rte_rcu_qsbr_thread_register(d->rcu, d->wk[0].lcore);
+	rte_rcu_qsbr_thread_online(d->rcu, d->wk[0].lcore);
+	while (!__atomic_load_n(&rd_stop, __ATOMIC_ACQUIRE)) {
+		void *v[1];
+		const struct dp_sa *ds;
+
+		if (dp_sad_lookup(sad_load(d), kp, v, 1) != 1 || !v[0])
+			sad_rd_miss++;
+		else {
+			ds = sa_of_sess(d, v[0]);
+			/* a retiring slot is still intact until the grace
+			 * period ends: what matters is it is never freed or
+			 * reused while this reader can hold it */
+			if (!ds || ds->spi != sad_rd_key.v4.spi)
+				sad_rd_miss++;
+		}
+		__atomic_fetch_add(&sad_rd_iters, 1, __ATOMIC_RELAXED);
+		rte_rcu_qsbr_quiescent(d->rcu, d->wk[0].lcore);
+	}
+	rte_rcu_qsbr_thread_offline(d->rcu, d->wk[0].lcore);
+	rte_rcu_qsbr_thread_unregister(d->rcu, d->wk[0].lcore);
+	return 0;
+}
+
+static void
+t_sad(struct dpdk_priv *d)
+{
+	enum { NCH = 600 };
+	struct r2dp_sa r;
+	unsigned lc = rte_get_next_lcore(-1, 1, 0);
+	size_t rsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
+	struct rte_hash *small;
+	uint32_t n0 = d->sad_n, cap0 = d->sad_cap, rej = 0;
+	struct rte_hash *orig = d->sad;
+	char ip[32];
+
+	if (lc >= RTE_MAX_LCORE) { CHECK(0, "need a worker lcore (-l 0-1)"); return; }
+	/* start from a tiny growable SAD so the churn forces several swaps */
+	small = dp_sad_create("t_sad_small", 8);
+	if (!small) { CHECK(0, "small SAD"); return; }
+	d->sad = small;
+	d->sad_cap = 8;
+	d->sad_n = 0;
+	d->wk[0].lcore = lc;
+	d->rcu = rte_zmalloc("t_rcu2", rsz, RTE_CACHE_LINE_SIZE);
+	if (!d->rcu) { CHECK(0, "rcu alloc"); return; }
+	rte_rcu_qsbr_init(d->rcu, RTE_MAX_LCORE);
+
+	mk_sa(&r, 0x7000, "192.0.2.2", "192.0.2.1");          /* the live SA */
+	CHECK(sa_install(d, &r, key, 20, 0, 1) == 0, "sad: live inbound SA");
+	memset(&sad_rd_key, 0, sizeof(sad_rd_key));
+	sad_rd_key.v4.spi = 0x7000;
+	memcpy(&sad_rd_key.v4.dip, r.dst.addr, 4);
+	rd_stop = 0;
+	lc_launch(sad_reader, d, lc);
+	while (!__atomic_load_n(&sad_rd_iters, __ATOMIC_RELAXED))
+		;
+	for (unsigned n = 0; n < NCH; n++) {           /* churn + growth */
+		snprintf(ip, sizeof(ip), "198.51.%u.%u", 100 + n / 250, 1 + n % 250);
+		mk_sa(&r, 0x8000 + n, ip, "192.0.2.1");
+		if (sa_install(d, &r, key, 20, 0, 1) != 0)
+			rej++;
+		if (n % 3 == 2) {                    /* delete an older one */
+			snprintf(ip, sizeof(ip), "198.51.%u.%u", 100 + (n - 2) / 250,
+			    1 + (n - 2) % 250);
+			mk_sa(&r, 0x8000 + n - 2, ip, "192.0.2.1");
+			(void)sa_install(d, &r, NULL, 0, 1, 1);
+		}
+		mk_sa(&r, 0x7000, "192.0.2.2", "192.0.2.1");   /* rekey-style upsert */
+		if (n % 50 == 0 && sa_install(d, &r, key, 20, 0, 1) != 0)
+			rej++;
+	}
+	__atomic_store_n(&rd_stop, 1, __ATOMIC_RELEASE);
+	lc_wait_all();
+	CHECK(sad_rd_iters > 0 && sad_rd_miss == 0,
+	    "sad: live SA resolved on every lookup through churn, upserts and growth");
+	CHECK(rej == 0, "sad: no install refused for want of SAD room");
+	CHECK(d->sad_cap >= 512 && d->sad_n == 1 + NCH - NCH / 3,
+	    "sad: grew by swap; sad_n counts exactly the live inbound SAs");
+
+	/* clean up: every inbound SA this test added */
+	mk_sa(&r, 0x7000, "192.0.2.2", "192.0.2.1");
+	(void)sa_install(d, &r, NULL, 0, 1, 1);
+	for (unsigned n = 0; n < NCH; n++) {
+		snprintf(ip, sizeof(ip), "198.51.%u.%u", 100 + n / 250, 1 + n % 250);
+		mk_sa(&r, 0x8000 + n, ip, "192.0.2.1");
+		(void)sa_install(d, &r, NULL, 0, 1, 1);
+	}
+	CHECK(d->sad_n == 0, "sad: empty after cleanup");
+	rte_free(d->rcu);
+	d->rcu = NULL;
+	dp_sad_destroy(d->sad);
+	d->sad = orig;
+	d->sad_cap = cap0;
+	d->sad_n = n0;
 }
 
 static void
@@ -589,7 +694,7 @@ main(void)
 		    "fields before sa_tab untouched (no sa_tab[-1] write)");
 		memset(&k, 0, sizeof(k));
 		k.v4.spi = 0x1001; memcpy(&k.v4.dip, r.dst.addr, 4);
-		CHECK(rte_ipsec_sad_lookup(d->sad, kp, val, 1) == 1 && val[0] != NULL,
+		CHECK(dp_sad_lookup(d->sad, kp, val, 1) == 1 && val[0] != NULL,
 		    "SAD resolves the fresh inbound SA");
 		CHECK(val[0] && ((struct dp_sa *)((char *)val[0] -
 		    offsetof(struct dp_sa, sess)))->inbound == 1, "SA marked inbound");
@@ -597,10 +702,10 @@ main(void)
 		/* upsert (same SPI/DIP): the old slot is retired, new one live */
 		CHECK(sa_install(d, &r, key, 20, 0, 1) == 0, "inbound upsert");
 		CHECK(d->rcu_tid == canary_tid, "upsert leaves canary intact");
-		CHECK(rte_ipsec_sad_lookup(d->sad, kp, val, 1) == 1 && val[0] != NULL,
+		CHECK(dp_sad_lookup(d->sad, kp, val, 1) == 1 && val[0] != NULL,
 		    "SAD resolves the upserted SA");
 		CHECK(sa_install(d, &r, NULL, 0, 1, 1) == 0, "inbound delete");
-		CHECK(rte_ipsec_sad_lookup(d->sad, kp, val, 1) == 0,
+		CHECK(dp_sad_lookup(d->sad, kp, val, 1) == 0,
 		    "SAD empty after delete");
 	}
 
@@ -646,6 +751,7 @@ main(void)
 	}
 
 	t_sp_concurrency(d);
+	t_sad(d);
 	t_inbound_policy(d);
 	t_binding(d);
 	t_replay_window();
@@ -657,7 +763,7 @@ main(void)
 	for (int i = 0; i < (int)sa_cap(d); i++)
 		if ((*sa_at(d, (uint32_t)(i))).used)
 			sa_slot_free(d, &(*sa_at(d, (uint32_t)(i))));
-	rte_ipsec_sad_destroy(d->sad);
+	dp_sad_destroy(d->sad);
 	rte_mempool_free(d->sess_mp);
 	rte_cryptodev_stop(d->cdev_id);
 	rte_cryptodev_close(d->cdev_id);

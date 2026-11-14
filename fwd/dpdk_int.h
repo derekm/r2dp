@@ -38,6 +38,7 @@
 #include <rte_acl.h>
 #include <rte_ring.h>
 #include <rte_hash_crc.h>
+#include <rte_hash.h>
 
 #include "r2dp/client.h"
 #include "dp.h"
@@ -291,7 +292,8 @@ struct dpdk_priv {
 	struct rte_mempool *sess_more[DP_MAX_SESS_POOLS]; /* added on demand */
 	uint32_t            n_sess_more;
 	struct rte_mempool *cop_mp;    /* crypto operation mempool */
-	struct rte_ipsec_sad *sad;     /* published: workers acquire-load it */
+	struct rte_hash    *sad;      /* inbound SAD (dp_sad_*); published:
+				       * workers acquire-load it */
 	uint32_t            sad_cap;  /* SAs it was sized for; 0 = fixed */
 	uint32_t            sad_n;    /* inbound SAs in it */
 	struct rte_cryptodev_info cdev_info;
@@ -370,10 +372,51 @@ sp_cap(const struct dpdk_priv *d)
 	return __atomic_load_n(&d->sp_cap, __ATOMIC_ACQUIRE);
 }
 
-static inline struct rte_ipsec_sad *
+static inline struct rte_hash *
 sad_load(const struct dpdk_priv *d)
 {
 	return __atomic_load_n(&d->sad, __ATOMIC_ACQUIRE);
+}
+
+/* Inbound SAD (ATOMICS A1, SADB S2): an r2dp-owned rte_hash keyed on the
+ * first 8 bytes of rte_ipsec_sadv4_key -- (SPI host order, DIP raw wire
+ * order) -- created lock-free (RW_CONCURRENCY_LF: readers never take a
+ * lock, so a preempted control thread can never stall a worker) with the
+ * extendable bucket table (an insert cannot fail on cuckoo collisions
+ * below capacity).  Deleted key slots are reclaimed only after a QSBR
+ * grace period (sa_slot_retire).  The value is &dp_sa.sess. */
+#define DP_SAD_KEY_LEN 8
+struct rte_hash *dp_sad_create(const char *name, uint32_t cap);
+static inline void
+dp_sad_destroy(struct rte_hash *h)
+{
+	rte_hash_free(h);
+}
+
+/* Same contract as rte_ipsec_sad_lookup: sa[i] = value or NULL; returns
+ * the number of hits.  Lock-free and wait-free for the caller. */
+static inline uint32_t
+dp_sad_lookup(const struct rte_hash *h, const union rte_ipsec_sad_key *const k[],
+    void *sa[], uint32_t n)
+{
+	uint32_t hits = 0;
+
+	for (uint32_t b = 0; b < n; b += RTE_HASH_LOOKUP_BULK_MAX) {
+		const void *kp[RTE_HASH_LOOKUP_BULK_MAX];
+		uint32_t m = RTE_MIN(n - b, (uint32_t)RTE_HASH_LOOKUP_BULK_MAX);
+		uint64_t hit = 0;
+
+		for (uint32_t i = 0; i < m; i++)
+			kp[i] = &k[b + i]->v4;
+		if (rte_hash_lookup_bulk_data(h, kp, m, &hit, &sa[b]) < 0)
+			hit = 0;
+		for (uint32_t i = 0; i < m; i++)
+			if (!(hit & (1ull << i)))
+				sa[b + i] = NULL;
+			else
+				hits++;
+	}
+	return hits;
 }
 
 /* Worker owning a tunnel is chosen at install, not by a hash.  A hash
@@ -397,7 +440,7 @@ dp_wk_init(struct dpdk_priv *d, unsigned id)
 }
 
 /* The inbound SAD stores &dp_sa.sess as its value, so a session handed back
- * from rte_ipsec_sad_lookup is the sess member of a dp_sa; recover the owner
+ * from dp_sad_lookup is the sess member of a dp_sa; recover the owner
  * and add `n` to its byte counter (byte-lifetime accounting). */
 static inline void
 sa_bytes_add(struct dpdk_priv *d, struct rte_ipsec_session *ss, uint64_t n)

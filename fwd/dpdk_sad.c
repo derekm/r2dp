@@ -166,55 +166,70 @@ sess_create(struct dpdk_priv *d, struct rte_crypto_sym_xform *x)
 	return rte_cryptodev_sym_session_create(d->cdev_id, x, mp);
 }
 
-/* Inbound SAD growth: build a SAD of twice the capacity holding every
- * live inbound SA, publish it, and destroy the old one after a grace
- * period (workers keep looking up in the old one until then).  On failure
- * the old SAD keeps serving.  d->sad_cap == 0: fixed-size SAD (tests). */
+struct rte_hash *
+dp_sad_create(const char *name, uint32_t cap)
+{
+	struct rte_hash_parameters hp;
+
+	memset(&hp, 0, sizeof(hp));
+	hp.name = name;
+	hp.entries = cap < 8 ? 8 : cap;
+	hp.key_len = DP_SAD_KEY_LEN;
+	hp.hash_func = rte_hash_crc;
+	hp.socket_id = SOCKET_ID_ANY;
+	hp.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF |
+	    RTE_HASH_EXTRA_FLAGS_EXT_TABLE;
+	return rte_hash_create(&hp);
+}
+
+/* Inbound SAD growth: build a SAD of (at least) twice the capacity holding
+ * every live inbound SA, publish it, and destroy the old one after a grace
+ * period (workers keep looking up in the old one until then).  A table
+ * that cannot take every key is retried larger before giving up; on
+ * failure the old SAD keeps serving.  d->sad_cap == 0: fixed size (tests). */
+#define DP_SAD_GROW_TRIES 3
 static int
 sad_grow(struct dpdk_priv *d)
 {
-	struct rte_ipsec_sad_conf conf;
-	struct rte_ipsec_sad *ns, *old = d->sad;
-	char name[RTE_IPSEC_SAD_NAMESIZE];
-	uint32_t ncap = d->sad_cap * 2;
+	struct rte_hash *ns = NULL, *old = d->sad;
+	char name[RTE_HASH_NAMESIZE];
+	uint32_t ncap = d->sad_cap ? d->sad_cap * 2 : DP_SAD_INIT;
 
 	if (grow_fail_injected(d)) {
 		d->n_grow_fail++;
 		return -ENOMEM;
 	}
-	memset(&conf, 0, sizeof(conf));
-	conf.socket_id = SOCKET_ID_ANY;
-	conf.max_sa[RTE_IPSEC_SAD_SPI_DIP] = ncap;
-	conf.flags = RTE_IPSEC_SAD_FLAG_RW_CONCURRENCY;
-	snprintf(name, sizeof(name), "r2dp_sad%u",
-	    __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELAXED));
-	ns = rte_ipsec_sad_create(name, &conf);
+	for (int t = 0; t < DP_SAD_GROW_TRIES && !ns; t++, ncap *= 2) {
+		snprintf(name, sizeof(name), "r2dp_sad%u",
+		    __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELAXED));
+		ns = dp_sad_create(name, ncap);
+		if (!ns)
+			break;
+		for (uint32_t i = 0; i < d->sa_cap; i++) {
+			struct dp_sa *ds = sa_at(d, i);
+			struct rte_ipsec_sadv4_key k = { ds->spi, ds->dip, 0 };
+
+			if (!ds->used || !ds->inbound)
+				continue;
+			if (rte_hash_add_key_data(ns, &k, &ds->sess) < 0) {
+				dp_sad_destroy(ns);
+				ns = NULL;
+				break;
+			}
+		}
+		if (ns)
+			break;
+	}
 	if (!ns) {
 		d->n_grow_fail++;
 		return -ENOMEM;
-	}
-	for (uint32_t i = 0; i < d->sa_cap; i++) {
-		struct dp_sa *ds = sa_at(d, i);
-		union rte_ipsec_sad_key k;
-
-		if (!ds->used || !ds->inbound)
-			continue;
-		memset(&k, 0, sizeof(k));
-		k.v4.spi = ds->spi;
-		k.v4.dip = ds->dip;
-		if (rte_ipsec_sad_add(ns, &k, RTE_IPSEC_SAD_SPI_DIP,
-		    &ds->sess) < 0) {
-			rte_ipsec_sad_destroy(ns);
-			d->n_grow_fail++;
-			return -ENOMEM;
-		}
 	}
 	__atomic_store_n(&d->sad, ns, __ATOMIC_RELEASE);
 	d->sad_cap = ncap;
 	d->n_grow++;
 	if (d->rcu)
 		r2dp_qsbr_sync(d->rcu);
-	rte_ipsec_sad_destroy(old);
+	dp_sad_destroy(old);
 	return 0;
 }
 
@@ -345,20 +360,22 @@ sa_slot_free(struct dpdk_priv *d, struct dp_sa *ds)
 static void
 sa_slot_retire(struct dpdk_priv *d, struct dp_sa *ds, int sad_del)
 {
-	union rte_ipsec_sad_key keyv;
+	struct rte_ipsec_sadv4_key keyv = { ds->spi, ds->dip, 0 };
 	int inbound = ds->inbound && sad_del;
+	int32_t pos = -1;
 
 	__atomic_store_n(&ds->used, 0, __ATOMIC_RELEASE); /* unlink from worker */
 	if (inbound) {
-		memset(&keyv, 0, sizeof(keyv));
-		keyv.v4.spi = ds->spi;
-		keyv.v4.dip = ds->dip;
-		if (rte_ipsec_sad_del(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP) == 0 &&
-		    d->sad_n)
+		pos = rte_hash_del_key(d->sad, &keyv);
+		if (pos >= 0 && d->sad_n)
 			d->sad_n--;
 	}
 	if (d->rcu)
 		r2dp_qsbr_sync(d->rcu);
+	/* lock-free table: the key slot is reused only after the readers
+	 * that might still hold it have passed the grace period above */
+	if (pos >= 0)
+		(void)rte_hash_free_key_with_position(d->sad, pos);
 	sa_slot_free(d, ds);
 }
 
@@ -401,7 +418,7 @@ int
 sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
     const void *key, size_t keylen, int remove, int inbound)
 {
-	union rte_ipsec_sad_key keyv;
+	struct rte_ipsec_sadv4_key keyv;
 	uint32_t dip = 0, sip = 0;
 	int idx = -1, ret;
 
@@ -503,20 +520,27 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 	(void)spd_rebuild(d);
 
 	/* Inbound: point the (SPI, DIP) SAD key at the new session before the
-	 * old one goes.  rte_ipsec_sad_add on an existing key replaces its
+	 * old one goes.  rte_hash_add_key_data on an existing key replaces its
 	 * value, so during a same-SPI update every lookup returns the old or
 	 * the new session, never a miss.  On failure the new SA is retired
 	 * and the old one keeps serving. */
 	if (inbound) {
 		memset(&keyv, 0, sizeof(keyv));
-		keyv.v4.spi = ntohl(rsa->spi);
-		keyv.v4.dip = dip;
+		keyv.spi = ntohl(rsa->spi);
+		keyv.dip = dip;
 		if (d->verbose)
 			fprintf(stderr, "r2dp-fwd: SA_ADD key spi=%08x dip=%08x "
 			    "(rsa.spi=%08x raw dip=%08x)\n", ntohl(rsa->spi),
 			    dip, rsa->spi, dip);
-		ret = rte_ipsec_sad_add(d->sad, &keyv, RTE_IPSEC_SAD_SPI_DIP,
-		    &nd->sess);   /* SAD value = the ipsec session ptr */
+		/* SAD value = the ipsec session ptr.  One table: an add either
+		 * maps the key or leaves it exactly as it was (on an existing
+		 * key it swaps the value atomically), so a failure never
+		 * leaves a key pointing at a slot about to be retired. */
+		ret = rte_hash_add_key_data(d->sad, &keyv, &nd->sess);
+		/* full despite the grow above: grow now and retry once rather
+		 * than refuse the install (lossless: grow, don't fail) */
+		if (ret == -ENOSPC && d->sad_cap && sad_grow(d) == 0)
+			ret = rte_hash_add_key_data(d->sad, &keyv, &nd->sess);
 		if (ret < 0) {
 			/* published already: unlink, wait out readers, free */
 			sa_slot_retire(d, nd, 0);

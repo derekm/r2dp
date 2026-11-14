@@ -60,7 +60,6 @@ static struct dpdk_priv *
 mk_priv(const char *tag)
 {
 	struct dpdk_priv *d = aligned_alloc(RTE_CACHE_LINE_SIZE, sizeof(*d));
-	struct rte_ipsec_sad_conf sc;
 	char n[32];
 
 	if (!d)
@@ -78,12 +77,8 @@ mk_priv(const char *tag)
 	d->cop_mp = rte_crypto_op_pool_create(n, RTE_CRYPTO_OP_TYPE_SYMMETRIC,
 	    4096, 128, sizeof(struct rte_crypto_op) +
 	    sizeof(struct rte_crypto_sym_op) + R2DP_GCM_IV_LEN, SOCKET_ID_ANY);
-	memset(&sc, 0, sizeof(sc));
-	sc.socket_id = SOCKET_ID_ANY;
-	sc.max_sa[RTE_IPSEC_SAD_SPI_DIP] = 4096;
-	sc.flags = RTE_IPSEC_SAD_FLAG_RW_CONCURRENCY;
 	snprintf(n, sizeof(n), "%s_sad", tag);
-	d->sad = rte_ipsec_sad_create(n, &sc);
+	d->sad = dp_sad_create(n, 4096);
 	d->sad_cap = 4096;              /* grows past it */
 	if (!d->sess_mp || !d->cop_mp || !d->sad)
 		return NULL;
@@ -98,7 +93,7 @@ free_priv(struct dpdk_priv *d)
 		if ((*sa_at(d, (uint32_t)(i))).used)
 			sa_slot_free(d, &(*sa_at(d, (uint32_t)(i))));
 	spd_teardown(d);
-	rte_ipsec_sad_destroy(d->sad);
+	dp_sad_destroy(d->sad);
 	rte_mempool_free(d->sess_mp);
 	rte_mempool_free(d->cop_mp);
 	dp_tables_free(d);

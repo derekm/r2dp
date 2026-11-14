@@ -440,8 +440,7 @@ bad:
 	}
 
 	/* Look up each distinct key once: a burst is normally one flow, and
-	 * every rte_ipsec_sad lookup is a full hash probe under the table's
-	 * reader lock.  Runs of the same (SPI, DIP) share one result. */
+	 * every SAD lookup is a full hash probe.  Runs of the same (SPI, DIP) share one result. */
 	uint32_t nu = 0;
 	uint8_t ux[BURST_SZ];
 	void *usa[BURST_SZ];
@@ -452,7 +451,7 @@ bad:
 			keys[nu++] = &kkey[i];
 		ux[i] = (uint8_t)(nu - 1);
 	}
-	uint32_t nlook = rte_ipsec_sad_lookup(sad_load(d), keys, usa, nu);
+	uint32_t nlook = dp_sad_lookup(sad_load(d), keys, usa, nu);
 	for (uint32_t i = 0; i < nk; i++)
 		sas[i] = usa[ux[i]];
 
@@ -477,12 +476,21 @@ bad:
 		if (!sas[i])
 			continue;
 		ds = sa_of_sess(d, sas[i]);
-		if (ds && (ds->natt == R2DP_NATT_ESPINUDP) != pnat[i]) {
+		if (!ds) {
+			/* not a table slot: fail closed.  A slot being retired
+			 * (used == 0) is still valid until the grace period
+			 * ends, so a packet that looked it up just before a
+			 * rekey swap is still decrypted, not dropped. */
+			DROP(w, DR_NO_SA_IN, 1);
+			rte_pktmbuf_free(pm[i]);
+			pm[i] = NULL;
+			sas[i] = NULL;
+		} else if ((ds->natt == R2DP_NATT_ESPINUDP) != pnat[i]) {
 			DROP(w, DR_ENCAP, 1);
 			rte_pktmbuf_free(pm[i]);
 			pm[i] = NULL;
 			sas[i] = NULL;
-		} else if (ds && ds->owner != w->id) {
+		} else if (ds->owner != w->id) {
 			/* another worker owns this SA's replay window */
 			DROP(w, DR_STEER, 1);
 			rte_pktmbuf_free(pm[i]);
@@ -894,7 +902,7 @@ dp_steer_outer(struct dpdk_priv *d, struct rte_mbuf *m[], uint16_t n,
 		}
 		ux[i] = (int16_t)(nu - 1);
 	}
-	if (!nu || rte_ipsec_sad_lookup(sad_load(d), kp, sa, nu) <= 0)
+	if (!nu || dp_sad_lookup(sad_load(d), kp, sa, nu) == 0)
 		return;
 	for (uint16_t i = 0; i < n; i++) {
 		const struct dp_sa *ds;

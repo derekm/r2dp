@@ -1062,20 +1062,13 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	}
 
 	{
-		struct rte_ipsec_sad_conf conf;
-
-		memset(&conf, 0, sizeof(conf));
-		conf.socket_id = SOCKET_ID_ANY;
-		/* Only the SPI_DIP key flavor is used (inbound ESP lookup).  Leave
-		 * the other table types unsized (0) so the SAD doesn't preallocate
-		 * SPI_ONLY / SPI_DIP_SIP tables we never query. */
-		conf.max_sa[RTE_IPSEC_SAD_SPI_DIP] = DP_SAD_INIT; /* grows */
-		conf.flags = RTE_IPSEC_SAD_FLAG_RW_CONCURRENCY;
-		d->sad = rte_ipsec_sad_create("r2dp_sad", &conf);
+		/* lock-free (SPI, DIP) table, grows by swap (dpdk_sad.c) */
+		d->sad = dp_sad_create("r2dp_sad", DP_SAD_INIT);
 		d->sad_cap = DP_SAD_INIT;
 		if (!d->sad) {
 			fprintf(stderr, "r2dp-fwd: sad create failed: %s\n",
 			    rte_strerror(rte_errno));
+			rte_mempool_free(d->pool);
 			free(d);
 			return -ENOMEM;
 		}
