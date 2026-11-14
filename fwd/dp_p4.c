@@ -167,6 +167,11 @@ struct p4_priv {
 	 * ethdev queue has ONE consumer (RX) and ONE producer (TX). */
 	int outer_port, inner_port;
 	struct rte_mempool *pool;
+	/* Inner (plaintext) tap's own MAC, read at io_init and programmed into
+	 * the inner next-hop entry so a decrypted frame is delivered unicast to
+	 * the inner host's kernel (which drops dst 00:00:00:00:00:00).  Mirrors
+	 * dp_dpdk.c our_inner_mac. */
+	uint8_t our_inner_mac[RTE_ETHER_ADDR_LEN];
 
 	/* Cached table key layout from table_info (bytes, big-endian order). */
 	uint32_t inbound_key_size;
@@ -759,6 +764,19 @@ static int p4_io_init(struct p4_priv *pr)
 		P4_LOG("no tap/memif/vhost device; serving control-only");
 		pr->outer_port = pr->inner_port = -1;
 		return 0;
+	}
+
+	/* Cache the inner tap's own MAC so the inner next-hop entry can carry a
+	 * unicast dst the inner host's kernel accepts. */
+	memset(pr->our_inner_mac, 0, RTE_ETHER_ADDR_LEN);
+	if (pr->inner_port >= 0) {
+		struct rte_ether_addr mac;
+		if (rte_eth_macaddr_get(pr->inner_port, &mac) == 0)
+			memcpy(pr->our_inner_mac, mac.addr_bytes, RTE_ETHER_ADDR_LEN);
+		P4_LOG("inner port=%d mac=%02x:%02x:%02x:%02x:%02x:%02x",
+		       pr->inner_port, pr->our_inner_mac[0], pr->our_inner_mac[1],
+		       pr->our_inner_mac[2], pr->our_inner_mac[3],
+		       pr->our_inner_mac[4], pr->our_inner_mac[5]);
 	}
 
 	/* Tap-free bench mode (R2DP_P4_BENCH): the bench workers self-inject
@@ -1481,6 +1499,42 @@ static int p4_start(struct fwd_dp *dp)
 	rc = p4_io_init(pr);
 	if (rc)
 		return rc;
+
+	
+	/* Program the inner next-hop MAC that p4_io_init just learned.  The
+	 * id1 (inner) entry from the slice loop carried dst/src MACs we could
+	 * not know before the ethdev legs were discovered; rewrite it with the
+	 * inner tap's own MAC so a decrypted frame is handed unicast to the
+	 * inner host instead of to 00:00:00:00:00:00 (which a real kernel
+	 * drops, and which blocks any inner ICMP reply).  Mirrors dp_dpdk.c
+	 * our_inner_mac.  Update every slice. */
+	if (pr->inner_port >= 0) {
+		int mac_is_zero = 1;
+		for (int i = 0; i < RTE_ETHER_ADDR_LEN; i++)
+			mac_is_zero &= pr->our_inner_mac[i] == 0;
+		for (int s = 0; s < pr->n_inst && !mac_is_zero; s++) {
+			struct rte_swx_table_entry en;
+			int rid = p4_table_action_id(pr->inst[s].p, 3, 0);
+			uint8_t k1[4] = { 1, 0, 0, 0 };
+			uint8_t ab[18];
+			if (rid < 0)
+				continue;
+			memset(&en, 0, sizeof(en));
+			memset(ab, 0, sizeof(ab));
+			memcpy(&ab[0], pr->our_inner_mac, RTE_ETHER_ADDR_LEN); /* dst */
+			memcpy(&ab[6], pr->our_inner_mac, RTE_ETHER_ADDR_LEN); /* src */
+			ab[12] = 0x08; ab[13] = 0x00;
+			ab[14] = 0x01;                 /* port_id=1 -> inner */
+			en.action_id = (uint64_t)rid;
+			en.action_data = ab;
+			en.key = k1;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->inst[s].ctl,
+				 "next_hop_table_0", &en))
+				P4_LOG("slice %u inner-hop MAC add failed", s);
+			else
+				(void)rte_swx_ctl_pipeline_commit(pr->inst[s].ctl, 1);
+		}
+	}
 
 	/* Live path: start the single RX distributor (bench mode skips this
 	 * because its workers self-inject and p4_io_init returns without
