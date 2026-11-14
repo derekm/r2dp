@@ -173,6 +173,11 @@ struct p4_priv {
 
 	int started;
 	int wake_fd;
+	/* Single RX distributor thread for the live path (hashes eth RX to
+	 * per-slice input rings).  NULL/unset under R2DP_P4_BENCH (bench
+	 * workers self-inject). */
+	pthread_t rx_th;
+	int rx_started;
 };
 
 /* I/O bridge burst size. */
@@ -220,27 +225,9 @@ static void *p4_worker(void *arg)
 	uint64_t last_dump = 0;
 
 	while (atomic_load_explicit(&it->running, __ATOMIC_RELAXED)) {
-		/* Bridge RX: outer -> in0, inner -> in1. */
-		if (pr->outer_port >= 0 && it->in0 && pr->pool) {
-			struct rte_mbuf *pkts[P4_BURST_SZ];
-			uint16_t n = rte_eth_rx_burst(pr->outer_port, 0,
-						      pkts, P4_BURST_SZ);
-			if (n) {
-				it->c_outer += n;
-				rte_ring_enqueue_bulk(it->in0, (void **)pkts,
-						      n, NULL);
-			}
-		}
-		if (pr->inner_port >= 0 && it->in1 && pr->pool) {
-			struct rte_mbuf *pkts[P4_BURST_SZ];
-			uint16_t n = rte_eth_rx_burst(pr->inner_port, 0,
-						      pkts, P4_BURST_SZ);
-			if (n) {
-				it->c_inner += n;
-				rte_ring_enqueue_bulk(it->in1, (void **)pkts,
-						      n, NULL);
-			}
-		}
+		/* RX is owned by the single p4_rx_worker distributor thread
+		 * (it hashes each frame to this slice's input ring); the
+		 * per-slice worker only runs the data plane and TXes. */
 
 		/* Run the pipeline + ipsec extern. */
 		if (it->p)
@@ -331,6 +318,121 @@ static void *p4_worker(void *arg)
 				       it->c_outer, it->c_inner, it->c_out0,
 				       it->c_out1, q0, q1, qo0, qo1);
 			last_dump = rte_get_tsc_cycles();
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Flow hash -> slice index for the LIVE path.  The NIC hands each
+ * pipeline a subset of flows (RSS); here a single RX thread emulates that:
+ * every frame of one flow/SA must land on ONE slice so the extern's per-SA
+ * state (CSP replay window, SA crypto) lives on a single core.
+ *
+ * Affinity keys:
+ *  - ESP (proto 50): outer IPv4 dst + SPI.  SA is pinned by (dst,spi), so
+ *    all fragments/REPLAY of one SA go to the same slice (replay window is
+ *    per-SA, in the extern).  SPI read from the ESP header.
+ *  - Everything else: (proto, src, dst, sport, dport) 5-tuple.
+ * Returns 0..n_inst-1; must be stable across relaunch (fixed seed = xor
+ * fold, no randomness).
+ */
+static uint32_t p4_xor(const uint8_t *p, size_t n)
+{
+	uint32_t h = 0x9e3779b9;
+	size_t i;
+	for (i = 0; i < n; i++) {
+		h ^= p[i];
+		h *= 0x85ebca6b;
+		h ^= h >> 13;
+	}
+	return h;
+}
+
+static uint32_t p4_flow_slice(struct p4_priv *pr, const struct rte_mbuf *m)
+{
+	uint8_t bb[16];
+	size_t n = 0;
+	const uint8_t *d = rte_pktmbuf_mtod(m, const uint8_t *);
+	uint16_t l = rte_pktmbuf_pkt_len(m);
+
+	if (pr->n_inst <= 1)
+		return 0;   /* one slice: everything lands on it */
+
+	/* Ethernet (14B) + IPv4 (20B).  Requires ethertype 0x0800. */
+	if (l < 14 + 20)
+		return p4_xor(d, l) % pr->n_inst;
+	if (d[12] != 0x08 || d[13] != 0x00)
+		return p4_xor(d, l) % pr->n_inst;
+	{
+		const uint8_t *ip = d + 14;
+		uint8_t proto = ip[9];
+		uint32_t dst;
+		memcpy(&dst, ip + 16, 4);
+		if (proto == 50) {             /* ESP: pin on (dst,spi) */
+			/* SPI is the first 4 bytes of the ESP header,
+			 * immediately after the IP header. */
+			if (l < 14 + 20 + 4)
+				return p4_xor((const uint8_t *)&dst, 4)
+				       % pr->n_inst;
+			memcpy(bb, &dst, 4);
+			memcpy(bb + 4, ip + 20, 4);
+			n = 8;
+		} else if (l >= 14 + 20 + 8) {  /* 5-tuple incl. TCP/UDP */
+			/* src(4) proto(1) dst(4) sport(2) dport(2) = 13B */
+			bb[0]=ip[12]; bb[1]=ip[13]; bb[2]=ip[14]; bb[3]=ip[15];
+			bb[4]=proto;
+			bb[5]=ip[16]; bb[6]=ip[17]; bb[7]=ip[18]; bb[8]=ip[19];
+			bb[9]=ip[20]; bb[10]=ip[21]; bb[11]=ip[22]; bb[12]=ip[23];
+			n = 13;
+		} else {
+			/* raw IP: (proto, src, dst) */
+			memcpy(bb, ip + 12, 4); bb[4]=proto;
+			memcpy(bb + 5, ip + 16, 4); n = 9;
+		}
+	}
+	return p4_xor(bb, n) % pr->n_inst;
+}
+
+/*
+ * Live-path RX distributor: ONE thread reads both ethdev legs and hashes
+ * every frame to a slice's input ring (R2DP_IN0_<i> outer, R2DP_IN1_<i>
+ * inner).  One thread only, so the ethdev RX queue is a single consumer
+ * (no two workers racing rte_eth_rx_burst on the same queue) -- exactly
+ * like a NIC RX engine fanning flows out to N pipelines.  The per-slice
+ * workers (p4_worker) then only run pipeline+extern and TX.
+ */
+static void *p4_rx_worker(void *arg)
+{
+	struct p4_priv *pr = arg;
+
+	while (atomic_load_explicit(&pr->inst[0].running, __ATOMIC_RELAXED)) {
+		if (pr->outer_port >= 0) {
+			struct rte_mbuf *pkts[P4_BURST_SZ];
+			uint16_t n = rte_eth_rx_burst(pr->outer_port, 0,
+						     pkts, P4_BURST_SZ);
+			uint16_t k;
+			for (k = 0; k < n; k++) {
+				uint32_t s = p4_flow_slice(pr, pkts[k]);
+				pr->inst[s].c_outer++;
+				/* ring full: drop (fail-closed, no copy) */
+				if (rte_ring_enqueue(pr->inst[s].in0,
+						     pkts[k]) != 0)
+					rte_pktmbuf_free(pkts[k]);
+			}
+		}
+		if (pr->inner_port >= 0) {
+			struct rte_mbuf *pkts[P4_BURST_SZ];
+			uint16_t n = rte_eth_rx_burst(pr->inner_port, 0,
+						     pkts, P4_BURST_SZ);
+			uint16_t k;
+			for (k = 0; k < n; k++) {
+				uint32_t s = p4_flow_slice(pr, pkts[k]);
+				pr->inst[s].c_inner++;
+				if (rte_ring_enqueue(pr->inst[s].in1,
+						     pkts[k]) != 0)
+					rte_pktmbuf_free(pkts[k]);
+			}
 		}
 	}
 	return NULL;
@@ -1295,7 +1397,9 @@ static int p4_start(struct fwd_dp *dp)
 		}
 
 		/* Launch this slice's packet-path worker (or the self-injecting
-		 * bench worker when R2DP_P4_BENCH is set). */
+		 * bench worker when R2DP_P4_BENCH is set).  In the live path the
+		 * per-slice worker only runs pipeline+extern+TX; RX is owned by the
+		 * single distributor thread started after p4_io_init below. */
 		atomic_store_explicit(&pr->inst[s].running, 1, __ATOMIC_RELAXED);
 		{
 			void *(*wk)(void *) = getenv("R2DP_P4_BENCH")
@@ -1309,7 +1413,7 @@ static int p4_start(struct fwd_dp *dp)
 			}
 		}
 		pr->inst[s].th_started = 1;
-	}
+		}
 
 	/* Find + configure the two ethdev legs (tap/memif/vhost) and the mbuf
 	 * pool; shared across slices.  A box with no such NIC runs
@@ -1318,6 +1422,19 @@ static int p4_start(struct fwd_dp *dp)
 	rc = p4_io_init(pr);
 	if (rc)
 		return rc;
+
+	/* Live path: start the single RX distributor (bench mode skips this
+	 * because its workers self-inject and p4_io_init returns without
+	 * legs).  One RX thread reads both legs and hashes each frame to a
+	 * slice by flow, giving per-SA replay affinity and keeping the
+	 * ethdev RX queue a single consumer. */
+	if (!getenv("R2DP_P4_BENCH") && pr->outer_port >= 0) {
+		if (pthread_create(&pr->rx_th, NULL, p4_rx_worker, pr) != 0) {
+			P4_LOG("rx distributor create failed");
+			return -EIO;
+		}
+		pr->rx_started = 1;
+	}
 
 	pr->started = 1;
 	return 0;
@@ -2069,6 +2186,11 @@ static void p4_stop(struct fwd_dp *dp)
 	/* Tear down every slice.  Always free whatever was allocated, even on a
 	 * partial start (the probe calls stop on failure).  `started` is not the
 	 * only guard. */
+	atomic_store_explicit(&pr->inst[0].running, 0, __ATOMIC_RELAXED);
+	if (pr->rx_started) {
+		pthread_join(pr->rx_th, NULL);
+		pr->rx_started = 0;
+	}
 	{
 		unsigned s;
 		for (s = 0; s < pr->n_inst; s++) {
