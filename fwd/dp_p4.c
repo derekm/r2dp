@@ -30,6 +30,9 @@
  */
 #define _GNU_SOURCE
 
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,9 +106,35 @@ struct p4_priv {
 	uint32_t inbound_key_size;
 	uint32_t outbound_key_size;
 
+	/* Pipeline run worker (brings up the SWX datapath). */
+	pthread_t th;
+	int th_started;
+	atomic_int running;
+
 	int started;
 	int wake_fd;
 };
+
+/* SWX run quanta per burst (arbitrary; bounds how many instructions one
+ * rte_swx_pipeline_run call executes before yielding to the ipsec block). */
+#define P4_RUN_QUANTA 1000
+
+/* Packet-path worker: drain the pipeline's input, execute the PNA program,
+ * run the ipsec extern head-of-line, then loop.  Mirrors examples/pipeline
+ * thread_main: run each pipeline then each block (the ipsec extern) with no
+ * sleep so the pipeline saturates. */
+static void *p4_worker(void *arg)
+{
+	struct p4_priv *pr = arg;
+
+	while (atomic_load_explicit(&pr->running, __ATOMIC_RELAXED)) {
+		if (pr->p)
+			rte_swx_pipeline_run(pr->p, P4_RUN_QUANTA);
+		if (pr->ipsec)
+			rte_swx_ipsec_run(pr->ipsec);
+	}
+	return NULL;
+}
 
 static void p4_caps(struct fwd_dp *dp)
 {
@@ -418,6 +447,35 @@ static int p4_start(struct fwd_dp *dp)
 		return -EIO;
 	}
 
+	/* Program the classification regarrays the spec's parser/apply read
+	 * (they default to 0).  PNA direction: 0 = NET_TO_HOST (inbound /
+	 * decrypt), 1 = HOST_TO_NET (outbound / encrypt).  Port 0 = outer
+	 * (ciphertext/wire) leg, port 1 = inner (plaintext) leg; both are
+	 * inbound-candidate on their own leg, so they are NOT from_ipsec (the
+	 * ipsec extern's own return rings, IP_IN/IP_OUT, are the from_ipsec
+	 * ports).  Set direction per port and leave ipsec_port_in_* at their
+	 * extern rings' identity (see PLAN §8 / spec apply). */
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->p, "direction", 0, 0);
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->p, "direction", 1, 1);
+	/* Parser `from_ipsec` = (input_port == ipsec_port_in_*).  The extern
+	 * returns processed packets on its own port; for our two-leg topology
+	 * the SAD is keyed per-leg by the port the wire packet arrives on, so
+	 * mark neither static leg as from_ipsec.  Pointer-only content; see
+	 * regarray_name resolution below. */
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
+		"ipsec_port_in_inbound", 0, (uint64_t)0xffffffffUL);
+	(void)rte_swx_ctl_pipeline_regarray_write(pr->p,
+		"ipsec_port_in_outbound", 0, (uint64_t)0xffffffffUL);
+
+	/* Launch the packet-path worker. */
+	atomic_store_explicit(&pr->running, 1, __ATOMIC_RELAXED);
+	if (pthread_create(&pr->th, NULL, p4_worker, pr) != 0) {
+		P4_LOG("worker create failed");
+		atomic_store_explicit(&pr->running, 0, __ATOMIC_RELAXED);
+		return -EIO;
+	}
+	pr->th_started = 1;
+
 	pr->started = 1;
 	return 0;
 }
@@ -643,6 +701,11 @@ static void p4_stop(struct fwd_dp *dp)
 	struct p4_priv *pr = dp->priv;
 	/* Always free whatever was allocated, even on a partial start (the
 	 * probe calls stop on failure).  `started` is not the only guard. */
+	atomic_store_explicit(&pr->running, 0, __ATOMIC_RELAXED);
+	if (pr->th_started) {
+		pthread_join(pr->th, NULL);
+		pr->th_started = 0;
+	}
 	if (pr->ctl)
 		rte_swx_ctl_pipeline_free(pr->ctl);
 	if (pr->ipsec)
