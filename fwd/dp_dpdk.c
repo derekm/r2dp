@@ -975,6 +975,24 @@ dpd_idle(struct fwd_dp *dp)
 	}
 }
 
+
+/* Undo a probe that got past crypto_init (INIT I4): nothing has been
+ * published yet, so everything is released directly. */
+static void
+probe_unwind(struct dpdk_priv *d)
+{
+	if (d->sad)
+		dp_sad_destroy(d->sad);
+	rte_mempool_free(d->pool);
+	rte_mempool_free(d->cop_mp);
+	rte_mempool_free(d->sess_mp);
+	if (d->have_cdev) {
+		rte_cryptodev_stop(d->cdev_id);
+		rte_cryptodev_close(d->cdev_id);
+	}
+	free(d);
+}
+
 int
 fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
     const char *sockpath, int verbose, int nb_workers, unsigned nh_size)
@@ -1051,6 +1069,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 	if (d->port_id < 0) {
 		fprintf(stderr, "r2dp-fwd: no dataplane port found (add "
 		    "--vdev=net_tap0,iface=r2dp-tap, or net_memif/net_vhost)\n");
+		probe_unwind(d);
 		return -ENODEV;
 	}
 	/* Fix the worker count now, before any SA exists: it decides
@@ -1072,6 +1091,7 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 		if (!d->pool) {
 			fprintf(stderr, "r2dp-fwd: mbuf pool of %u failed: %s\n",
 			    nmb, rte_strerror(rte_errno));
+			probe_unwind(d);
 			return -ENOMEM;
 		}
 		fprintf(stderr, "r2dp-fwd: mbuf pool %u (%u port(s), %u worker(s))\n",
