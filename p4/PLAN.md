@@ -198,15 +198,17 @@ and the delegated `deleg_8f37ef0b` review):
   `r2dp-p4-bind-probe`), which reads the forwarder log: SA-first → direct bind
   with NO discard; SP-first → `OUT PROTECT unbound -> DISCARD` then a rebind to
   `ipsec_protect` — not inferred from `r2dpctl dump`.
-- **Egress next-hop staged (round-5):** every classified/processed frame must
-  exit through `routing_table_0` → `next_hop_table_0`, and `next_hop_table_0`'s
-  const default was `drop` — so NO frame could leave the dataplane even after a
-  correct SAD/SPD or crypto pass.  `p4_start` now populates `next_hop_table_0`
-  (id 0 → outer port 0, id 1 → inner port 1; `next_hop_set` with ether_type
-  0x0800), so egress is reachable (`next_hop table populated` on load, forwarder
-  control + bind still pass).  This is the **prerequisite** for framed forward,
-  not a proof of it: proving bytes move still needs a real injected frame
-  (inner-leg input → SPD → outer-leg egress), which requires either adapting
-  `e2e_tgen`/`e2e_bench.sh` (they assume the DPDK worker's `-n W --lcores` and
-  `r2dp-fwd: stats` log format the P4 pthread worker does not emit) or a small
-  ring-injector probe.
+- **Framed forward proven (round-6):** a real IPv4/UDP frame injected on the
+  inner tap (`r2pi`, outbound leg) is processed by the SWX pipeline and
+  egresses the outer tap (`r2po`) — captured by tcpdump (`10.0.0.1.1024 >
+  10.0.0.2.discard: UDP`, payload intact).  Worker counters (`out_rx in_rx
+  out0 out1` + ring-occupancy, printed ~1s from the worker) show
+  `in_rx=125 out0=96`, rings drained.  This proves I/O-ring bridge →
+  pipeline run → next-hop → output-ring → eth bridge moves bytes end to end.
+  The outbound default (`spd_bypass`) forwards it clear, as designed.  What
+  this does NOT yet prove: framed **ESP crypto** — injecting an ESP frame on
+  the outer leg and observing a decrypted inner exit (and the reverse
+  encrypt).  The framed forward is the prerequisite that now works over tap
+  (root; memif vdevs do not materialize on `.165`).  ctr() in bench/e2e_bench.sh
+  still parses the DPDK `stats` format the P4 worker does not emit — the
+  worker's own `pkt:` line is the P4-leg counter equivalent.
