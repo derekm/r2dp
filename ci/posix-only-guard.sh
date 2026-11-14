@@ -17,13 +17,17 @@ cd "$(git rev-parse --show-toplevel)"
 #     the replay feature and is intentionally allowed.
 #
 # Docs/generated html are out of scope (prose may mention the dev host).
+# The guard itself, its self-test and the workflow that names the step are
+# excluded too: they must spell the forbidden terms to look for them.
 # Exit 0 = clean; exit 1 = forbidden term found in source.
 echo "== POSIX-only regression guard =="
+EXCL=(':!*.md' ':!site/index.html' ':!ci/posix-only-guard.sh'
+      ':!ci/guard-selftest.sh' ':!.github/workflows/*')
 fail=0
 
 # (a) unambiguous OS markers, case-insensitive — must never exist in source
 AMBIG='(MSVC|Win32|Win64|MingW|Visual.?Studio)'
-hits="$(git grep --no-color -I -i -E "$AMBIG" -- ':!*.md' ':!site/index.html' 2>/dev/null)"
+hits="$(git grep --no-color -I -i -E "$AMBIG" -- "${EXCL[@]}" 2>/dev/null)"
 if [ -n "$hits" ]; then
   echo "  FORBIDDEN OS marker in source (case-insensitive):"
   printf '%s\n' "$hits" | head -20
@@ -31,7 +35,7 @@ if [ -n "$hits" ]; then
 fi
 
 # (b) capital-W "Windows" proper noun only (not the lowercase replay window)
-WINHITS="$(git grep --no-color -I -E '\bWindows\b' -- ':!*.md' ':!site/index.html' 2>/dev/null)"
+WINHITS="$(git grep --no-color -I -E '\bWindows\b' -- "${EXCL[@]}" 2>/dev/null)"
 if [ -n "$WINHITS" ]; then
   echo "  FORBIDDEN 'Windows' (proper noun) in source:"
   printf '%s\n' "$WINHITS" | head -20
