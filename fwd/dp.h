@@ -98,6 +98,11 @@ void fwd_dp_init(struct fwd_dp *dp);
 int fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
     const char *sockpath, int verbose, int nb_workers, unsigned nh_size);
 
+/* P4/SWX backend (fwd/dp_p4.c).  spec_path: compiled SWX spec (p4/r2dp.out);
+ * NULL uses the compiled-in default.  Built only with -Denable_p4=enabled. */
+int fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
+    const char *spec_path);
+
 /* Linux kernel XFRM backend (fwd/dp_xfrm.c, `r2dp-fwd --dp kernel`):
  * opens NETLINK_XFRM and probes which transforms the kernel accepts.
  * cleanup != 0: remove every SA/SP this process installed on stop. */

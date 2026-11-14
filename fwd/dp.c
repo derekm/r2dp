@@ -22,6 +22,17 @@ fwd_dp_dpdk_probe(struct fwd_dp *dp, int *argc, char **argv[],
 }
 #endif
 
+#ifndef R2DP_HAVE_P4
+#include <errno.h>
+int
+fwd_dp_p4_probe(struct fwd_dp *dp, int *argc, char **argv[],
+    const char *spec_path)
+{
+	(void)dp; (void)argc; (void)argv; (void)spec_path;
+	return -2;      /* "no P4 build" */
+}
+#endif
+
 void
 fwd_dp_init(struct fwd_dp *dp)
 {
