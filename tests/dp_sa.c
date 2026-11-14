@@ -348,6 +348,82 @@ t_inbound_policy(struct dpdk_priv *d)
 /* Our anti-replay window (librte_ipsec's drops bits 32..63 of each
  * bucket): duplicates in every bit position, window edges, windows > 64,
  * and ESN reconstruction across a 2^32 wrap. */
+/* The bit-at-a-time window advance replay_accept used before the
+ * word-wise clear (REPLAY R2): the reference for the differential test. */
+static int
+ref_accept(struct dp_sa *ds, uint32_t lo)
+{
+	uint64_t t = ds->rp_top, sqn = lo;
+	uint32_t w = ds->rp_w, tl = (uint32_t)t;
+
+	if (!w)
+		return 1;
+	if (ds->rp_esn) {
+		uint64_t hi = t >> 32;
+		if (tl >= w - 1) {
+			if (lo < tl - w + 1) hi++;
+		} else if (lo >= tl - w + 1 && hi) {
+			hi--;
+		}
+		sqn = (hi << 32) | lo;
+	}
+	if (sqn == 0)
+		return 0;
+	if (sqn > t) {
+		uint64_t d = sqn - t;
+		if (d >= RP_BITS)
+			memset(ds->rp_map, 0, sizeof(ds->rp_map));
+		else
+			for (uint64_t s = t + 1; s <= sqn; s++)
+				ds->rp_map[(s % RP_BITS) / 64] &= ~(1ull << (s % 64));
+		ds->rp_top = sqn;
+	} else if (t - sqn >= w) {
+		return 0;
+	} else if (ds->rp_map[(sqn % RP_BITS) / 64] & (1ull << (sqn % 64))) {
+		return 0;
+	}
+	ds->rp_map[(sqn % RP_BITS) / 64] |= 1ull << (sqn % 64);
+	return 1;
+}
+
+static void
+t_replay_diff(void)
+{
+	static const uint32_t jump[] = { 1, 2, 63, 64, 65, 127, 128, 129, 500,
+	    1000, 1023, 1024, 1025, 4096 };
+	static const uint32_t win[] = { 32, 64, 200, RP_BITS };
+	static struct dp_sa a, b;
+	unsigned long diff = 0, n = 0;
+	uint64_t rnd = 0x9e3779b97f4a7c15ull;
+
+	for (unsigned wi = 0; wi < RTE_DIM(win); wi++)
+		for (int esn = 0; esn < 2; esn++) {
+			uint32_t q = esn ? 0xffffff00u : 1;
+			memset(&a, 0, sizeof(a)); memset(&b, 0, sizeof(b));
+			a.rp_w = b.rp_w = win[wi];
+			a.rp_esn = b.rp_esn = (uint8_t)esn;
+			for (unsigned i = 0; i < 4000; i++, n++) {
+				rnd ^= rnd << 13; rnd ^= rnd >> 7; rnd ^= rnd << 17;
+				switch (rnd % 4) {
+				case 0: case 1:          /* forward jump */
+					q += jump[(rnd >> 8) % RTE_DIM(jump)];
+					break;
+				case 2:                  /* late, maybe replayed */
+					q -= (uint32_t)((rnd >> 8) % (win[wi] + 70));
+					break;
+				default:                 /* exact duplicate */
+					break;
+				}
+				if (replay_accept(&a, q) != ref_accept(&b, q) ||
+				    a.rp_top != b.rp_top ||
+				    memcmp(a.rp_map, b.rp_map, sizeof(a.rp_map)))
+					diff++;
+			}
+		}
+	CHECK(n && !diff, "replay: word-wise window advance matches the bit loop "
+	    "(jumps 1..4096, windows 32..1024, ESN wrap)");
+}
+
 static void
 t_replay_window(void)
 {
@@ -769,6 +845,7 @@ main(void)
 	t_inbound_policy(d);
 	t_binding(d);
 	t_replay_window();
+	t_replay_diff();
 	t_wsize_install(d);
 	t_inbound_indexed(d);
 	t_acl_diff(d);

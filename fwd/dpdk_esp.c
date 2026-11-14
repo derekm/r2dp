@@ -102,6 +102,28 @@ replay_refused(const struct dp_sa *ds, uint32_t lo)
 	    (ds->rp_map[(sqn % RP_BITS) / 64] & (1ull << (sqn % 64)))));
 }
 
+/* Clear window bits for sequence numbers from..to (inclusive, fewer than
+ * RP_BITS of them) a word at a time: at most RP_WORDS + 1 steps, not one
+ * read-modify-write per bit (REPLAY R2). */
+static inline void
+rp_clear(uint64_t *map, uint64_t from, uint64_t to)
+{
+	uint64_t n = to - from + 1;
+	uint32_t b = (uint32_t)(from % RP_BITS);
+
+	while (n) {
+		uint32_t off = b % 64, take = 64 - off;
+		uint64_t mask;
+
+		if (take > n)
+			take = (uint32_t)n;
+		mask = take == 64 ? ~0ull : ((1ull << take) - 1) << off;
+		map[b / 64] &= ~mask;
+		n -= take;
+		b = (b + take) % RP_BITS;
+	}
+}
+
 int
 replay_accept(struct dp_sa *ds, uint32_t lo)
 {
@@ -119,8 +141,7 @@ replay_accept(struct dp_sa *ds, uint32_t lo)
 		if (d >= RP_BITS)
 			memset(ds->rp_map, 0, sizeof(ds->rp_map));
 		else
-			for (uint64_t s = t + 1; s <= sqn; s++)
-				ds->rp_map[(s % RP_BITS) / 64] &= ~(1ull << (s % 64));
+			rp_clear(ds->rp_map, t + 1, sqn);
 		ds->rp_top = sqn;
 	} else if (t - sqn >= w) {
 		return 0;                    /* left of the window */
