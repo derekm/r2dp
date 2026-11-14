@@ -258,7 +258,7 @@ per-slice best_cyc_pkt pps):**
   uint32s; the correct key is { ntohl(dip), ntohl(spi) } in BOTH fields.
   Live N=2 openssl: ib hit 0->380, crypto enq=deq 0->288 for 300 distinct
   ESP seqs (previously 0).  N=1 bench gate unchanged.
-- **VERIFIED (`1dd9700`) third-round review `deleg_ce36234f` (harness +
+- **VERIFIED (`be57676`) third-round review `deleg_ce36234f` (harness +
    atomicity), re-proven live:**
   - `bench/p4_live_proof.sh` is FIXED and now actually runs its injector
     (writes and runs the SAME /tmp/liveinj.py path), records the real
