@@ -12,7 +12,8 @@
  *     overlap, regardless of table slot order.
  *  3. Inbound SAD (ATOMICS A1, SADB S1-S3): a reader resolving a live SA
  *     never misses it while other inbound SAs churn and the SAD grows by
- *     swap from a tiny size; no install fails for want of SAD room.
+ *     swap from a tiny size; no install fails for want of SAD room; an
+ *     update that flips direction is refused with the old SA untouched.
  *
  * SKIP (77) without EAL/crypto_openssl unless R2DP_REQUIRE_DPDK is set.
  */
@@ -217,6 +218,19 @@ t_sad(struct dpdk_priv *d)
 	CHECK(rej == 0, "sad: no install refused for want of SAD room");
 	CHECK(d->sad_cap >= 512 && d->sad_n == 1 + NCH - NCH / 3,
 	    "sad: grew by swap; sad_n counts exactly the live inbound SAs");
+
+	/* S3: same (SPI, DIP, proto) re-sent as outbound is refused */
+	mk_sa(&r, 0x7000, "192.0.2.2", "192.0.2.1");
+	{
+		uint32_t n1 = d->sad_n;
+		const union rte_ipsec_sad_key *kp[1] = { &sad_rd_key };
+		void *v[1];
+		CHECK(sa_install(d, &r, key, 20, 0, 0) == -EINVAL,
+		    "sad: direction flip on update refused (-EINVAL)");
+		CHECK(dp_sad_lookup(d->sad, kp, v, 1) == 1 && v[0] &&
+		    sa_live(sa_of_sess(d, v[0])) && d->sad_n == n1,
+		    "sad: inbound SA still resolves after the refused flip, sad_n unchanged");
+	}
 
 	/* clean up: every inbound SA this test added */
 	mk_sa(&r, 0x7000, "192.0.2.2", "192.0.2.1");

@@ -459,6 +459,16 @@ sa_install(struct dpdk_priv *d, const struct r2dp_sa *rsa,
 		}
 	}
 
+	/* The (SPI, DIP, proto) match ignores direction, and the SAD key and
+	 * its count follow the inbound SA only: an update that flips the
+	 * direction would leave a stale SAD key (or a missing one) and skew
+	 * sad_n.  Refuse it, old SA untouched; the caller deletes and adds
+	 * (SADB S3). */
+	if (idx >= 0 && !sa_at(d, (uint32_t)idx)->inbound != !inbound) {
+		rte_spinlock_unlock(&d->lock);
+		return -EINVAL;
+	}
+
 	/* M2 (build-then-swap): build the NEW session first so a failure leaves
 	 * the old SA untouched (ctl still holds the old one as last-known-good).
 	 * Only after the new session exists do we tear the old one down and
