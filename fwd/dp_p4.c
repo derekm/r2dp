@@ -755,7 +755,7 @@ static int p4_start(struct fwd_dp *dp)
 		/* next_hop_set args: dst_mac(6) src_mac(6) ether_type(2) port_id(4). */
 		struct rte_swx_table_entry en;
 		int rid = p4_table_action_id(pr->p, 3, 0);  /* next_hop_set */
-		uint8_t k0[4] = { 0, 0, 0, 0 }, k1[4] = { 0, 0, 0, 1 };
+		uint8_t k0[4] = { 0, 0, 0, 0 }, k1[4] = { 1, 0, 0, 0 };
 		uint8_t ab[18];
 		if (rid < 0) {
 			P4_LOG("next_hop_set action id lookup failed");
@@ -770,14 +770,44 @@ static int p4_start(struct fwd_dp *dp)
 			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
 				 "next_hop_table_0", &en))
 				P4_LOG("next_hop id0 add failed");
-			/* id1 -> inner leg (port 1): port_id at offset 14. */
-			ab[14] = 0x00; ab[15] = 0x00; ab[16] = 0x00; ab[17] = 0x01;
+			/* id1 -> inner leg (port 1): port_id at offset 14, written to
+			 * metadata output_port (HOST order, LE 1 = {1,0,0,0}). */
+			ab[14] = 0x01; ab[15] = 0x00; ab[16] = 0x00; ab[17] = 0x00;
 			en.key = k1;
 			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
 				 "next_hop_table_0", &en))
 				P4_LOG("next_hop id1 add failed");
 			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 1);
 			P4_LOG("next_hop table populated (id0->outer, id1->inner)");
+		}
+	}
+
+	/* Decrypt egress: a frame the extern returns on IP_OUT is re-parsed and
+	 * routed by its INNER IPv4 dst (h.ipv4.dst_addr, a HEADER field, so the
+	 * LPM prefix is network byte order).  The default route sends every miss
+	 * to next_hop 0 -> outer leg, which is right for the encrypted outer
+	 * frame but would push a decrypted inner frame back out the wire.  Add
+	 * an LPM entry for the inner subnet -> next_hop 1 (-> inner leg). */
+	{
+		struct rte_swx_table_entry en;
+		int rid = p4_table_action_id(pr->p, 2, 0);  /* next_hop_id_set */
+		uint8_t rkey[4] = { 0x0a, 0, 0, 0 };        /* 10.0.0.0/8 inner */
+		uint8_t rmask[4] = { 0xff, 0, 0, 0 };
+		uint8_t rdata[4] = { 1, 0, 0, 0 };          /* next_hop_id 1, meta */
+		if (rid < 0) {
+			P4_LOG("next_hop_id_set action id lookup failed");
+		} else {
+			memset(&en, 0, sizeof(en));
+			en.key = rkey;
+			en.key_mask = rmask;
+			en.action_id = (uint64_t)rid;
+			en.action_data = rdata;
+			if (rte_swx_ctl_pipeline_table_entry_add(pr->ctl,
+				 "routing_table_0", &en))
+				P4_LOG("routing 10/8 add failed");
+			else
+				P4_LOG("routing 10/8 -> next_hop 1 (inner)");
+			(void)rte_swx_ctl_pipeline_commit(pr->ctl, 1);
 		}
 	}
 
@@ -847,15 +877,15 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		 * the direction we stored at install to pick the SAD table. */
 		isin = (e->dir == R2DP_DIR_IN);
 		if (isin) {
-			/* remove the (dip,spi) -> ipsec_enable SAD entry */
+			/* remove the (dip,spi) -> ipsec_enable SAD entry.
+			 * Inbound SAD key fields are METADATA copies of
+			 * h.ipv4.dst_addr / h.esp.spi, matched in HOST byte
+			 * order (same as outbound_table_0; values are already
+			 * host uint32s). */
 			memset(&ent, 0, sizeof(ent));
 			memset(key, 0, sizeof(key));
-			{
-				uint32_t dip_be = htonl(dip);
-				uint32_t spi_be = htonl(spi);
-				memcpy(&key[0], &dip_be, 4);
-				memcpy(&key[4], &spi_be, 4);
-			}
+			memcpy(&key[0], &dip, 4);
+			memcpy(&key[4], &sa->spi, 4);   /* h.esp.spi, host order */
 			ent.key = key;
 			rc = rte_swx_ctl_pipeline_table_entry_delete(pr->ctl,
 					"inbound_table_0", &ent);
@@ -994,16 +1024,16 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 	}
 
 	/* inbound_table_0 entry: (ipv4.dst_addr, esp.spi)
-	 * -> ipsec_enable(sl_id).  Keys are big-endian wire bytes. */
+	 * -> ipsec_enable(sl_id).  KEY fields (dst_addr, spi) are metadata
+	 * copies matched in HOST order; the action data (sa_id -> the
+	 * h.ipsec_hdr.sa_id header field) is stored network byte order. */
 	memset(&ent, 0, sizeof(ent));
 	memset(key, 0, sizeof(key));
 	{
-		uint32_t dip_be = htonl(dip);
-		uint32_t spi_be = htonl(spi);
-		uint32_t id_be  = htonl(e->sl_id);
+		uint32_t id_be = htonl(e->sl_id);
 		/* match-field order from the spec: dst_addr then spi */
-		memcpy(&key[0], &dip_be, 4);
-		memcpy(&key[4], &spi_be, 4);
+		memcpy(&key[0], &dip, 4);
+		memcpy(&key[4], &sa->spi, 4);   /* h.esp.spi, host order */
 		memcpy(data, &id_be, 4);
 	}
 	ent.key = key;
