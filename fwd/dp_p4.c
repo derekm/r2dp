@@ -1697,11 +1697,13 @@ static int p4_sa_add(struct fwd_dp *dp, int add, const struct r2dp_sa *sa,
 		    sa->natt_type == R2DP_NATT_ESPINUDP, P4_HAVE_REPLAY,
 		    P4_HAVE_NATT, &w_sz);
 		if (r < 0) {
-			P4_LOG("SA spi=0x%08x refused: %s%s%s unsupported by this "
-			       "SWX extern (see contrib/upstream)", ntohl(sa->spi),
-			       (sa->saflags & R2DP_SAF_ESN) ? "ESN " : "",
-			       sa->natt_type == R2DP_NATT_ESPINUDP ? "NAT-T " : "",
-			       inbound && r2dp_sa_window(sa) ? "replay-window" : "");
+			P4_LOG("SA spi=0x%08x refused: esn=%d natt=%d window=%u not "
+			       "enforceable by this SWX extern (replay=%d natt=%d; "
+			       "see contrib/upstream)", ntohl(sa->spi),
+			       (sa->saflags & R2DP_SAF_ESN) != 0,
+			       sa->natt_type == R2DP_NATT_ESPINUDP,
+			       inbound ? r2dp_sa_window(sa) : 0u, P4_HAVE_REPLAY,
+			       P4_HAVE_NATT);
 			return r;
 		}
 	}
@@ -2296,6 +2298,9 @@ static int p4_spd_bind(struct p4_priv *pr, struct p4_pol *p)
 							pr->inst[s].tid_outbt, 0);
 				ent.action_data = data;
 			} else {
+				if (ea)
+					P4_LOG("slice %u is not the outbound "
+					       "owner: PROTECT -> DISCARD", s);
 				ent.action_id = (uint64_t)
 					p4_table_action_id(pr->inst[s].p,
 							pr->inst[s].tid_outbt, 2);

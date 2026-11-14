@@ -181,3 +181,16 @@ test('fwd_cli',
   args: [r2dp_fwd.full_path()],
   depends: [r2dp_fwd],
   is_parallel: false, timeout: 60)
+
+# p4_smoke: the P4 backend refuses what it cannot enforce (replay window 1,
+# a window on a stock extern, port-qualified policies) and keeps a single
+# outbound owner slice (COMMITS C6/C7, P4 review P1/P2).
+if dpdk.found() and get_option('enable_p4').enabled()
+  test('p4_smoke', find_program('p4_smoke.sh'),
+    args: [r2dp_fwd.full_path(), r2dpctl.full_path(),
+      meson.project_source_root() / 'p4' / 'r2dp.out',
+      p4_args.contains('-DR2DP_P4_SWX_REPLAY=1') ? '1' : '0',
+      meson.current_build_dir() / 'p4-scratch',
+      dpdk.get_variable(pkgconfig: 'prefix') / 'share' / 'dpdk-swx-src'],
+    depends: [r2dp_fwd, r2dpctl], is_parallel: false, timeout: 120)
+endif
