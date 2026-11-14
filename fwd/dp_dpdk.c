@@ -888,10 +888,13 @@ crypto_init(struct dpdk_priv *d)
 	rte_cryptodev_info_get(d->cdev_id, &d->cdev_info);
 	if (d->cdev_info.max_nb_queue_pairs < d->nb_wk) {
 		/* Fail closed rather than silently running fewer workers than
-		 * requested: a clamped -n looks like scaling but is not. */
+		 * requested: a clamped -n looks like scaling but is not.  Raise the
+		 * device's queue pairs at creation, e.g.
+		 * --vdev='crypto_openssl0,max_nb_queue_pairs=12'. */
 		fprintf(stderr, "r2dp-fwd: %s only has %u queue pairs but -n %u was "
-		    "requested; add max_nb_queue_pairs=<n> to the --vdev (e.g. "
-		    "--vdev='crypto_openssl0,max_nb_queue_pairs=%u')\n",
+		    "requested; add max_nb_queue_pairs=<n> to the --vdev so the "
+		    "device can serve %u queue pairs, or refuse to start with "
+		    "fewer (no silent clamp).\n",
 		    rte_cryptodev_name_get(d->cdev_id),
 		    d->cdev_info.max_nb_queue_pairs, d->nb_wk, d->nb_wk);
 		return -EINVAL;

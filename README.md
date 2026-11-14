@@ -85,8 +85,8 @@ resides on the `p4-backend` branch and is not on `origin/main`.
 **Measured throughput** (`bench/p4_bench.sh`, i5-6500T 4-core,
 `crypto_openssl0`, 64B): ~132K pps through the shared net_tap — the tap I/O
 crossing is the wall, not the data plane.  DPDK's internal dataplane ceiling
-is ~2.4–3.0 Mpps (enc/dec, 64B, `fwd_bench`), so both engines are bounded by
-the tap at the lab I/O layer.  A tap-free P4 measurement
+is ~2.4–3.0 Mpps (enc/dec, 64B, `fwd_bench`, single worker on `.165`), so
+both engines are bounded by the tap at the lab I/O layer.  A tap-free P4 measurement
 (`R2DP_P4_BENCH=1`; the worker injects plaintext directly into the pipeline
 rings, no ethdev) shows the real SWX+crypto cost: **~1.00 Mpps / ~2484
 cyc/pkt** at 64B — about 8× the tap figure — versus DPDK's internal
